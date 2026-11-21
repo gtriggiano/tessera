@@ -8,7 +8,7 @@ tessera is in development and has no release yet. The binary has only the `help`
 
 ## Development
 
-You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`.
+You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`. `make ci` adds the vulnerability scan and the workflow lint, as CI does.
 
 ## License
 
