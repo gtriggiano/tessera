@@ -1,0 +1,221 @@
+// Package cli implements tessera's command interface.
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
+	"strings"
+
+	"github.com/spf13/cobra"
+)
+
+// BuildInfo identifies the binary. Empty version, revision and GoVersion values
+// use local development defaults; an empty BuildTime is omitted from output.
+type BuildInfo struct {
+	Version   string
+	Revision  string
+	GoVersion string
+	BuildTime string
+}
+
+// Options supplies process dependencies. Nil writers discard output.
+type Options struct {
+	Out   io.Writer
+	Err   io.Writer
+	Build BuildInfo
+	// Signals delivers the process's shutdown signals. The first cancels the
+	// running command, like a signal-cancelled context. Nil delivers none.
+	Signals <-chan os.Signal
+}
+
+// Run executes a new command tree. It returns 0 on success, 2 for usage
+// errors, and 1 for runtime failures such as writing output.
+func Run(ctx context.Context, args []string, opts Options) int {
+	opts = defaults(opts)
+	// Ends the signal watcher of a command, if any, when Run returns.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	output := &checkedWriter{writer: opts.Out}
+	opts.Out = output
+	opts.Err = &checkedWriter{writer: opts.Err}
+	cmd := newCommand(opts)
+	cmd.SetArgs(args)
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		// Cobra's lookup errors include the argument. Avoid echoing arbitrary
+		// user input, which may contain a mistakenly pasted credential.
+		message := err.Error()
+		if strings.HasPrefix(message, "unknown command ") || strings.HasPrefix(message, "unknown help topic ") {
+			message = "unknown command; see tessera --help"
+		}
+		if _, writeErr := fmt.Fprintf(opts.Err, "tessera: %s\n", message); writeErr != nil {
+			return 1
+		}
+		var failure runtimeError
+		if errors.As(err, &failure) {
+			return 1
+		}
+		return 2
+	}
+	// Cobra's built-in help renderer does not return write failures from
+	// ExecuteContext, so inspect the output writer as well.
+	if output.failed {
+		fmt.Fprintln(opts.Err, "tessera: cannot write output")
+		return 1
+	}
+	return 0
+}
+
+// newCommand builds an independent command tree for defaulted opts.
+func newCommand(opts Options) *cobra.Command {
+	root := &cobra.Command{
+		Use:               "tessera",
+		Short:             "External authorization service for Envoy",
+		Args:              noArgs,
+		SilenceErrors:     true,
+		SilenceUsage:      true,
+		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			if err := cmd.Context().Err(); err != nil {
+				return runtimeError{err}
+			}
+			cancelOnSignal(cmd, opts.Signals)
+			return nil
+		},
+	}
+	root.SetOut(opts.Out)
+	root.SetErr(opts.Err)
+	root.SetFlagErrorFunc(func(_ *cobra.Command, _ error) error {
+		return errors.New("invalid command flags; see --help")
+	})
+	root.SetHelpCommand(&cobra.Command{
+		Use:   "help [command]",
+		Short: "Help about any command",
+		RunE: func(_ *cobra.Command, args []string) error {
+			target, remaining, err := root.Find(args)
+			if err != nil || len(remaining) != 0 {
+				return errors.New("unknown command; see tessera --help")
+			}
+			return help(target, nil)
+		},
+	})
+	root.RunE = help
+	root.AddCommand(versionCommand(opts.Build))
+	return root
+}
+
+// cancelOnSignal makes the first signal cancel cmd's context. The watcher
+// ends with that context, which Run cancels when it returns.
+func cancelOnSignal(cmd *cobra.Command, signals <-chan os.Signal) {
+	if signals == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(cmd.Context())
+	go func() {
+		defer cancel()
+		select {
+		case <-signals:
+		case <-ctx.Done():
+		}
+	}()
+	cmd.SetContext(ctx)
+}
+
+func defaults(opts Options) Options {
+	if opts.Out == nil {
+		opts.Out = io.Discard
+	}
+	if opts.Err == nil {
+		opts.Err = io.Discard
+	}
+	if opts.Build.Version == "" {
+		opts.Build.Version = "dev"
+	}
+	if opts.Build.Revision == "" {
+		opts.Build.Revision = "unknown"
+	}
+	if opts.Build.GoVersion == "" {
+		opts.Build.GoVersion = runtime.Version()
+	}
+	return opts
+}
+
+// versionOutput is the JSON form of version. Its field names are a public
+// interface.
+type versionOutput struct {
+	Version   string `json:"version"`
+	Revision  string `json:"revision"`
+	GoVersion string `json:"go_version"`
+	BuildTime string `json:"build_time,omitempty"`
+}
+
+func versionCommand(build BuildInfo) *cobra.Command {
+	var format string
+	cmd := &cobra.Command{
+		Use:   "version",
+		Short: "Print build information",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			switch format {
+			case "text":
+				info := fmt.Sprintf("tessera %s (revision %s; %s", build.Version, build.Revision, build.GoVersion)
+				if build.BuildTime != "" {
+					info += "; built " + build.BuildTime
+				}
+				return write(cmd.OutOrStdout(), []byte(info+")\n"))
+			case "json":
+				data, err := json.Marshal(versionOutput(build))
+				if err != nil {
+					return runtimeError{errors.New("cannot render build information")}
+				}
+				return write(cmd.OutOrStdout(), append(data, '\n'))
+			default:
+				// The value is not repeated: it is arbitrary user input.
+				return errors.New("invalid --output; want text or json")
+			}
+		},
+	}
+	cmd.Flags().StringVar(&format, "output", "text", "output format: text or json")
+	return cmd
+}
+
+func noArgs(_ *cobra.Command, args []string) error {
+	if len(args) != 0 {
+		return errors.New("unexpected arguments; see --help")
+	}
+	return nil
+}
+
+func help(cmd *cobra.Command, _ []string) error {
+	if err := cmd.Help(); err != nil {
+		return runtimeError{err}
+	}
+	return nil
+}
+
+type runtimeError struct{ error }
+
+type checkedWriter struct {
+	writer io.Writer
+	failed bool
+}
+
+func (w *checkedWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	if err != nil || n != len(data) {
+		w.failed = true
+		return n, errors.New("cannot write output")
+	}
+	return n, nil
+}
+
+func write(out io.Writer, data []byte) error {
+	if n, err := out.Write(data); err != nil || n != len(data) {
+		return runtimeError{errors.New("cannot write output")}
+	}
+	return nil
+}
