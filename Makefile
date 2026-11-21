@@ -14,7 +14,7 @@ ACTIONLINT_VERSION := v1.7.12
 ZIZMOR_VERSION := 1.32.0
 UVX ?= uvx
 # Keep equal to the version inputs of goreleaser-action and download-syft in
-# .github/workflows/ci.yml.
+# .github/workflows/ci.yml and release.yml.
 GORELEASER_VERSION := v2.19.0
 SYFT_VERSION := v1.55.0
 TOOLS_DIR := $(CURDIR)/.cache/tools
