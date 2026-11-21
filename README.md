@@ -12,4 +12,4 @@ You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race
 
 ## License
 
-tessera is released under the [Apache License 2.0](LICENSE).
+tessera is released under the [Apache License 2.0](LICENSE). The copyright notice is in [NOTICE](NOTICE).

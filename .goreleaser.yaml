@@ -33,6 +33,8 @@ archives:
     files:
       - src: LICENSE
         info: *fixed_info
+      - src: NOTICE
+        info: *fixed_info
       - src: README.md
         info: *fixed_info
       - src: CHANGELOG.md
