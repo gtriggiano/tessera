@@ -1,0 +1,56 @@
+name: Bug report
+description: Report behavior that differs from what the documentation describes
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before you paste anything, remove credentials and hostnames you do not
+        want to publish. To report a vulnerability, do not open an issue: use
+        the [private security advisory](https://github.com/gtriggiano/tessera/security/advisories/new).
+  - type: input
+    id: version
+    attributes:
+      label: tessera version
+      description: >-
+        The output of `tessera version`. For the container image, run the image
+        with the `version` command.
+      placeholder: tessera 1.0.0 (revision 0123abc…; go1.27.4; built 2026-11-20T10:00:00Z)
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: How you run tessera
+      options:
+        - Container image
+        - Release binary
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: envoy
+    attributes:
+      label: Envoy version
+      description: The Envoy version that sends requests to tessera, if it matters.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what you expected
+      description: >-
+        Include the request, with its method, host, path and where it comes
+        from, and the decision you got.
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration
+      description: The relevant part of the configuration file, with secrets removed.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: The log lines around the problem.
+      render: text

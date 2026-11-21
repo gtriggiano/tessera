@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/gtriggiano/tessera/security/advisories/new
+    about: Report a security problem privately. Do not open an issue for it.
+  - name: Documentation
+    url: https://github.com/gtriggiano/tessera/tree/main/docs
+    about: What tessera is, and the reference for its public interface. The published site starts with the first release.

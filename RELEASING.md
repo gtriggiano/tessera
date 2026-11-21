@@ -18,20 +18,6 @@ Everything up to step 5 happens on a draft: a failed job can run again. After st
 
 tessera has no release yet. The first version is `1.0.0` (`initial-version` in `release-please-config.json`; `.release-please-manifest.json` holds `0.0.0` until then), so the first Release PR is `chore(main): release 1.0.0`. After it, a breaking change bumps the major version, and everything else follows the table in CONTRIBUTING.md.
 
-## One-time repository setup
-
-Make these settings before the first release; afterwards, check them when something behaves unexpectedly.
-
-- **General**: squash merge only, with the default message "Pull request title and description"; release immutability on.
-- **Advanced Security**: Dependabot alerts and security updates; secret scanning with push protection; **private vulnerability reporting**, which [SECURITY.md](SECURITY.md) and the issue forms point reporters to.
-- **Actions**: actions pinned to full commit SHAs; workflow permissions read-only; GitHub Actions may not create or approve pull requests.
-- **GitHub App `tessera-release`**, installed on this repository only, with Contents, Issues and Pull requests read and write. It creates the Release PR, the tags and the releases: events created with `GITHUB_TOKEN` would not start the CI on the Release PR.
-- **Environment `release`**, limited to the branch `main`, with the secret `RELEASE_APP_PRIVATE_KEY` (the App's private key) and the variable `RELEASE_APP_CLIENT_ID`.
-- **GitHub Pages** with GitHub Actions as source. The environment `github-pages` allows the branch `main` and the tags `v*` (the tags only for recovery runs).
-- **Ruleset `main`**: pull request required, squash only, linear history, no force push or deletion, branches up to date before merging, and these required checks: `Go checks`, `Go tests (linux/arm64)`, `Go tests (macOS)`, `Go vulnerabilities`, `Release dry run`, `Build documentation`, `PR title`. `Workflow audit` is not required: a new advisory about an action can turn it red without any change in the pull request. Fix what it reports before merging anyway.
-- **Ruleset `release tags`** on `v*`: creation, update and deletion restricted, with the App as the only bypass actor. Nobody creates a release tag by hand.
-- **Package `tessera` on ghcr.io**: public, linked to this repository. The package appears with the first image push, so the first release or release candidate stops in `publish` until you make it public (see [When something goes wrong](#when-something-goes-wrong)).
-
 ## Release a new version
 
 1. Merge pull requests as usual. The Release PR updates itself: release-please rebuilds it on every push to `main` (`always-update` in `release-please-config.json`), also when the push changes nothing in the changelog, so it never falls behind `main`.
