@@ -1,4 +1,10 @@
-# tessera
+<p align="left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/public/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/public/banner-light.svg">
+    <img alt="tessera — External authorization for Envoy, rule by rule" src="docs/public/banner-light.svg" width="680">
+  </picture>
+</p>
 
 **tessera** will be an external authorization service for [Envoy](https://www.envoyproxy.io/).
 
@@ -8,7 +14,11 @@ tessera is in development and has no release yet. The binary has only the `help`
 
 ## Development
 
-You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`. `make ci` adds the vulnerability scan and the workflow lint, as CI does.
+You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`. `make ci` adds the vulnerability scan, the workflow lint, and the build and checks of the documentation, as CI does.
+
+## Documentation
+
+The documentation sources are in [`docs/`](docs/), as a site built with [VitePress](https://vitepress.dev/). To preview it, run `make docs-install` once, then `make docs-dev`, or `make docs-build` followed by `make docs-preview` for the production build. `make docs-build` needs Node.js at the version in [`docs/.node-version`](docs/.node-version), and `make docs-check` also needs Google Chrome.
 
 ## License
 

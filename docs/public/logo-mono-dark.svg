@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Single-Ink Dark Monochrome Mark (#0F172A) for Light Backgrounds -->
+  <polygon points="128,24 218.07,76 218.07,180 128,232 37.93,180 37.93,76"
+           fill="#0F172A" fill-opacity="0.04"
+           stroke="#0F172A" stroke-width="5" stroke-linejoin="round"/>
+
+  <!-- Phase 1 (Top Stratum) -->
+  <polygon points="128,56 194,89 128,122 62,89"
+           fill="#0F172A" fill-opacity="0.10"
+           stroke="#0F172A" stroke-width="3.75" stroke-linejoin="round"/>
+
+  <!-- Phase 2 (Middle Stratum — 3 Visible Parallel Sub-Squares) -->
+  <polygon points="92,113 122,128 92,143 62,128"
+           fill="#0F172A" fill-opacity="0.16"
+           stroke="#0F172A" stroke-width="3.5" stroke-linejoin="round"/>
+  <polygon points="164,113 194,128 164,143 134,128"
+           fill="#0F172A" fill-opacity="0.16"
+           stroke="#0F172A" stroke-width="3.5" stroke-linejoin="round"/>
+  <polygon points="128,131 158,146 128,161 98,146"
+           fill="#0F172A" fill-opacity="0.16"
+           stroke="#0F172A" stroke-width="3.5" stroke-linejoin="round"/>
+
+  <!-- Phase 3 (Bottom Stratum — 3/4 Cut-Out Plane) -->
+  <polygon points="92,152 128,170 164,152 194,167 128,200 62,167"
+           fill="#0F172A" fill-opacity="0.24"
+           stroke="#0F172A" stroke-width="3.75" stroke-linejoin="round"/>
+</svg>

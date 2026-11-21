@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="canvasBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#EEF2F7"/>
+    </linearGradient>
+    <linearGradient id="prismStroke" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E13EAF"/>
+      <stop offset="50%" stop-color="#0891B2"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="prismTint" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E13EAF" stop-opacity="0.06"/>
+      <stop offset="50%" stop-color="#06B6D4" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="topS" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E13EAF"/>
+      <stop offset="100%" stop-color="#A21CAF"/>
+    </linearGradient>
+    <linearGradient id="topF" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E13EAF" stop-opacity="0.34"/>
+      <stop offset="100%" stop-color="#9333EA" stop-opacity="0.24"/>
+    </linearGradient>
+    <linearGradient id="midS" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="50%" stop-color="#0284C7"/>
+      <stop offset="100%" stop-color="#0891B2"/>
+    </linearGradient>
+    <linearGradient id="midF" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8B5CF6" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#06B6D4" stop-opacity="0.28"/>
+    </linearGradient>
+    <linearGradient id="botS" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0284C7"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="botF" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0EA5E9" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0.38"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed iOS-safe soft light canvas (no transparent corners) -->
+  <rect width="256" height="256" fill="url(#canvasBg)"/>
+
+  <!-- Centered tessera Isometric Logic Prism Mark (scaled 0.84 for iOS safe-zone padding) -->
+  <g transform="translate(128, 128) scale(0.84) translate(-128, -128)">
+    <polygon points="128,24 218.07,76 218.07,180 128,232 37.93,180 37.93,76" fill="#FFFFFF"/>
+    <polygon points="128,24 218.07,76 218.07,180 128,232 37.93,180 37.93,76" fill="url(#prismTint)" stroke="url(#prismStroke)" stroke-width="4.5" stroke-linejoin="round"/>
+    <polygon points="128,32 211.14,80 211.14,176 128,224 44.86,176 44.86,80" fill="none" stroke="#0284C7" stroke-opacity="0.18" stroke-width="1.35" stroke-linejoin="round"/>
+    <polygon points="128,56 194,89 128,122 62,89" fill="url(#topF)" stroke="url(#topS)" stroke-width="3.25" stroke-linejoin="round"/>
+    <polygon points="92,113 122,128 92,143 62,128" fill="url(#midF)" stroke="url(#midS)" stroke-width="3" stroke-linejoin="round"/>
+    <polygon points="164,113 194,128 164,143 134,128" fill="url(#midF)" stroke="url(#midS)" stroke-width="3" stroke-linejoin="round"/>
+    <polygon points="128,131 158,146 128,161 98,146" fill="url(#midF)" stroke="url(#midS)" stroke-width="3" stroke-linejoin="round"/>
+    <polygon points="92,152 128,170 164,152 194,167 128,200 62,167" fill="url(#botF)" stroke="url(#botS)" stroke-width="3.25" stroke-linejoin="round"/>
+  </g>
+</svg>

@@ -1,0 +1,30 @@
+import type { DefaultTheme } from 'vitepress'
+
+// Top navigation and per-section sidebars for the sections: Guide (/guide/)
+// and Reference (/reference/), and later Architecture (/architecture/).
+// List only pages that exist: each documentation change appends the pages it
+// adds (a nav entry when a section gets its first page, sidebar items as pages
+// land), so the site never links to a missing page.
+
+export const nav: DefaultTheme.NavItem[] = [
+  { text: 'Guide', link: '/guide/what-is-tessera', activeMatch: '^/guide/' },
+  { text: 'Reference', link: '/reference/versioning', activeMatch: '^/reference/' },
+]
+
+export const sidebar: DefaultTheme.SidebarMulti = {
+  '/guide/': [
+    {
+      text: 'Get started',
+      items: [{ text: 'What is tessera?', link: '/guide/what-is-tessera' }],
+    },
+  ],
+  '/reference/': [
+    {
+      text: 'Releases',
+      items: [
+        { text: 'Versioning', link: '/reference/versioning' },
+        { text: 'Changelog', link: '/reference/changelog' },
+      ],
+    },
+  ],
+}

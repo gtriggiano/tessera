@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#060911"/>
+      <stop offset="55%" stop-color="#0B1120"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <radialGradient id="markGlow" cx="16%" cy="50%" r="38%">
+      <stop offset="0%" stop-color="#06B6D4" stop-opacity="0.20"/>
+      <stop offset="55%" stop-color="#A855F7" stop-opacity="0.07"/>
+      <stop offset="100%" stop-color="#0B1120" stop-opacity="0"/>
+    </radialGradient>
+    
+    <pattern id="isoGrid" width="56" height="32.33" patternUnits="userSpaceOnUse">
+      <path d="M 0 16.165 L 28 0 L 56 16.165 L 28 32.33 Z" fill="none" stroke="#38BDF8" stroke-opacity="0.06" stroke-width="0.9"/>
+    </pattern>
+    <radialGradient id="gridFade" cx="50%" cy="50%" r="58%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="1"/>
+      <stop offset="68%" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="gridMask">
+      <rect width="1200" height="630" fill="url(#gridFade)"/>
+    </mask>
+    
+    <linearGradient id="prismStroke" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#E13EAF"/><stop offset="50%" stop-color="#06B6D4"/><stop offset="100%" stop-color="#10B981"/></linearGradient>
+    <linearGradient id="prismFill" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#E13EAF" stop-opacity="0.08"/><stop offset="50%" stop-color="#06B6D4" stop-opacity="0.10"/><stop offset="100%" stop-color="#10B981" stop-opacity="0.08"/></linearGradient>
+    <linearGradient id="topS" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#F472B6"/><stop offset="100%" stop-color="#C026D3"/></linearGradient>
+    <linearGradient id="topF" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#E13EAF" stop-opacity="0.42"/><stop offset="100%" stop-color="#9333EA" stop-opacity="0.28"/></linearGradient>
+    <linearGradient id="midS" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#A855F7"/><stop offset="45%" stop-color="#38BDF8"/><stop offset="100%" stop-color="#06B6D4"/></linearGradient>
+    <linearGradient id="midF" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#8B5CF6" stop-opacity="0.38"/><stop offset="100%" stop-color="#06B6D4" stop-opacity="0.32"/></linearGradient>
+    <linearGradient id="botS" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0EA5E9"/><stop offset="100%" stop-color="#10B981"/></linearGradient>
+    <linearGradient id="botF" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0EA5E9" stop-opacity="0.34"/><stop offset="100%" stop-color="#10B981" stop-opacity="0.44"/></linearGradient>
+  </defs>
+
+  <rect width="1200" height="300" rx="18" fill="url(#bgGrad)" stroke="#1E293B" stroke-width="2"/>
+  <rect width="1200" height="300" rx="18" fill="url(#isoGrid)" mask="url(#gridMask)"/>
+  <rect width="1200" height="300" rx="18" fill="url(#markGlow)"/>
+
+  <!-- Primary Isometric Logic Prism Mark -->
+  <g transform="translate(175, 150) scale(0.95) translate(-128, -128)">
+    
+    <polygon points="128,24 218.07,76 218.07,180 128,232 37.93,180 37.93,76" fill="url(#prismFill)" stroke="url(#prismStroke)" stroke-width="4" stroke-linejoin="round"/>
+    <polygon points="128,32 211.14,80 211.14,176 128,224 44.86,176 44.86,80" fill="none" stroke="#38BDF8" stroke-opacity="0.18" stroke-width="1.25" stroke-linejoin="round"/>
+    <polygon points="128,56 194,89 128,122 62,89" fill="url(#topF)" stroke="url(#topS)" stroke-width="3" stroke-linejoin="round"/>
+    <polygon points="92,113 122,128 92,143 62,128" fill="url(#midF)" stroke="url(#midS)" stroke-width="2.75" stroke-linejoin="round"/>
+    <polygon points="164,113 194,128 164,143 134,128" fill="url(#midF)" stroke="url(#midS)" stroke-width="2.75" stroke-linejoin="round"/>
+    <polygon points="128,131 158,146 128,161 98,146" fill="url(#midF)" stroke="url(#midS)" stroke-width="2.75" stroke-linejoin="round"/>
+    <polygon points="92,152 128,170 164,152 194,167 128,200 62,167" fill="url(#botF)" stroke="url(#botS)" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Wordmark & Tagline -->
+  <g transform="translate(335, 70)">
+    <!-- Lowercase "tessera" in Chakra Petch Bold (74px vector path) -->
+    <path fill="#FFFFFF" aria-label="tessera" d="M7.77 54.45 L7.77 33.36 L1.11 33.36 L1.11 25.15 L7.92 25.15 L7.92 13.16 L17.54 13.16 L17.54 25.15 L28.79 25.15 L28.79 33.44 L17.54 33.44 L17.54 51.27 L20.05 53.71 L28.79 53.71 L28.79 62.00 L15.39 62.00 Z M34.84 54.45 L34.84 32.84 L42.46 25.15 L63.25 25.15 L70.95 32.84 L70.95 46.83 L44.60 46.83 L44.60 51.57 L46.97 54.01 L59.03 54.01 L61.25 51.71 L61.25 49.79 L70.87 49.79 L70.87 54.60 L63.55 62.00 L42.31 62.00 Z M61.18 40.02 L61.18 35.73 L58.66 33.14 L47.12 33.14 L44.60 35.73 L44.60 40.02 Z M77.37 54.75 L77.37 50.23 L86.99 50.23 L86.99 52.31 L88.62 54.01 L100.60 54.01 L102.23 52.31 L102.23 49.12 L100.53 47.35 L84.62 47.35 L77.66 40.32 L77.66 32.25 L84.69 25.15 L103.93 25.15 L111.11 32.40 L111.11 36.91 L101.49 36.91 L101.49 34.84 L99.86 33.14 L88.91 33.14 L87.28 34.84 L87.28 37.73 L88.99 39.50 L104.90 39.50 L111.85 46.53 L111.85 54.90 L104.82 62.00 L84.55 62.00 Z M117.53 54.75 L117.53 50.23 L127.15 50.23 L127.15 52.31 L128.78 54.01 L140.77 54.01 L142.40 52.31 L142.40 49.12 L140.69 47.35 L124.78 47.35 L117.83 40.32 L117.83 32.25 L124.86 25.15 L144.10 25.15 L151.28 32.40 L151.28 36.91 L141.66 36.91 L141.66 34.84 L140.03 33.14 L129.08 33.14 L127.45 34.84 L127.45 37.73 L129.15 39.50 L145.06 39.50 L152.02 46.53 L152.02 54.90 L144.99 62.00 L124.71 62.00 Z M158.81 54.45 L158.81 32.84 L166.43 25.15 L187.22 25.15 L194.92 32.84 L194.92 46.83 L168.57 46.83 L168.57 51.57 L170.94 54.01 L183.00 54.01 L185.22 51.71 L185.22 49.79 L194.84 49.79 L194.84 54.60 L187.52 62.00 L166.28 62.00 Z M185.15 40.02 L185.15 35.73 L182.63 33.14 L171.09 33.14 L168.57 35.73 L168.57 40.02 Z M203.19 25.15 L212.22 25.15 L212.22 31.29 L218.14 25.15 L228.64 25.15 L228.64 33.44 L220.13 33.44 L212.96 40.84 L212.96 62.00 L203.19 62.00 Z M232.84 55.19 L232.84 46.76 L239.65 39.95 L258.37 39.95 L258.37 35.29 L256.08 32.99 L244.98 32.99 L242.76 35.29 L242.76 37.36 L233.14 37.36 L233.14 33.14 L241.06 25.15 L260.08 25.15 L267.99 33.14 L267.99 62.00 L259.19 62.00 L259.19 56.75 L253.71 62.00 L239.65 62.00 Z M253.05 54.45 L258.37 49.35 L258.37 46.90 L244.46 46.90 L242.46 48.90 L242.46 52.60 L244.31 54.45 Z"/>
+
+    <!-- Tagline (two lines, as on the social card) -->
+    <text x="2" y="108" fill="#E2E8F0" font-family="'Inter', system-ui, -apple-system, sans-serif" font-size="26" font-weight="500">External authorization for Envoy, rule by rule.</text>
+    <text x="2" y="142" fill="#94A3B8" font-family="'Inter', system-ui, -apple-system, sans-serif" font-size="22" font-weight="400">Fast, explainable, fail-closed.</text>
+  </g>
+</svg>

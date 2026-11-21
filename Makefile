@@ -1,5 +1,6 @@
 GO ?= go
 GOFMT ?= $(shell $(GO) env GOROOT)/bin/gofmt
+NPM ?= npm
 BUILD_DIR ?= bin
 # Build identity for make build: the commit and its date, in UTC. Override on
 # the command line only (make build VERSION=...), not from the environment.
@@ -22,11 +23,11 @@ SYFT_DIR := $(TOOLS_DIR)/syft-$(SYFT_VERSION)
 SNAPSHOT_FLAGS ?=
 FUZZ_TIME ?= 10s
 
-.PHONY: help build fmt fmt-check vet test fuzz mod-check check ci vuln workflows-check workflows-audit release-check release-snapshot
+.PHONY: help build fmt fmt-check vet test fuzz mod-check check ci vuln workflows-check workflows-audit release-check release-snapshot docs-install docs-audit docs-dev docs-build docs-check docs-preview
 
 help:
 	@echo "make check           Check Go formatting, modules, vet, tests and build"
-	@echo "make ci              Run Go checks, fuzzing, vulnerability scan and workflow lint"
+	@echo "make ci              Run Go checks, fuzzing, vulnerability scan, workflow lint, docs build and checks"
 	@echo "make build           Build tessera in bin/"
 	@echo "make fmt             Format Go sources"
 	@echo "make fuzz            Run each fuzz target for $(FUZZ_TIME) (none yet)"
@@ -35,6 +36,12 @@ help:
 	@echo "make workflows-audit Audit workflows and Dependabot configuration using pinned zizmor (needs uv)"
 	@echo "make release-check   Validate the GoReleaser configuration"
 	@echo "make release-snapshot Build archives, checksums, SBOMs and images in dist/ without publishing (needs Docker)"
+	@echo "make docs-install    Install locked documentation dependencies"
+	@echo "make docs-audit      Check documentation dependency advisories"
+	@echo "make docs-dev        Serve documentation locally"
+	@echo "make docs-build      Build the static documentation site and check its links"
+	@echo "make docs-check      Render every built page in Chrome and check its diagrams"
+	@echo "make docs-preview    Preview the built documentation site"
 
 build:
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/tessera ./cmd/tessera
@@ -88,3 +95,25 @@ release-snapshot: $(GORELEASER) $(SYFT_DIR)/syft
 	PATH="$(SYFT_DIR):$$PATH" $(GORELEASER) release --snapshot --clean $(SNAPSHOT_FLAGS)
 
 ci: check fuzz vuln workflows-check
+	$(MAKE) docs-install
+	$(MAKE) docs-audit
+	$(MAKE) docs-build
+	$(MAKE) docs-check
+
+docs-install:
+	$(NPM) --prefix docs ci
+
+docs-audit:
+	$(NPM) --prefix docs audit --audit-level=moderate
+
+docs-dev:
+	$(NPM) --prefix docs run docs:dev
+
+docs-build:
+	$(NPM) --prefix docs run docs:build
+
+docs-check:
+	$(NPM) --prefix docs run docs:check
+
+docs-preview:
+	$(NPM) --prefix docs run docs:preview
