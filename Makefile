@@ -12,9 +12,17 @@ ACTIONLINT_VERSION := v1.7.12
 # Keep equal to the version input of zizmor-action in .github/workflows/ci.yml.
 ZIZMOR_VERSION := 1.32.0
 UVX ?= uvx
+# Keep equal to the version inputs of goreleaser-action and download-syft in
+# .github/workflows/ci.yml.
+GORELEASER_VERSION := v2.19.0
+SYFT_VERSION := v1.55.0
+TOOLS_DIR := $(CURDIR)/.cache/tools
+GORELEASER := $(TOOLS_DIR)/goreleaser-$(GORELEASER_VERSION)/goreleaser
+SYFT_DIR := $(TOOLS_DIR)/syft-$(SYFT_VERSION)
+SNAPSHOT_FLAGS ?=
 FUZZ_TIME ?= 10s
 
-.PHONY: help build fmt fmt-check vet test fuzz mod-check check ci vuln workflows-check workflows-audit
+.PHONY: help build fmt fmt-check vet test fuzz mod-check check ci vuln workflows-check workflows-audit release-check release-snapshot
 
 help:
 	@echo "make check           Check Go formatting, modules, vet, tests and build"
@@ -25,6 +33,8 @@ help:
 	@echo "make vuln            Scan Go code using pinned govulncheck"
 	@echo "make workflows-check Validate GitHub Actions workflows"
 	@echo "make workflows-audit Audit workflows and Dependabot configuration using pinned zizmor (needs uv)"
+	@echo "make release-check   Validate the GoReleaser configuration"
+	@echo "make release-snapshot Build archives, checksums, SBOMs and images in dist/ without publishing (needs Docker)"
 
 build:
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/tessera ./cmd/tessera
@@ -62,5 +72,19 @@ workflows-check:
 workflows-audit:
 	@command -v $(UVX) >/dev/null 2>&1 || { echo "make workflows-audit: $(UVX) not found; install uv from https://docs.astral.sh/uv/" >&2; exit 1; }
 	$(UVX) zizmor@$(ZIZMOR_VERSION) --offline .
+
+# GoReleaser and syft are built once per version into .cache/tools/; GoReleaser
+# runs syft from PATH to write the SBOMs of the archives.
+$(GORELEASER):
+	GOBIN=$(dir $@) $(GO) install github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
+
+$(SYFT_DIR)/syft:
+	GOBIN=$(SYFT_DIR) $(GO) install github.com/anchore/syft/cmd/syft@$(SYFT_VERSION)
+
+release-check: $(GORELEASER)
+	$(GORELEASER) check
+
+release-snapshot: $(GORELEASER) $(SYFT_DIR)/syft
+	PATH="$(SYFT_DIR):$$PATH" $(GORELEASER) release --snapshot --clean $(SNAPSHOT_FLAGS)
 
 ci: check fuzz vuln workflows-check
