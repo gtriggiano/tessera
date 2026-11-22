@@ -42,6 +42,7 @@ Each package under `internal/` has one role.
 | `cmd/tessera/` | Entry point. |
 | `internal/cli/` | Commands: `help`, `version`, `config validate` and `config print`. |
 | `internal/config/` | The configuration file: types, defaults, strict reading, checks and printing; the tests that generate its JSON Schema and compare its documentation with the code. |
+| `internal/telemetry/` | Log events, in logfmt or JSON. |
 | `internal/release/` | Tests only: version references in the documentation and the README. |
 | `internal/agentdocs/` | Tests only: consistency of `AGENTS.md`, `CLAUDE.md` and the skills. |
 
