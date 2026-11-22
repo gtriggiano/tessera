@@ -435,9 +435,35 @@ func jsonSchemaCheck(t *testing.T, schema map[string]any, data []byte) []string 
 	return jsonSchemaProblems(t, schema, schema, jsonSchemaDocument(t, data), "configuration")
 }
 
-// The schema never rejects a file that tessera accepts.
+// The schema never rejects a file that tessera accepts: the examples, the
+// configuration snippets of the documentation, and the cases below.
 func TestJSONSchemaAcceptsValidConfigurations(t *testing.T) {
 	schema := loadJSONSchema(t)
+	examples, err := filepath.Glob(filepath.Join(examplesDir, "*.yaml"))
+	if err != nil || len(examples) == 0 {
+		t.Fatalf("no examples found: %v", err)
+	}
+	for _, path := range examples {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(data, nil); err != nil {
+			continue // Reported by TestRepositoryExamples.
+		}
+		for _, problem := range jsonSchemaCheck(t, schema, data) {
+			t.Errorf("%s: tessera accepts it, the schema does not: %s", filepath.Base(path), problem)
+		}
+	}
+	for where, snippet := range docsConfigSnippets(t) {
+		_, completed, err := parseConfigSnippet(snippet)
+		if err != nil {
+			continue // Reported by TestDocsConfigSnippets.
+		}
+		for _, problem := range jsonSchemaCheck(t, schema, completed) {
+			t.Errorf("%s: tessera accepts it, the schema does not: %s", where, problem)
+		}
+	}
 	environment := map[string]string{"LISTEN": ":9101", "ADMIN": "127.0.0.1:9102", "AGE": "30m", "LEVEL": "warn", "ACTION": "allow"}
 	for name, text := range map[string]string{
 		"required keys only": "policy:\n  default_action: deny\n",

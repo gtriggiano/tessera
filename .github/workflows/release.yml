@@ -330,6 +330,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPOSITORY: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
@@ -342,6 +346,9 @@ jobs:
           out=$(docker run --rm "$image" version)
           echo "$out"
           grep -qF "tessera $VERSION (revision $GITHUB_SHA;" <<< "$out"
+          docker run --rm --read-only \
+            -v "$PWD/docs/examples/minimal.yaml:/etc/tessera/config.yaml:ro" \
+            "$image" config validate
       - name: Verify the image attestation
         run: gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$REPOSITORY" --signer-workflow "$SIGNER_WORKFLOW"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

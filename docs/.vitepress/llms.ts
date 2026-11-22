@@ -13,12 +13,15 @@
 // A twin is the page source with what only VitePress understands rewritten:
 // frontmatter removed, included files expanded, the version placeholder
 // replaced, containers turned into block quotes and code groups into labeled
-// fences. The build fails on a construct that this file cannot rewrite.
+// fences. In a file included with <<<, a relative schema path becomes an
+// address, as in the HTML (schema-path.ts). The build fails on a construct
+// that this file cannot rewrite.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, extname, join, resolve } from 'node:path'
 import type { DefaultTheme, HeadConfig, SiteConfig, TransformContext } from 'vitepress'
 import { setReleaseVersion } from './release-version'
+import { publishSchemaPaths } from './schema-path'
 
 type Frontmatter = Record<string, any>
 
@@ -47,8 +50,12 @@ const fail = (page: string, message: string): never => {
 
 // Reads a file named by a page: @/ is the documentation root, any other path
 // is relative to the page.
+function includedFile(srcDir: string, page: string, path: string): string {
+  return path.startsWith('@/') ? join(srcDir, path.slice(2)) : resolve(srcDir, dirname(page), path)
+}
+
 function readIncluded(srcDir: string, page: string, path: string): string {
-  const file = path.startsWith('@/') ? join(srcDir, path.slice(2)) : resolve(srcDir, dirname(page), path)
+  const file = includedFile(srcDir, page, path)
   try {
     return readFileSync(file, 'utf8').trimEnd()
   } catch {
@@ -65,7 +72,7 @@ const containerTitles: Record<string, string> = {
 }
 
 // The body of a page as plain Markdown.
-function plainMarkdown(srcDir: string, page: string, source: string): string {
+function plainMarkdown(srcDir: string, base: string, page: string, source: string): string {
   const out: string[] = []
   // Open containers, innermost last; a quoted one prefixes its lines with ">".
   const containers: { name: string; quoted: boolean }[] = []
@@ -112,7 +119,8 @@ function plainMarkdown(srcDir: string, page: string, source: string): string {
       const snippet = /^<<<\s*([^\s{#]+)(?:\{([\w-]+)\})?(?:\s+\[(.+)\])?\s*$/.exec(line)
       if (!snippet) return fail(page, `unsupported snippet: ${line}`)
       const [, path, lang, label] = snippet
-      const text = readIncluded(srcDir, page, path).replace(/\n$/, '')
+      const file = includedFile(srcDir, page, path)
+      const text = publishSchemaPaths(readIncluded(srcDir, page, path).replace(/\n$/, ''), file, srcDir, base)
       // A fence longer than any run of backticks in the file.
       const ticks = '`'.repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map((run) => run[0].length + 1)))
       emitLabel(label)
@@ -202,7 +210,7 @@ export function writeLlmsFiles(siteConfig: SiteConfig, releaseVersion: string): 
     const source = readFileSync(join(srcDir, page), 'utf8').replace(/^---\n[\s\S]*?\n---\n/, '')
     const intro = frontmatter.layout === 'home' ? homeIntro(frontmatter) : ''
     // As in the HTML, the version is not replaced in files included with <<<.
-    const markdown = plainMarkdown(srcDir, page, setReleaseVersion(intro + source, releaseVersion))
+    const markdown = plainMarkdown(srcDir, base, page, setReleaseVersion(intro + source, releaseVersion))
     descriptions.set(page, setReleaseVersion(describe(frontmatter, markdown.replace(/^# .*\n/, '')), releaseVersion))
     mkdirSync(dirname(join(outDir, page)), { recursive: true })
     writeFileSync(join(outDir, page), markdown)

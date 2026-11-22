@@ -1,9 +1,11 @@
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { defineConfig, type HeadConfig } from 'vitepress'
 import { llmsHead, writeLlmsFiles } from './llms'
 import { mermaidFence } from './mermaid-fence'
 import { nav, sidebar } from './navigation'
 import { setReleaseVersion } from './release-version'
+import { schemaPathFence } from './schema-path'
 
 const repository = 'https://github.com/gtriggiano/tessera'
 
@@ -80,6 +82,7 @@ export default defineConfig({
   markdown: {
     config: (md) => {
       mermaidFence(md);
+      schemaPathFence(md, fileURLToPath(new URL("..", import.meta.url)), base);
       // The source reaches the parser with its includes already expanded.
       const parse = md.parse.bind(md);
       md.parse = (source, env) =>

@@ -14,11 +14,7 @@ No command serves requests yet: `tessera config validate` and `tessera config pr
 
 The schema of the latest release is at `https://gtriggiano.github.io/tessera/config.schema.json`, and the schema of each version at `https://gtriggiano.github.io/tessera/v<major>.<minor>/config.schema.json`:
 
-```yaml
-# yaml-language-server: $schema=https://gtriggiano.github.io/tessera/config.schema.json
-policy:
-  default_action: deny
-```
+<<< @/examples/minimal.yaml{yaml}
 
 The schema does not check the rules between two keys, nor values that contain `${NAME}`: `tessera config validate` does.
 
@@ -48,7 +44,7 @@ No key accepts a negative duration.
 
 `${NAME}` in a string or duration value is replaced with the value of the environment variable `NAME`. `NAME` starts with a letter or an underscore, followed by letters, digits or underscores.
 
-```yaml
+```yaml [config.yaml]
 log:
   level: ${LOG_LEVEL:-info}
 ```
@@ -81,7 +77,7 @@ tessera: server.drain_delay (line 3, column 16): expected a duration with units,
 ## `server`
 
 **Type:** mapping\
-**Default:** every key has its own default
+**Default:** `{}`
 
 The gRPC listener for Envoy.
 
@@ -141,7 +137,7 @@ At shutdown, the longest time to finish the calls in progress.
 ## `admin`
 
 **Type:** mapping\
-**Default:** every key has its own default
+**Default:** `{}`
 
 The listener of the health checks and the metrics.
 
@@ -160,7 +156,7 @@ The address of the admin listener, in the `host:port` form of [`server.listen`](
 ## `log`
 
 **Type:** mapping\
-**Default:** every key has its own default
+**Default:** `{}`
 
 The log events, written to standard error.
 

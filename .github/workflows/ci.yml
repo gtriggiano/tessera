@@ -117,6 +117,9 @@ jobs:
           out=$(docker run --rm "$image" version)
           echo "$out"
           grep -qF "tessera $version (revision $(git rev-parse HEAD);" <<< "$out"
+          docker run --rm --read-only \
+            -v "$PWD/docs/examples/minimal.yaml:/etc/tessera/config.yaml:ro" \
+            "$image" config validate
 
   vulnerabilities:
     name: Go vulnerabilities

@@ -1,0 +1,3 @@
+# yaml-language-server: $schema=../public/config.schema.json
+policy:
+  default_action: deny
