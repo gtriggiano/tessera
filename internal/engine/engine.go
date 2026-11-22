@@ -19,6 +19,7 @@ import (
 
 	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/request"
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // Action is what a decision does with a request.
@@ -82,11 +83,15 @@ type Policy struct {
 	Rules        []Rule
 }
 
-// Options are the hooks of an Engine.
+// Options are the hooks and the data of an Engine.
 type Options struct {
 	// OnPanic, when set, is called with each panic recovered while a
 	// condition is evaluated, with its stack when it is known.
 	OnPanic func(*expr.Panic)
+	// Sets holds the sets that the conditions read: its declarations are
+	// the fields of the variable sets, and each decision reads one
+	// snapshot of it. Nil declares no set.
+	Sets *sets.Store
 }
 
 // AuditMatch is a rule in audit mode whose condition was true.
@@ -154,12 +159,13 @@ type Engine struct {
 	defaultAction Action
 	denyResponse  *Response
 	onPanic       func(*expr.Panic)
+	sets          *sets.Store
 }
 
 // New compiles p. An action other than allow or deny, or a condition that
 // does not compile, is an error: a valid configuration has neither.
 func New(p Policy, o Options) (*Engine, error) {
-	env, err := expr.NewEnv(expr.Options{OnPanic: o.OnPanic})
+	env, err := expr.NewEnv(expr.Options{OnPanic: o.OnPanic, Sets: o.Sets.Declarations()})
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +177,7 @@ func New(p Policy, o Options) (*Engine, error) {
 		defaultAction: p.DefaultAction,
 		denyResponse:  normalized(p.DenyResponse),
 		onPanic:       o.OnPanic,
+		sets:          o.Sets,
 	}
 	for i, r := range p.Rules {
 		if r.Action != Allow && r.Action != Deny {
@@ -264,11 +271,11 @@ func (e *Engine) Explain(r *request.Request) Explanation {
 	return x
 }
 
-// decide decides r. trace, when set, receives the outcome of each rule
-// evaluated.
+// decide decides r, with one snapshot of the sets for every rule. trace,
+// when set, receives the outcome of each rule evaluated.
 func (e *Engine) decide(r *request.Request, trace func(*rule, Outcome)) Decision {
 	var d Decision
-	in := expr.NewInput(r)
+	in := expr.NewInput(r, e.sets.Snapshot())
 	for i := range e.rules {
 		rl := &e.rules[i]
 		in.SetRule(rl.name)

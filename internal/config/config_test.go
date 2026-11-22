@@ -44,7 +44,7 @@ func TestDefaults(t *testing.T) {
 		ClientIP: ClientIP{From: "peer"},
 		Policy:   Policy{Mode: "enforce", DefaultAction: "deny", DenyResponse: Response{Status: 403, Headers: map[string]string{}}, Rules: []Rule{}},
 	}
-	if c.Server != want.Server || c.Admin != want.Admin || c.Log != want.Log || c.ClientIP != want.ClientIP || !reflect.DeepEqual(c.Policy, want.Policy) {
+	if c.Server != want.Server || c.Admin != want.Admin || c.Log != want.Log || c.ClientIP != want.ClientIP || !reflect.DeepEqual(c.Policy, want.Policy) || c.Sets == nil || len(c.Sets) != 0 {
 		t.Fatalf("got %+v", *c)
 	}
 }
@@ -121,7 +121,7 @@ func TestInvalidConfigurations(t *testing.T) {
 		{"root scalar", secret + "\n", "configuration: the root is not a mapping"},
 		{"missing policy", "log:\n  level: info\n", "policy.default_action: required"},
 		{"missing default action", "policy: {}\n", "policy.default_action (line 1, column 9): required"},
-		{"unknown top-level key", "policy: {default_action: deny}\nsets: {}\n", "sets (line 2, column 1): unknown key"},
+		{"unknown top-level key", "policy: {default_action: deny}\nroutes: {}\n", "routes (line 2, column 1): unknown key"},
 		{"unknown nested key", "policy:\n  default_action: deny\n  routes: []\n", "policy.routes (line 3, column 3): unknown key"},
 		{"unknown key not echoed", "policy: {default_action: deny}\n" + secret + ": 1\n", "<unknown> (line 2, column 1): unknown key"},
 		{"duplicate key", "policy:\n  default_action: deny\n  default_action: allow\n", "policy.default_action (line 3, column 3): duplicate key"},
@@ -301,6 +301,7 @@ log:
   decisions: deny
 client_ip:
   from: peer
+sets: {}
 policy:
   mode: enforce
   default_action: '[REDACTED]'

@@ -14,6 +14,7 @@ import (
 	"github.com/gtriggiano/tessera/internal/config"
 	"github.com/gtriggiano/tessera/internal/engine"
 	"github.com/gtriggiano/tessera/internal/request"
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // redactedHeaders are the headers whose values eval never prints, as the
@@ -24,7 +25,7 @@ const redacted = "[REDACTED]"
 
 type evalFlags struct {
 	config, ip, host, method, path, query, scheme, output string
-	headers                                               []string
+	headers, sets                                         []string
 }
 
 func evalCommand(lookup config.LookupEnv) *cobra.Command {
@@ -36,7 +37,8 @@ func evalCommand(lookup config.LookupEnv) *cobra.Command {
 			"file, and show the attributes that the rules read, the outcome of each rule up\n" +
 			"to the one that decides, and the decision. The request goes through the same\n" +
 			"normalization as a request from Envoy; --ip sets client.ip, which is missing\n" +
-			"without it. Nothing is logged and no socket is opened.\n\n" +
+			"without it. The sets are loaded as serve loads them, their files included,\n" +
+			"except those that --set replaces. Nothing is logged and no socket is opened.\n\n" +
 			"Exit status: 0 whatever the decision; 2 for usage and configuration errors.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -47,11 +49,23 @@ func evalCommand(lookup config.LookupEnv) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			given, err := f.setValues()
+			if err != nil {
+				return err
+			}
 			_, cfg, err := loadConfig(cmd, lookup, f.config)
 			if err != nil {
 				return err
 			}
-			e, err := app.NewEngine(cfg.Policy, nil)
+			replace, err := replacements(cfg, given)
+			if err != nil {
+				return err
+			}
+			loaded, err := app.LoadSets(cfg, replace)
+			if err != nil {
+				return err
+			}
+			e, err := app.NewEngine(cfg.Policy, loaded.Store, nil)
 			if err != nil {
 				return runtimeError{errors.New("cannot compile the policy")}
 			}
@@ -77,6 +91,7 @@ func evalCommand(lookup config.LookupEnv) *cobra.Command {
 	flags.StringVar(&f.query, "query", "", "the query of the request, without ?")
 	flags.StringVar(&f.scheme, "scheme", "https", "the scheme of the request")
 	flags.StringArrayVar(&f.headers, "header", nil, "a header, as 'name: value'; repeat it for more")
+	flags.StringArrayVar(&f.sets, "set", nil, "replace the content of a set, as 'name=value,value', read as its values; 'name=' for an empty set; its file is not read; once per set, repeat it for more sets")
 	flags.StringVar(&f.output, "output", "text", "output format: text or json")
 	return cmd
 }
@@ -113,6 +128,52 @@ func (f *evalFlags) request() (*request.Request, error) {
 		}
 	}
 	return r, nil
+}
+
+// setFlag is a --set flag: the name of a set and its values.
+type setFlag struct {
+	name   string
+	values []string
+}
+
+// setValues splits the --set flags. Their text is not repeated in an error:
+// it could be anything.
+func (f *evalFlags) setValues() ([]setFlag, error) {
+	out := make([]setFlag, 0, len(f.sets))
+	for _, s := range f.sets {
+		name, list, ok := strings.Cut(s, "=")
+		if !ok {
+			return nil, errors.New("invalid --set; want name=value,value")
+		}
+		flag := setFlag{name: name}
+		if list != "" {
+			flag.values = strings.Split(list, ",")
+		}
+		out = append(out, flag)
+	}
+	return out, nil
+}
+
+// replacements builds the copy of each set that --set replaces, from the
+// values read as the values of its type. An unknown set and an invalid value
+// are usage errors that repeat no value; a declared name can be named.
+func replacements(cfg *config.Config, given []setFlag) (map[string]*sets.Set, error) {
+	out := map[string]*sets.Set{}
+	for _, g := range given {
+		s, ok := cfg.Sets[g.name]
+		if !ok {
+			return nil, errors.New("invalid --set: the configuration declares no set of this name")
+		}
+		if _, twice := out[g.name]; twice {
+			return nil, fmt.Errorf("invalid --set: the set %s is given twice", g.name)
+		}
+		set, err := sets.FromValues(sets.Type(s.Type), g.values, s.MaxEntries)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --set for the set %s: %w", g.name, err)
+		}
+		out[g.name] = set
+	}
+	return out, nil
 }
 
 // token reports whether s is an HTTP field name.

@@ -226,13 +226,16 @@ func TestEnvoy(t *testing.T) {
 	}
 }
 
-// start runs tessera with the configuration file config, then Envoy, and
-// waits until a request through Envoy gets an answer other than 503. It
-// returns the tessera container and the address of Envoy.
-func (e *environment) start(t *testing.T, name, config string) (tessera, front string) {
+// start runs tessera with the configuration file config, and the volumes of
+// volumes, then Envoy, and waits until a request through Envoy gets an answer
+// other than 503. It returns the tessera container and the address of Envoy.
+func (e *environment) start(t *testing.T, name, config string, volumes ...string) (tessera, front string) {
 	t.Helper()
-	tessera = e.run(t, "tessera-"+name, "--network-alias", "tessera", "--read-only",
-		"--volume", config+":/etc/tessera/config.yaml:ro", "--publish", "127.0.0.1::9090", e.tessera)
+	args := []string{"--network-alias", "tessera", "--read-only", "--volume", config + ":/etc/tessera/config.yaml:ro"}
+	for _, volume := range volumes {
+		args = append(args, "--volume", volume)
+	}
+	tessera = e.run(t, "tessera-"+name, append(args, "--publish", "127.0.0.1::9090", e.tessera)...)
 	admin := hostAddress(t, tessera, "9090/tcp")
 	poll(t, "http://"+admin+"/readyz", func(status int) bool { return status == http.StatusOK })
 	envoy := e.run(t, "envoy-"+name, "--publish", "127.0.0.1::8080", e.envoy)

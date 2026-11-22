@@ -15,13 +15,13 @@ The **tessera** binary has a command that answers Envoy's authorization requests
 | [`tessera version`](#tessera-version) | Print build information |
 | [`tessera`, `tessera help`](#tessera-and-tessera-help) | Print help |
 
-Only `tessera serve` opens sockets. `tessera eval` and the `config` commands read one file, the configuration, and nothing else.
+Only `tessera serve` opens sockets. `tessera config print` reads one file, the configuration; `tessera serve`, `tessera eval` and `tessera config validate` read the files of its [sets](./configuration.md#sets) too.
 
 ## Synopsis
 
 ```text
 tessera serve [--config <path>]
-tessera eval [--config <path>] [--ip <address>] [--host <host>] [--method <method>] [--path <path>] [--query <query>] [--scheme <scheme>] [--header '<name>: <value>']... [--output text|json]
+tessera eval [--config <path>] [--ip <address>] [--host <host>] [--method <method>] [--path <path>] [--query <query>] [--scheme <scheme>] [--header '<name>: <value>']... [--set '<name>=<value>,<value>']... [--output text|json]
 tessera config validate [--config <path>]
 tessera config print [--config <path>]
 tessera version [--output text|json]
@@ -43,7 +43,7 @@ Only `tessera help` takes positional arguments: the name of a command. An extra 
 
 ### Configuration file
 
-`tessera serve`, `tessera eval`, `tessera config validate` and `tessera config print` read exactly one file:
+`tessera serve`, `tessera eval`, `tessera config validate` and `tessera config print` read exactly one configuration file:
 
 1. the one named by `--config`, when the flag is present;
 2. otherwise, the one named by the `TESSERA_CONFIG` environment variable, when it is set.
@@ -53,7 +53,7 @@ With neither, the command fails with `no configuration file; use --config or TES
 ### Output streams
 
 - Standard output carries the result of the command: help, build information, the evaluation of `tessera eval`, `configuration valid`, the printed configuration, and the [log events](./logs.md) of `tessera serve`, its errors included.
-- Standard error carries the errors of the command line, one line each: `tessera: <message>`. `tessera serve` writes there only the errors found before it reads its configuration.
+- Standard error carries the errors of the command line, one line each: `tessera: <message>`, and the warnings of [`tessera config validate`](#tessera-config-validate): `tessera: warning: <message>`. `tessera serve` writes there only the errors found before it reads its configuration and its sets.
 
 ### Exit status
 
@@ -61,7 +61,7 @@ With neither, the command fails with `no configuration file; use --config or TES
 | --- | --- |
 | 0 | Success. For `tessera serve`, a shutdown in which every call finished. |
 | 1 | Runtime failure: the output could not be written, or `tessera serve` could not open a listener, a listener failed, or its shutdown was forced (see [Exit status of `serve`](#exit-status-of-serve)). |
-| 2 | Usage or configuration error: an unknown command, argument or flag, an invalid flag value, or a configuration file that is not selected, missing, unreadable or invalid. |
+| 2 | Usage or configuration error: an unknown command, argument or flag, an invalid flag value, a configuration file that is not selected, missing, unreadable or invalid, or a set that cannot be read or is invalid. |
 
 ### Signals
 
@@ -77,14 +77,14 @@ Answers Envoy's external authorization requests on the gRPC listener, at [`serve
 
 ### Startup
 
-1. Reads the [selected file](#configuration-file) and checks it like `tessera config validate`. An error here prints `tessera: <message>` and exits with status 2, before anything opens.
-2. Logs [`starting`](./logs.md#starting).
+1. Reads the [selected file](#configuration-file) and checks it like `tessera config validate`, and loads every [set](./configuration.md#sets), reading its file when it has one. An error here, an invalid set included, prints `tessera: <message>` and exits with status 2, before anything opens.
+2. Logs [`starting`](./logs.md#starting), then a [`config_warning`](./logs.md#config-warning) for each warning of the configuration, then a [`set_loaded`](./logs.md#set-loaded) for each set.
 3. Opens the gRPC listener, then the admin listener, within 10 seconds for both, the time to resolve their host names included. If one cannot open, or does not open in time, the other is closed, [`startup_failed`](./logs.md#startup-failed) is logged and the exit status is 1. A signal stops a listener that is still resolving its host name in the same way.
-4. Logs [`listening`](./logs.md#listening) for each listener, reports ready, on `/readyz` and through the gRPC health service, logs [`ready`](./logs.md#ready) and starts answering.
+4. Logs [`listening`](./logs.md#listening) for each listener, reports ready, on `/readyz` and through the gRPC health service, logs [`ready`](./logs.md#ready), starts checking the file of each set every [`sets.<name>.refresh`](./configuration.md#sets-name-refresh), and starts answering.
 
 ### Output
 
-`serve` writes its [log events](./logs.md) to standard output, one line each, in the format of [`log.format`](./configuration.md#log-format), and nothing else. An error before the configuration is read, which has no format yet, is a plain `tessera: <message>` line on standard error. A standard output that is closed or cannot be written loses the events, and does not stop `serve` or change its exit status.
+`serve` writes its [log events](./logs.md) to standard output, one line each, in the format of [`log.format`](./configuration.md#log-format), and nothing else. An error before the configuration and its sets are read, which has no format yet, is a plain `tessera: <message>` line on standard error. A standard output that is closed or cannot be written loses the events, and does not stop `serve` or change its exit status.
 
 ### Signals of `serve`
 
@@ -93,11 +93,12 @@ SIGTERM or SIGINT starts a graceful shutdown:
 1. [`shutdown_started`](./logs.md#shutdown-started) is logged. `/readyz` answers 503 and the gRPC health service `NOT_SERVING`, and [`not_ready`](./logs.md#not-ready) is logged.
 2. For [`server.drain_delay`](./configuration.md#server-drain-delay), both listeners keep answering as before, so that Envoy and the orchestrator see the change and stop sending requests.
 3. The gRPC listener closes, every client is asked to close its connection, and the calls in progress finish, for at most [`server.shutdown_timeout`](./configuration.md#server-shutdown-timeout). A connection whose client has sent nothing is closed at once.
-4. The admin listener closes, within the same deadline. A connection that has not sent a request is closed at once.
-5. The [`decision`](./logs.md#decision) events still in their [queue](./logs.md#the-queue-of-decision-events) are written, within the same deadline.
-6. [`shutdown_complete`](./logs.md#shutdown-complete) is logged with `outcome=drained`.
+4. The checks of the files of the sets stop, within the same deadline. A check in progress is cut short, and changes nothing.
+5. The admin listener closes, within the same deadline. A connection that has not sent a request is closed at once.
+6. The [`decision`](./logs.md#decision) events still in their [queue](./logs.md#the-queue-of-decision-events) are written, within the same deadline.
+7. [`shutdown_complete`](./logs.md#shutdown-complete) is logged with `outcome=drained`.
 
-If the deadline passes before the calls and admin requests in progress finish, they are cancelled and every connection is closed: `shutdown_complete` reports `outcome=forced forced_by=timeout`. The same happens when the deadline passes before the queued `decision` events are written: the events left are dropped. Another signal during the shutdown does the same at once, at any step: `shutdown_complete` reports `outcome=forced forced_by=signal`. A listener that fails while tessera runs logs [`listener_failed`](./logs.md#listener-failed) and starts the same shutdown; one that fails during the shutdown is logged at its end, and the exit status is 1. Any other signal received during the startup starts the shutdown as soon as both listeners are open.
+If the deadline passes before the calls, the checks of the sets and the admin requests in progress finish, they are cancelled and every connection is closed: `shutdown_complete` reports `outcome=forced forced_by=timeout`. The same happens when the deadline passes before the queued `decision` events are written: the events left are dropped. Another signal during the shutdown does the same at once, at any step: `shutdown_complete` reports `outcome=forced forced_by=signal`. A listener that fails while tessera runs logs [`listener_failed`](./logs.md#listener-failed) and starts the same shutdown; one that fails during the shutdown is logged at its end, and the exit status is 1. Any other signal received during the startup starts the shutdown as soon as both listeners are open.
 
 ::: tip
 Give the orchestrator a grace period longer than `server.drain_delay` plus `server.shutdown_timeout` between its signal and a forced kill: 25 seconds with the defaults.
@@ -112,11 +113,11 @@ Give the orchestrator a grace period longer than `server.drain_delay` plus `serv
 | Shutdown cut by another signal | `shutdown_complete outcome=forced forced_by=signal` | 1 |
 | A listener could not open | `startup_failed` | 1 |
 | A listener failed while serving or during the shutdown | `listener_failed` | 1 |
-| Invalid usage or configuration | None: `tessera: <message>` | 2 |
+| Invalid usage or configuration, an invalid set included | None: `tessera: <message>` | 2 |
 
 ## `tessera eval`
 
-Shows how the policy of a configuration decides a request that the flags describe, without Envoy: the attributes that the rules read, the outcome of each rule up to the one that decides, and the decision. It writes no [log event](./logs.md), changes no [metric](./metrics.md), and opens no socket.
+Shows how the policy of a configuration decides a request that the flags describe, without Envoy: the attributes that the rules read, the outcome of each rule up to the one that decides, and the decision. It loads the [sets](#sets) as `tessera serve` does, writes no [log event](./logs.md), changes no [metric](./metrics.md), and opens no socket.
 
 With the configuration of [A complete example](../guide/write-rules.md#a-complete-example), in a file named `rules.yaml`:
 
@@ -184,12 +185,56 @@ response: status 404
 - `request.headers` holds only the headers of the flags, and `request.id` is the value of an `x-request-id` header among them, empty without it.
 - A `?` in `--path` fails with `invalid --path; write the query with --query`: write the query with `--query`.
 
+### Sets
+
+`tessera eval` loads the [sets](./configuration.md#sets) of the configuration as `tessera serve` does, their files included: a file that is missing or invalid is a configuration error. `--set '<name>=<value>,<value>'` replaces the content of the set `<name>` for the evaluation, and its file is not read, so that `eval` works without the files of the server:
+
+- the values are separated by commas, and read as the [`values`](./configuration.md#sets-name-values) of the type of the set, with the spaces around them ignored: a value of a `string` set cannot hold a comma;
+- `--set '<name>='` makes the set empty;
+- `--set` replaces one set, and is given once for each set that you replace.
+
+With this configuration in a file named `sets.yaml`, and the file of its set `blocked`, `blocked.txt`, next to it:
+
+<<< @/examples/sets.yaml{yaml}
+
+<<< @/examples/blocked.txt{text}
+
+```sh
+tessera eval --config sets.yaml --ip 198.51.100.7 --host admin.example.com
+```
+
+```text
+client.ip  198.51.100.7
+
+blocked-networks  true -> deny  Networks blocked during an incident.
+
+decision: deny (rule blocked-networks, reason rule)
+response: status 403
+```
+
+The same request, with the set `blocked` empty and the network of the client in `office`:
+
+```sh
+tessera eval --config sets.yaml --set blocked= --set office=198.51.100.0/24 \
+  --ip 198.51.100.7 --host admin.example.com
+```
+
+```text
+client.ip     198.51.100.7
+request.host  "admin.example.com"
+
+blocked-networks  false  Networks blocked during an incident.
+internal-hosts    false  The internal hosts, from the office only.
+
+decision: allow (rule default, reason default)
+```
+
 ### The output
 
 The text output has three blocks:
 
 1. **The attributes** that the conditions of the rules evaluated read, sorted by name, with their values: a string in double quotes, `client.ip` without them, and `missing` for an attribute or a header that the request does not have. A rule that reads the whole map `request.headers`, such as with `exists`, shows every header. The values of `authorization` and `cookie` are shown as `[REDACTED]`.
-2. **The rules**, in order, up to the one that decides, each with the outcome of its condition: `true`, `false`, or `indeterminate` followed by its cause (`client_ip_missing`, `expression` or `panic`), then `-> allow` or `-> deny` for the rule that decides, or `(audit)` for a rule in `audit` mode, then its description, on one line.
+2. **The rules**, in order, up to the one that decides, each with the outcome of its condition: `true`, `false`, or `indeterminate` followed by its cause (`client_ip_missing`, `expression`, `panic` or `set_unavailable`), then `-> allow` or `-> deny` for the rule that decides, or `(audit)` for a rule in `audit` mode, then its description, on one line.
 3. **The decision**: its action, the rule that decided or `default`, and the reason (`rule`, `default`, or `error` followed by the cause), with `not enforced: policy.mode is audit` when [`policy.mode: audit`](./configuration.md#policy-mode) allows a denied request; for a denial, the status of the response.
 
 `--output json` writes one JSON object on one line:
@@ -212,7 +257,14 @@ tessera eval --config rules.yaml \
 
 ### Exit status of `eval`
 
-`tessera eval` exits with status 0 whatever the decision, with 2 for a usage or configuration error, and with 1 when it cannot write its output. An invalid `--ip`, `--header`, `--path` or `--output` fails with `invalid --ip; want an IP address`, `invalid --header; want 'name: value'`, `invalid --path; write the query with --query` or `invalid --output; want text or json`, without repeating the value.
+`tessera eval` exits with status 0 whatever the decision, with 2 for a usage or configuration error, and with 1 when it cannot write its output. An invalid `--ip`, `--header`, `--path` or `--output` fails with `invalid --ip; want an IP address`, `invalid --header; want 'name: value'`, `invalid --path; write the query with --query` or `invalid --output; want text or json`, without repeating the value. An invalid `--set` fails without repeating its text either, with one of:
+
+| Error | Cause |
+| --- | --- |
+| `invalid --set; want name=value,value` | The flag has no `=`. |
+| `invalid --set: the configuration declares no set of this name` | No set of [`sets`](./configuration.md#sets) has the name. |
+| `invalid --set: the set <name> is given twice` | Two `--set` flags replace the same set. |
+| `invalid --set for the set <name>: value <n>: <problem>` | The value in position `<n>`, from 1, is not a value of the type of the set, as for [`sets.<name>.values`](./configuration.md#sets-name-values). |
 
 ## `tessera config validate`
 
@@ -220,19 +272,31 @@ tessera eval --config rules.yaml \
 tessera config validate --config config.yaml
 ```
 
-Reads the [selected file](#configuration-file), checks it as the [configuration reference](./configuration.md) describes, compiles the conditions of the rules, and prints `configuration valid`. It reads nothing but the file:
+Reads the [selected file](#configuration-file), checks it as the [configuration reference](./configuration.md) describes, compiles the conditions of the rules, reads the file of every [set](./configuration.md#sets), and prints `configuration valid`. It opens no socket:
 
 ```text
 configuration valid
 ```
 
-An invalid configuration prints its first error on standard error and exits with status 2:
+An invalid configuration, or a set file that is missing or invalid, prints its first error on standard error and exits with status 2:
 
 ```text
 tessera: policy.default_action (line 2, column 19): expected allow or deny
 ```
 
+```text
+tessera: sets.partners.file (line 9, column 11): line 12 of the file: the value has a control character
+```
+
 [Error messages](./configuration.md#error-messages) describes their form.
+
+A warning is a problem that does not make the configuration invalid. `tessera config validate` prints each warning on standard error, in the order of the file, then `configuration valid` on standard output, and exits with status 0. The only warning is a set that no rule reads, which tessera loads and checks all the same:
+
+```text
+tessera: warning: sets.office (line 3, column 3): the set is not used by any rule
+```
+
+`tessera serve` writes the same warnings as [`config_warning`](./logs.md#config-warning) events.
 
 ## `tessera config print`
 
@@ -240,7 +304,7 @@ tessera: policy.default_action (line 2, column 19): expected allow or deny
 tessera config print --config config.yaml
 ```
 
-Reads and checks the [selected file](#configuration-file) like `tessera config validate`, then prints the configuration as YAML, with every default applied and the keys in the order of the [configuration reference](./configuration.md). For a file that sets only `policy.default_action`:
+Reads and checks the [selected file](#configuration-file) like `tessera config validate`, without reading the files of the sets or printing the warnings, then prints the configuration as YAML, with every default applied and the keys in the order of the [configuration reference](./configuration.md). For a file that sets only `policy.default_action`:
 
 ```text
 server:
@@ -258,6 +322,7 @@ log:
   decisions: deny
 client_ip:
   from: peer
+sets: {}
 policy:
   mode: enforce
   default_action: deny
@@ -273,6 +338,7 @@ policy:
 - Durations are printed in a normal form: `90s` is printed as `1m30s`, `30m` as `30m0s`, and `500ms` as `500ms`.
 - A relative socket path in `server.listen` is printed as an absolute path.
 - `client_ip` shows the keys of its source only: `client_ip.from`, with `client_ip.header` or `client_ip.trusted_hops` when the source has one.
+- The sets are sorted by name. Each shows the keys of its source only: `type`, `values` and `max_entries` for a set of values, and every key but `values` for a set with a file, whose relative path is printed as an absolute path. A value of `values` is printed as a string, `"64496"` for the integer `64496`.
 - Each rule shows `name`, `description`, `action`, `mode` and `when`, in this order and with their defaults, and its `response` with only the keys that the file writes: the others come from `policy.deny_response`.
 
 The output is meant for reading. Because of the redacted values, it is not always a valid configuration.

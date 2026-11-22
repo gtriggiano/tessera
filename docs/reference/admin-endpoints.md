@@ -49,7 +49,7 @@ ok
 not ready: shutting down
 ```
 
-tessera is ready once both listeners are open, and stops being ready when a shutdown starts. The only condition that `/readyz` can report is therefore:
+tessera is ready once both listeners are open, and stops being ready when a shutdown starts. It loads every [set](./configuration.md#sets) before it opens its listeners, and does not start when one cannot be loaded: once it reports ready, every set is loaded. A set that becomes unavailable later does not change readiness: [`tessera_set_available`](./metrics.md#tessera-set-available) reports it. The only condition that `/readyz` can report is therefore:
 
 | Line | When |
 | --- | --- |

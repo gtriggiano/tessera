@@ -1,10 +1,10 @@
 ---
-description: "The expression language of the rule conditions: attributes and their types, functions, operators, indeterminate conditions, errors and limits."
+description: "The expression language of the rule conditions: attributes and their types, functions, sets, operators, indeterminate conditions, errors and limits."
 ---
 
 # Expression language reference
 
-**tessera** reads the condition of each rule, [`policy.rules[].when`](./configuration.md#policy-rules-when), as an expression of the [Common Expression Language](https://cel.dev/) (CEL). This page lists the attributes that an expression reads, the functions and operators it can use, what happens when it cannot be evaluated, and its limits. [Write rules](../guide/write-rules.md) shows how to combine conditions into a policy.
+**tessera** reads the condition of each rule, [`policy.rules[].when`](./configuration.md#policy-rules-when), as an expression of the [Common Expression Language](https://cel.dev/) (CEL). This page lists the attributes that an expression reads, the functions and operators it can use, the sets it can look values up in, what happens when it cannot be evaluated, and its limits. [Write rules](../guide/write-rules.md) shows how to combine conditions into a policy.
 
 ## Conditions
 
@@ -28,6 +28,7 @@ tessera compiles and type-checks every condition when it reads the configuration
 | `request.headers` | `map(string, string)` | The headers, by name in lowercase. |
 | `request.id` | `string` | The value of the `x-request-id` header, empty without it. |
 | `client.ip` | `tessera.IP` | The client address, read from the source that [`client_ip`](./configuration.md#client-ip) declares. Absent when that source gives no address. |
+| `sets.<name>` | `tessera.CIDRSet`, `tessera.ASNSet` or `tessera.StringSet` | The set `<name>` that [`sets`](./configuration.md#sets) declares, of the type of its values. It is used only as `sets.<name>.contains(value)`: see [Sets](#sets). |
 
 tessera reads the request as Envoy describes it, and changes it only as follows:
 
@@ -47,6 +48,7 @@ tessera reads the request as Envoy describes it, and changes it only as follows:
 | `bool`, `int`, `uint`, `double`, `string`, `bytes` | The types of CEL. An `int` is a 64-bit signed integer. |
 | `list`, `map` | Written as `["GET", "HEAD"]` and `{"a": 1}`. `request.headers` is a `map(string, string)`. |
 | `tessera.IP` | An IPv4 or IPv6 address. An IPv4-mapped IPv6 address, such as `::ffff:192.0.2.10`, is the IPv4 address `192.0.2.10`. Two addresses compare with `==` and `!=`; nothing else compares or converts them, but the functions below. |
+| `tessera.CIDRSet`, `tessera.ASNSet`, `tessera.StringSet` | A set of networks, of autonomous system numbers, or of strings: a set of type `cidr`, `asn` or `string`. Only `contains` reads it. |
 
 ## Functions
 
@@ -72,6 +74,24 @@ The standard functions and macros of CEL are available, among them:
 | `list.all(v, cond)`, `list.exists(v, cond)`, `list.exists_one(v, cond)`, `list.map(v, expr)`, `list.filter(v, cond)` | The macros over the items of a list, or the keys of a map. |
 | `int(x)`, `uint(x)`, `double(x)`, `string(x)`, `bytes(x)`, `bool(x)` | Conversions. |
 
+## Sets
+
+`sets.<name>.contains(value)` is `true` when the set `<name>`, declared in [`sets`](./configuration.md#sets), holds `value`. The type of `value` follows the type of the set:
+
+| Set | Example | `value` | `contains` is `true` when |
+| --- | --- | --- | --- |
+| `cidr` | `sets.office.contains(client.ip)` | A `tessera.IP` | The address is in a network of the set. An IPv4 address is never in an IPv6 network. |
+| `asn` | `sets.partner_networks.contains(64496)` | An `int` | The set holds the number. An `int` outside `1` to `4294967295` is never in the set. |
+| `string` | `sets.partners.contains(request.host)` | A `string` | The set holds the string, compared exactly, case included. |
+
+```text
+request.path.startsWith("/admin") && !sets.office.contains(client.ip)
+```
+
+A set is not a value: `sets.<name>` alone, `sets`, `has(sets.<name>)`, a comparison of sets and a list of sets are errors. So are an argument of another type, such as `sets.office.contains("192.0.2.10")` for a `cidr` set, and a set that [`sets`](./configuration.md#sets) does not declare (see [Errors](#errors)). `s.contains(t)` on strings stays the standard function.
+
+All the conditions of one decision read the sets as they were when it started: a set that changes meanwhile changes nothing for it. When a set is unavailable, `contains` answers what its [`on_unavailable`](./configuration.md#sets-name-on-unavailable) says, whatever its argument: with `fail`, the default, the condition is [indeterminate](#indeterminate-conditions).
+
 ## Operators
 
 From the highest precedence to the lowest:
@@ -92,6 +112,7 @@ From the highest precedence to the lowest:
 The evaluation of a condition fails when it:
 
 - reads `client.ip` and the request has no client address;
+- looks a value up in a set that is unavailable and whose [`on_unavailable`](./configuration.md#sets-name-on-unavailable) is `fail`, which tessera reports with the cause [`set_unavailable`](./metrics.md#tessera-rule-evaluation-errors-total);
 - reads a key that a map does not have, as `request.headers["authorization"]` does when the request has no `Authorization` header;
 - fails a conversion (`int("ten")`), overflows an integer, or divides by zero;
 - exceeds the [cost limit](#limits).
@@ -119,6 +140,9 @@ A condition that does not compile stops `tessera config validate` and `tessera s
 | `request.host == 443` | `found no matching overload for '_==_' applied to '(string, int)'` |
 | `request.path` | `the condition must be a bool, not string` |
 | `client.ip.inCidr("192.0.2.1/24")` | `invalid network: the network has bits set after the prefix length: write its first address, such as 192.0.2.0/24` |
+| `sets.office.contains("192.0.2.10")`, `office` of type `cidr` | `found no matching overload for 'contains' applied to 'tessera.CIDRSet.(string)'` |
+| `sets.ofice.contains(client.ip)` | `undefined field 'ofice'` |
+| `has(sets.office)` | `a set can be used only as the target of contains, as in sets.<name>.contains(value)` |
 | `request.path.matches("[a-")` | `invalid regular expression: missing closing ]` |
 | `request.host == "x" &&` | `syntax error in the expression` |
 
@@ -139,5 +163,5 @@ An error message never quotes a literal of the expression, such as a string that
 | Cost of one evaluation | 10000 units of the cost model of CEL |
 | Nesting of macros | A macro over a list or a map (`all`, `exists`, `exists_one`, `map`, `filter`) cannot contain another, nor iterate over the result of another: `l.map(x, f(x)).filter(y, g(y))` is an error. |
 
-- **Cost.** CEL counts a cost for each step of an evaluation, larger for steps that read more data, such as a regular expression over a long header or a macro over many headers. A condition made of comparisons and a few function calls stays far below the limit. An evaluation that reaches it stops, and the condition is [indeterminate](#indeterminate-conditions).
+- **Cost.** CEL counts a cost for each step of an evaluation, larger for steps that read more data, such as a regular expression over a long header or a macro over many headers. `contains` on a set costs one unit, whatever the size of the set and of its argument. A condition made of comparisons and a few function calls stays far below the limit. An evaluation that reaches it stops, and the condition is [indeterminate](#indeterminate-conditions).
 - **Regular expressions** are RE2, whose time grows linearly with the text. tessera compiles a pattern written as a literal when it reads the configuration, and an invalid one is an error.

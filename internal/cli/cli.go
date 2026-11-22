@@ -231,7 +231,7 @@ func configCommand(lookup config.LookupEnv) *cobra.Command {
 	parent := &cobra.Command{
 		Use:   "config",
 		Short: "Check or print the configuration",
-		Long:  "Check or print the configuration file, selected with --config or, when the flag is\nabsent, with the TESSERA_CONFIG environment variable. These commands read only\nthat file.",
+		Long:  "Check or print the configuration file, selected with --config or, when the flag is\nabsent, with the TESSERA_CONFIG environment variable. validate reads the files\nof the sets too; print reads only the configuration file.",
 		Args:  noArgs,
 		RunE:  help,
 	}
@@ -243,10 +243,23 @@ func configCommand(lookup config.LookupEnv) *cobra.Command {
 	validate := &cobra.Command{
 		Use:   "validate",
 		Short: "Check the configuration",
-		Args:  noArgs,
+		Long: "Check the configuration file, and the file of every set, as serve does before it\n" +
+			"opens a socket. Write each warning on standard error, which does not make the\n" +
+			"configuration invalid.\n\n" +
+			"Exit status: 0 for a valid configuration, warnings or not; 2 for an invalid one.",
+		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if _, err := load(cmd); err != nil {
+			cfg, err := load(cmd)
+			if err != nil {
 				return err
+			}
+			if _, err := app.LoadSets(cfg, nil); err != nil {
+				return err
+			}
+			for _, w := range cfg.Warnings() {
+				if err := write(cmd.ErrOrStderr(), []byte("tessera: warning: "+w.String()+"\n")); err != nil {
+					return err
+				}
 			}
 			return write(cmd.OutOrStdout(), []byte("configuration valid\n"))
 		},

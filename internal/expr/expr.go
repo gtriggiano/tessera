@@ -1,6 +1,7 @@
 // Package expr compiles and evaluates the conditions of tessera's rules,
-// written in CEL: the variables request and client, their types, tessera's
-// functions on IP addresses, and the limits of an expression.
+// written in CEL: the variables request, client and sets, their types,
+// tessera's functions on IP addresses and sets, and the limits of an
+// expression.
 //
 // A condition is compiled once, at startup, and type-checked: an unknown
 // attribute, a wrong type or a result that is not a bool is a CompileError
@@ -21,6 +22,8 @@ import (
 	"cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/interpreter"
+
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // CostLimit is the largest cost of one evaluation of a condition, in the
@@ -44,6 +47,9 @@ const (
 	CauseExpression Cause = "expression"
 	// CausePanic: tessera recovered a panic.
 	CausePanic Cause = "panic"
+	// CauseSetUnavailable: the condition read a set that was not
+	// available, and whose on_unavailable is fail.
+	CauseSetUnavailable Cause = "set_unavailable"
 )
 
 // EvalError is the error of a condition that could not be evaluated. Its
@@ -66,6 +72,9 @@ type Options struct {
 	// an evaluation, when it recovers it: a panic that && or || then absorb
 	// is reported too.
 	OnPanic func(*Panic)
+	// Sets declares the sets: each is a field of the variable sets, in the
+	// order of the entries of the Snapshot that NewInput receives.
+	Sets []sets.Declaration
 }
 
 // Env compiles conditions. It is immutable and safe for concurrent use.
@@ -77,7 +86,7 @@ type Env struct {
 
 // NewEnv returns an Env.
 func NewEnv(opts Options) (*Env, error) {
-	lib := &library{onPanic: opts.OnPanic, parseNetwork: parseNetwork}
+	lib := &library{onPanic: opts.OnPanic, parseNetwork: parseNetwork, sets: append([]sets.Declaration(nil), opts.Sets...)}
 	p, err := newProvider(lib)
 	if err != nil {
 		return nil, err
@@ -87,6 +96,7 @@ func NewEnv(opts Options) (*Env, error) {
 		cel.CustomTypeAdapter(p),
 		cel.Variable("request", requestType),
 		cel.Variable("client", clientType),
+		cel.Variable("sets", setsType),
 		cel.ParserExpressionSizeLimit(MaxLength),
 	}
 	env, err := cel.NewEnv(append(envOpts, lib.envOptions()...)...)
@@ -102,13 +112,14 @@ func NewEnv(opts Options) (*Env, error) {
 			cel.EvalOptions(cel.OptOptimize),
 			cel.CustomDecoratorV2(lib.prepareInCidr),
 			cel.CostLimit(CostLimit),
+			cel.CostTrackerOptions(costOptions()...),
 		},
 	}, nil
 }
 
 // validatorMessages start the messages of the validators of the
 // environment, which hold no text of the expression.
-var validatorMessages = []string{"invalid network: ", errNetworkLiteral.Error(), "invalid regular expression: ", "comprehension exceeds nesting limit"}
+var validatorMessages = []string{"invalid network: ", errNetworkLiteral.Error(), "invalid regular expression: ", "comprehension exceeds nesting limit", errSetUse.Error()}
 
 // SyntaxError is the message of an issue of the parser.
 const SyntaxError = "syntax error in the expression"
@@ -167,6 +178,7 @@ type Condition struct {
 	prg        cel.Program
 	always     bool
 	attributes []string
+	sets       []string
 	lib        *library
 }
 
@@ -219,7 +231,7 @@ func (e *Env) Compile(text string) (*Condition, error) {
 	}
 	root := native.Expr()
 	always := root.Kind() == ast.LiteralKind && root.AsLiteral() == types.True
-	return &Condition{prg: prg, always: always, attributes: attributes(root, native.ReferenceMap()), lib: e.lib}, nil
+	return &Condition{prg: prg, always: always, attributes: attributes(root, native.ReferenceMap()), sets: setsRead(native), lib: e.lib}, nil
 }
 
 func issue(loc common.Location, message string) Issue {
@@ -255,6 +267,8 @@ func (c *Condition) Eval(in *Input) (bool, error) {
 //     reported when recovered;
 //   - interpreter.EvalCancelledError: the cost limit;
 //   - ErrClientIPMissing: the condition read client.ip without an address;
+//   - ErrSetUnavailable: contains on an unavailable set, whose
+//     on_unavailable is fail;
 //   - any other *types.Err: an ordinary evaluation error;
 //   - anything else: cel-go recovered a panic outside tessera's guards and
 //     returned "internal error", without a stack; it is reported here.
@@ -273,6 +287,9 @@ func (c *Condition) classify(err error, in *Input) *EvalError {
 	if errors.Is(err, ErrClientIPMissing) {
 		return &EvalError{Cause: CauseClientIPMissing, err: err}
 	}
+	if errors.Is(err, ErrSetUnavailable) {
+		return &EvalError{Cause: CauseSetUnavailable, err: err}
+	}
 	var celErr *types.Err
 	if errors.As(err, &celErr) {
 		return &EvalError{Cause: CauseExpression, err: err}
@@ -290,6 +307,29 @@ func (c *Condition) classify(err error, in *Input) *EvalError {
 // or as request.headers when it reads the map otherwise.
 func (c *Condition) Attributes() []string {
 	return c.attributes
+}
+
+// Sets returns the names of the sets that the condition reads, sorted.
+func (c *Condition) Sets() []string {
+	return c.sets
+}
+
+// setsRead lists the sets that a reads: the fields of the variable sets, the
+// only selections of it that the validator lets through.
+func setsRead(a *ast.AST) []string {
+	found := map[string]bool{}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(a), ast.KindMatcher(ast.SelectKind)) {
+		op := e.AsSelect().Operand()
+		if op.Kind() == ast.IdentKind && op.AsIdent() == "sets" && a.GetType(op.ID()).IsExactType(setsType) {
+			found[e.AsSelect().FieldName()] = true
+		}
+	}
+	out := make([]string, 0, len(found))
+	for name := range found {
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // attributes lists the attributes that e reads. refs tells the variables

@@ -17,6 +17,11 @@ description: "Every Prometheus metric that tessera serve exports on the admin li
 | [`tessera_rule_evaluation_errors_total`](#tessera-rule-evaluation-errors-total) | counter | `rule`, `cause` |
 | [`tessera_policy_audit_mode`](#tessera-policy-audit-mode) | gauge | none |
 | [`tessera_decision_logs_dropped_total`](#tessera-decision-logs-dropped-total) | counter | none |
+| [`tessera_set_entries`](#tessera-set-entries) | gauge | `set`, `type`, `source` |
+| [`tessera_set_available`](#tessera-set-available) | gauge | `set`, `type`, `source` |
+| [`tessera_set_last_refresh_success_timestamp_seconds`](#tessera-set-last-refresh-success-timestamp-seconds) | gauge | `set`, `type`, `source` |
+| [`tessera_set_refreshes_total`](#tessera-set-refreshes-total) | counter | `set`, `type`, `source`, `result` |
+| [`tessera_set_refresh_duration_seconds`](#tessera-set-refresh-duration-seconds) | histogram | `set`, `type`, `source` |
 
 Every series exists from startup, at zero for a counter: the values of the labels come from the configuration and from fixed lists, never from a request, so the number of series depends on the configuration alone. A thousand hosts, paths or client addresses add no series. Scrapes read memory only.
 
@@ -113,6 +118,7 @@ The conditions that could not be evaluated and that counted against allowing, by
 | `client_ip_missing` | Read `client.ip`, and the request had no client address. |
 | `expression` | Failed otherwise, such as on a missing header, a failed conversion, or the cost limit. |
 | `panic` | Made tessera fail while it evaluated the condition, which it recovered (see [`panic_recovered`](./logs.md#panic-recovered)). |
+| `set_unavailable` | Looked a value up in a set that was unavailable, with [`on_unavailable: fail`](./configuration.md#sets-name-on-unavailable). |
 
 A failure that `&&` or `||` absorbs does not make the condition indeterminate, and is not counted. A failure of tessera outside the evaluation of a condition is not counted either: the call fails without a decision, and [`panic_recovered`](./logs.md#panic-recovered) reports it (see [Failure modes](./failure-modes.md)). The log event [`evaluation_error`](./logs.md#evaluation-error) reports the same conditions.
 
@@ -129,6 +135,62 @@ A failure that `&&` or `||` absorbs does not make the condition indeterminate, a
 **Labels:** none
 
 The [`decision`](./logs.md#decision) events that tessera dropped instead of writing them: because their queue was full, as when standard output is slower than the decisions, because the output was closed at the end of a shutdown, or because a write to standard output failed. See [The queue of decision events](./logs.md#the-queue-of-decision-events).
+
+## Sets
+
+The metrics of the sets have three labels: `set` is the name of the set, `type` its type, `cidr`, `asn` or `string`, and `source` where tessera reads it from:
+
+| `source` | The set | Series |
+| --- | --- | --- |
+| `values` | Written in the configuration, in [`sets.<name>.values`](./configuration.md#sets-name-values). It never refreshes. | [`tessera_set_entries`](#tessera-set-entries) and [`tessera_set_available`](#tessera-set-available). |
+| `file` | Read from [`sets.<name>.file`](./configuration.md#sets-name-file), and checked every [`sets.<name>.refresh`](./configuration.md#sets-name-refresh), which describes a check. | Every metric of this section. |
+
+Each series that a set has exists from startup. tessera loads every set before it opens its listeners; for a set read from a file, that load counts as a check with the result `updated`. The log events [`set_loaded`](./logs.md#set-loaded), [`set_load_failed`](./logs.md#set-load-failed), [`set_unavailable`](./logs.md#set-unavailable) and [`set_available`](./logs.md#set-available) report the same changes.
+
+### `tessera_set_entries`
+
+**Type:** gauge\
+**Labels:** `set`, `type`, `source`
+
+The entries of the copy of the set in use: the values read from its source, a value written twice counted twice, as [`sets.<name>.max_entries`](./configuration.md#sets-name-max-entries) counts them. It changes when a new copy replaces the one in use, and stays the same when a check fails.
+
+### `tessera_set_available`
+
+**Type:** gauge\
+**Labels:** `set`, `type`, `source`
+
+`1` when the set is available, `0` when it is not. A set read from a file is unavailable while its last successful check, or the start of the checks before the first one, is older than [`sets.<name>.max_staleness`](./configuration.md#sets-name-max-staleness), and `contains` then answers what [`sets.<name>.on_unavailable`](./configuration.md#sets-name-on-unavailable) says. A set of `values` is always available.
+
+### `tessera_set_last_refresh_success_timestamp_seconds`
+
+**Type:** gauge\
+**Labels:** `set`, `type`, `source`
+
+The time of the last successful check of a set read from a file, in seconds since the Unix epoch: a check that found the file unchanged or that replaced the copy, the load at startup included. `time() - tessera_set_last_refresh_success_timestamp_seconds` is the age of the copy in use since that check, which `max_staleness` limits once tessera has checked the file. Before the first check, `max_staleness` counts from the start of the checks, when tessera is ready: until then, this age exceeds the one that `max_staleness` limits by the time that tessera took to start.
+
+### `tessera_set_refreshes_total`
+
+**Type:** counter\
+**Labels:** `set`, `type`, `source`, `result`
+
+The checks of the file of a set, the load at startup included, by result. Each set read from a file has a series for each result:
+
+| `result` | The check |
+| --- | --- |
+| `updated` | Found new valid content, which replaced the copy in use. The load at startup counts here. |
+| `unchanged` | Found the file unchanged, or read it and found the content of the copy in use. |
+| `rejected` | Found content that is invalid, or that exceeds a ceiling or `max_entries`: the copy in use stays. |
+| `error` | Found no file, or one that cannot be opened or read, or that is not a regular file: the copy in use stays. |
+
+`updated` and `unchanged` are successful checks. A check that fails is counted at each `refresh` for as long as the file stays the same, while [`set_load_failed`](./logs.md#set-load-failed) reports the failure once.
+
+### `tessera_set_refresh_duration_seconds`
+
+**Type:** histogram\
+**Labels:** `set`, `type`, `source`\
+**Buckets:** `0.0001`, `0.001`, `0.01`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`
+
+The time of each check of the file of a set that [`tessera_set_refreshes_total`](#tessera-set-refreshes-total) counts, whatever its result, the load at startup included: the reading of the state of the file and, when it has to be read, the reading of the file and the building of the new copy. A check that trusts the state of an unchanged file reads no content.
 
 ## Go and process metrics
 

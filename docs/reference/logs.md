@@ -44,7 +44,8 @@ Each event has a level: `debug`, `info`, `warn` or `error`. [`log.level`](./conf
 
 | Event | Level | When |
 | --- | --- | --- |
-| [`starting`](#starting) | `info` | `tessera serve` has read a valid configuration. |
+| [`starting`](#starting) | `info` | `tessera serve` has read a valid configuration and loaded its sets. |
+| [`config_warning`](#config-warning) | `warn` | The configuration has a warning: one event for each, after `starting`. |
 | [`listening`](#listening) | `info` | Both listeners are open: one event for each. |
 | [`ready`](#ready) | `info` | tessera reports ready. |
 | [`not_ready`](#not-ready) | `info` | tessera stops reporting ready, at the start of a shutdown. |
@@ -52,6 +53,10 @@ Each event has a level: `debug`, `info`, `warn` or `error`. [`log.level`](./conf
 | [`shutdown_complete`](#shutdown-complete) | `info` or `warn` | The shutdown ends, as the last event before the process exits. |
 | [`startup_failed`](#startup-failed) | `error` | A listener could not open. |
 | [`listener_failed`](#listener-failed) | `error` | A listener stopped while tessera was running or shutting down. |
+| [`set_loaded`](#set-loaded) | `info` | A new copy of a set is in use: one event for each set at startup, after `config_warning`, and one for each new content of a file. |
+| [`set_load_failed`](#set-load-failed) | `warn` | A check of the file of a set failed, and the copy in use stays. |
+| [`set_unavailable`](#set-unavailable) | `warn` | A set became unavailable. |
+| [`set_available`](#set-available) | `info` | A set became available again. |
 | [`decision`](#decision) | `info` or `warn` | tessera decided a request, and [`log.decisions`](./configuration.md#log-decisions) selects it. |
 | [`decision_logs_dropped`](#decision-logs-dropped) | `warn` | `decision` events were dropped because their queue was full. |
 | [`evaluation_error`](#evaluation-error) | `warn` | Conditions of a rule could not be evaluated. |
@@ -68,6 +73,19 @@ The first event of `tessera serve`, written before any listener opens. It is the
 | `version` | The release, as [`tessera version`](./cli.md#tessera-version) prints it: `dev` for a binary not built for a release. |
 | `revision` | The commit the binary was built from, or `unknown`. |
 | `config_path` | The path of the configuration file, as `--config` or `TESSERA_CONFIG` gave it. |
+
+### `config_warning`
+
+A problem of the configuration that does not make it invalid, such as a set that no rule reads. `tessera serve` writes one event for each warning, right after `starting`, and [`tessera config validate`](./cli.md#tessera-config-validate) prints the same warnings.
+
+```text
+ts=2026-11-22T10:15:00.124Z level=warn msg=config_warning key=sets.office warning="the set is not used by any rule"
+```
+
+| Field | Value |
+| --- | --- |
+| `key` | The key of the configuration that the warning is about, such as `sets.office`. |
+| `warning` | The problem. It never repeats a configured value. |
 
 ### `listening`
 
@@ -98,7 +116,7 @@ The last event of `tessera serve`. Its level is `info` when every call finished,
 
 | Field | Value |
 | --- | --- |
-| `outcome` | `drained`: every call and admin request in progress finished, and every queued [`decision`](#decision) event was written, within [`server.shutdown_timeout`](./configuration.md#server-shutdown-timeout). `forced`: the remaining ones were cancelled and their connections closed, and the queued `decision` events dropped. |
+| `outcome` | `drained`: every call and admin request in progress finished, the checks of the sets stopped, and every queued [`decision`](#decision) event was written, within [`server.shutdown_timeout`](./configuration.md#server-shutdown-timeout). `forced`: the remaining ones were cancelled and their connections closed, and the queued `decision` events dropped. |
 | `forced_by` | With `outcome=forced` only. `timeout`: `server.shutdown_timeout` passed. `signal`: another signal arrived during the shutdown. |
 
 The exit status is 0 after `outcome=drained` and 1 after `outcome=forced` (see [Exit status of `serve`](./cli.md#exit-status-of-serve)).
@@ -127,6 +145,69 @@ A listener stopped accepting connections, and `tessera serve` exits with status 
 | --- | --- |
 | `listener` | `grpc` or `admin`. |
 
+### `set_loaded`
+
+A new copy of a [set](./configuration.md#sets) is in use. tessera writes one for each set at startup, sets of `values` included, in the order of the configuration file, after `starting` and the `config_warning` events and before `listening`. Then it writes one each time a check of the file of a set finds new valid content, which replaces the copy in use (see [`sets.<name>.refresh`](./configuration.md#sets-name-refresh)). A file whose content is that of the copy in use writes no event.
+
+```text
+ts=2026-11-22T10:15:00.125Z level=info msg=set_loaded set=partners set_type=string set_source=file entries=1250 duration_ms=1.873
+```
+
+The same event at startup for a set of `values`, in the `json` format:
+
+```json
+{"ts":"2026-11-22T10:15:00.124Z","level":"info","msg":"set_loaded","set":"office","set_type":"cidr","set_source":"values","entries":2,"duration_ms":0.012}
+```
+
+| Field | Value |
+| --- | --- |
+| `set` | The name of the set. |
+| `set_type` | The type of the set: `cidr`, `asn` or `string`, as the label `type` of the [metrics of the sets](./metrics.md#sets). |
+| `set_source` | Where tessera reads the set from: `values` or `file`, as the label `source` of the metrics of the sets. |
+| `entries` | The entries of the new copy: the values read, a value written twice counted twice, as [`sets.<name>.max_entries`](./configuration.md#sets-name-max-entries) counts them. |
+| `duration_ms` | The time of the load, in milliseconds with the precision of a microsecond, as in [`decision`](#decision): for a file, from the check of its state to the new copy, the reading of the file included. |
+
+### `set_load_failed`
+
+A check of the file of a set failed: the file is missing, cannot be read, or has invalid content, and the copy of the set in use stays. tessera writes the event once for each new failure: when the version of the file or the error differs from those of the previous failure. A check that fails again in the same way, at each [`sets.<name>.refresh`](./configuration.md#sets-name-refresh), writes no event, and [`tessera_set_refreshes_total`](./metrics.md#tessera-set-refreshes-total) counts it, with `result="rejected"` or `result="error"`. After a successful check, the next failure is a new one. A file that is missing or invalid when tessera starts writes no event: tessera does not start (see [`sets`](./configuration.md#sets)).
+
+```text
+ts=2026-11-22T10:20:00.125Z level=warn msg=set_load_failed set=partners set_type=string set_source=file error="line 12 of the file: the value has a control character"
+```
+
+| Field | Value |
+| --- | --- |
+| `set` | The name of the set. |
+| `set_type`, `set_source` | The type and the source of the set, as in [`set_loaded`](#set-loaded). |
+| `error` | The problem. Content that is invalid or exceeds a ceiling gives `line <n> of the file: <problem>`, such as `line 12 of the file: more entries than max_entries`, or `the content is larger than 256 MiB`. A file that cannot be read gives `the file does not exist`, `not a regular file`, `the file cannot be opened: permission denied`, `the file cannot be opened` or `the file cannot be read`. It never repeats the content of the file or its path. |
+
+### `set_unavailable`
+
+A set read from a file became unavailable: its last successful check is older than [`sets.<name>.max_staleness`](./configuration.md#sets-name-max-staleness). tessera writes it as the age passes the limit, between two checks too. From then on, `contains` on the set answers what [`sets.<name>.on_unavailable`](./configuration.md#sets-name-on-unavailable) says, until [`set_available`](#set-available).
+
+```text
+ts=2026-11-22T10:25:00.125Z level=warn msg=set_unavailable set=partners set_type=string set_source=file reason=stale
+```
+
+| Field | Value |
+| --- | --- |
+| `set` | The name of the set. |
+| `set_type`, `set_source` | The type and the source of the set, as in [`set_loaded`](#set-loaded). |
+| `reason` | `stale`: the last successful check is older than `max_staleness`. |
+
+### `set_available`
+
+A set that was unavailable is available again, after a successful check of its file: one that found the file unchanged, or that replaced the copy. It follows the [`set_loaded`](#set-loaded) of the new copy, if any.
+
+```text
+ts=2026-11-22T10:26:00.125Z level=info msg=set_available set=partners set_type=string set_source=file
+```
+
+| Field | Value |
+| --- | --- |
+| `set` | The name of the set. |
+| `set_type`, `set_source` | The type and the source of the set, as in [`set_loaded`](#set-loaded). |
+
 ### `decision`
 
 tessera decided a request. [`log.decisions`](./configuration.md#log-decisions) selects the decisions that have an event: by default, the denials, and the allows in which a rule in `audit` mode with `action: deny` matched. The level is `info` when `action` is `allow`, and `warn` when it is `deny`, also when `policy.mode: audit` did not enforce the denial; [`log.level`](./configuration.md#log-level) applies.
@@ -152,7 +233,7 @@ ts=2026-11-22T10:16:04.512Z level=warn msg=decision request_id=6f1c0f6e-5a1b-4a0
 | `reason` | `rule`: the condition of the rule was true. `default`: no rule decided. `error`: the condition of a `deny` rule could not be evaluated. |
 | `audit_rules` | Only when there are some: the rules in `audit` mode whose condition was true, in order, separated by commas. |
 | `indeterminate_rules` | Only when there are some: the `allow` rules that did not match because their condition could not be evaluated, in order, separated by commas. |
-| `error` | Only with `reason=error`: why the condition could not be evaluated: `client_ip_missing`, `expression` or `panic` (see [`tessera_rule_evaluation_errors_total`](./metrics.md#tessera-rule-evaluation-errors-total)). |
+| `error` | Only with `reason=error`: why the condition could not be evaluated: `client_ip_missing`, `expression`, `panic` or `set_unavailable` (see [`tessera_rule_evaluation_errors_total`](./metrics.md#tessera-rule-evaluation-errors-total)). |
 | `duration_ms` | The time of the decision, from when tessera received the call of Envoy: the reading of the request and of its client address, and the evaluation of the rules. It does not count the recording of the decision, nor the time of the call in the network. In milliseconds with the precision of a microsecond; a number in both formats. |
 
 - Every field but `audit_rules`, `indeterminate_rules` and `error` is in every `decision` event, in the order of the table. The lists are strings in both formats: rule names contain no comma.
@@ -186,7 +267,7 @@ ts=2026-11-22T10:16:04.513Z level=warn msg=evaluation_error rule=office cause=cl
 | Field | Value |
 | --- | --- |
 | `rule` | The rule. |
-| `cause` | `client_ip_missing`, `expression` or `panic`, as in [`tessera_rule_evaluation_errors_total`](./metrics.md#tessera-rule-evaluation-errors-total). |
+| `cause` | `client_ip_missing`, `expression`, `panic` or `set_unavailable`, as in [`tessera_rule_evaluation_errors_total`](./metrics.md#tessera-rule-evaluation-errors-total). |
 | `count` | The conditions of this rule with this cause since the previous `evaluation_error` for them. |
 
 ### `panic_recovered`

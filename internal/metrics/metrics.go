@@ -8,6 +8,7 @@ package metrics
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -15,14 +16,19 @@ import (
 
 	"github.com/gtriggiano/tessera/internal/engine"
 	"github.com/gtriggiano/tessera/internal/expr"
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // DurationBuckets are the upper bounds, in seconds, of the buckets of
 // tessera_decision_duration_seconds.
 var DurationBuckets = []float64{0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1}
 
+// RefreshBuckets are the upper bounds, in seconds, of the buckets of
+// tessera_set_refresh_duration_seconds.
+var RefreshBuckets = []float64{0.0001, 0.001, 0.01, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+
 // causes are the values of the label cause.
-var causes = []expr.Cause{expr.CauseClientIPMissing, expr.CauseExpression, expr.CausePanic}
+var causes = []expr.Cause{expr.CauseClientIPMissing, expr.CauseExpression, expr.CausePanic, expr.CauseSetUnavailable}
 
 const namespace = "tessera"
 
@@ -41,17 +47,24 @@ type Metrics struct {
 	auditTotal  *prometheus.CounterVec
 	errorsTotal *prometheus.CounterVec
 	dropped     prometheus.Counter
+
+	setLabels      map[string]setLabels // of each declared set
+	setEntries     *prometheus.GaugeVec
+	setAvailable   *prometheus.GaugeVec
+	setLastSuccess *prometheus.GaugeVec
+	setRefreshes   *prometheus.CounterVec
+	setDuration    *prometheus.HistogramVec
 }
 
 // New returns the metrics of a process built as build, whose configuration
 // has the hash configHash, the hexadecimal SHA-256 of the output of tessera
-// config print, and the policy p. It registers the Go and process collectors
-// too.
+// config print, the policy p and the sets declared. It registers the Go and
+// process collectors too.
 //
-// Every series that p can produce exists from the start, at zero: label
-// values come from p and fixed sets only, so the number of series depends on
-// the configuration alone.
-func New(build BuildInfo, configHash string, p engine.Policy) *Metrics {
+// Every series that p and declared can produce exists from the start, at
+// zero: label values come from the configuration and fixed sets only, so the
+// number of series depends on the configuration alone.
+func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.Declaration) *Metrics {
 	reg := prometheus.NewRegistry()
 	buildInfo := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   namespace,
@@ -101,6 +114,33 @@ func New(build BuildInfo, configHash string, p engine.Policy) *Metrics {
 			Name:      "decision_logs_dropped_total",
 			Help:      "Decision events dropped because their queue was full, the output closed or a write failed.",
 		}),
+		setLabels: map[string]setLabels{},
+		setEntries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "set_entries",
+			Help:      "Entries of the copy of the set in use, by set, type and source.",
+		}, []string{"set", "type", "source"}),
+		setAvailable: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "set_available",
+			Help:      "1 when the set is available, 0 when it is not, by set, type and source.",
+		}, []string{"set", "type", "source"}),
+		setLastSuccess: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "set_last_refresh_success_timestamp_seconds",
+			Help:      "The Unix time of the last successful check of the source of a set that refreshes, unchanged or updated, by set, type and source.",
+		}, []string{"set", "type", "source"}),
+		setRefreshes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "set_refreshes_total",
+			Help:      "Checks of the source of a set that refreshes, the load at startup included, by set, type, source and result.",
+		}, []string{"set", "type", "source", "result"}),
+		setDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "set_refresh_duration_seconds",
+			Help:      "The time of a check of the source of a set that refreshes, the load at startup included, by set, type and source.",
+			Buckets:   RefreshBuckets,
+		}, []string{"set", "type", "source"}),
 	}
 	auditMode := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
@@ -128,6 +168,20 @@ func New(build BuildInfo, configHash string, p engine.Policy) *Metrics {
 	for _, a := range []engine.Action{engine.Allow, engine.Deny} {
 		m.duration.WithLabelValues(string(a))
 	}
+	for _, d := range declared {
+		l := setLabels{typ: string(d.Type), source: string(d.Source), refreshes: d.Source.Refreshes()}
+		m.setLabels[d.Name] = l
+		m.setEntries.WithLabelValues(d.Name, l.typ, l.source)
+		m.setAvailable.WithLabelValues(d.Name, l.typ, l.source)
+		if !l.refreshes {
+			continue
+		}
+		m.setLastSuccess.WithLabelValues(d.Name, l.typ, l.source)
+		for _, r := range sets.RefreshResults {
+			m.setRefreshes.WithLabelValues(d.Name, l.typ, l.source, string(r))
+		}
+		m.setDuration.WithLabelValues(d.Name, l.typ, l.source)
+	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
@@ -140,6 +194,11 @@ func New(build BuildInfo, configHash string, p engine.Policy) *Metrics {
 		m.auditTotal,
 		m.errorsTotal,
 		m.dropped,
+		m.setEntries,
+		m.setAvailable,
+		m.setLastSuccess,
+		m.setRefreshes,
+		m.setDuration,
 	)
 	m.handler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	return m
@@ -163,6 +222,46 @@ func (m *Metrics) DecisionLogDropped() { m.dropped.Inc() }
 // ConnectionRefused counts a connection to the gRPC listener refused because
 // server.max_connections were open.
 func (m *Metrics) ConnectionRefused() { m.refused.Inc() }
+
+// setLabels are the labels of the series of a set, and whether it has the
+// series of the refreshes.
+type setLabels struct {
+	typ, source string
+	refreshes   bool
+}
+
+// SetRefreshed records a check of the source of the set name, or its load
+// at startup: its result, how long it took, and when it ended, which is the
+// time of the last successful check when the result is updated or
+// unchanged. It records nothing for a set that does not refresh, such as a
+// set of values.
+func (m *Metrics) SetRefreshed(name string, r sets.RefreshResult, took time.Duration, at time.Time) {
+	l := m.setLabels[name]
+	if !l.refreshes {
+		return
+	}
+	m.setRefreshes.WithLabelValues(name, l.typ, l.source, string(r)).Inc()
+	m.setDuration.WithLabelValues(name, l.typ, l.source).Observe(took.Seconds())
+	if r == sets.RefreshUpdated || r == sets.RefreshUnchanged {
+		m.setLastSuccess.WithLabelValues(name, l.typ, l.source).Set(float64(at.UnixNano()) / 1e9)
+	}
+}
+
+// SetEntries records the entries of the copy of the set name in use.
+func (m *Metrics) SetEntries(name string, entries int) {
+	l := m.setLabels[name]
+	m.setEntries.WithLabelValues(name, l.typ, l.source).Set(float64(entries))
+}
+
+// SetAvailable records whether the set name is available.
+func (m *Metrics) SetAvailable(name string, available bool) {
+	v := 0.0
+	if available {
+		v = 1
+	}
+	l := m.setLabels[name]
+	m.setAvailable.WithLabelValues(name, l.typ, l.source).Set(v)
+}
 
 // Handler serves the registry in the Prometheus exposition format.
 func (m *Metrics) Handler() http.Handler { return m.handler }

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // LookupEnv returns the value of an environment variable and whether it is
@@ -16,20 +18,26 @@ type LookupEnv func(string) (string, bool)
 
 // Config is a valid configuration with its defaults applied.
 type Config struct {
-	Server   Server   `yaml:"server"`
-	Admin    Admin    `yaml:"admin"`
-	Log      Log      `yaml:"log"`
-	ClientIP ClientIP `yaml:"client_ip"`
-	Policy   Policy   `yaml:"policy"`
+	Server   Server         `yaml:"server"`
+	Admin    Admin          `yaml:"admin"`
+	Log      Log            `yaml:"log"`
+	ClientIP ClientIP       `yaml:"client_ip"`
+	Sets     map[string]Set `yaml:"sets"`
+	Policy   Policy         `yaml:"policy"`
 
 	// nodes maps the path of each key read from the file to its position.
 	nodes map[string]location
 	// tainted holds the paths of the values that contain a ${...}
 	// substitution.
 	tainted map[string]bool
-	// keys holds the keys of each mapping of strings, in the order of the
-	// file, by the path of the mapping.
+	// keys holds the keys of each mapping of strings or of named blocks, in
+	// the order of the file, by the path of the mapping.
 	keys map[string][]mapKey
+	// integers holds the paths of the values of a list of set values that
+	// the file writes as YAML integers.
+	integers map[string]bool
+	// warnings are the problems that do not make the configuration invalid.
+	warnings []Warning
 	// styles holds the YAML style of each expression, by its path, and lines
 	// the lines of the file: they place an error in an expression.
 	styles map[string]yaml.Style
@@ -94,6 +102,50 @@ func (c ClientIP) MarshalYAML() (any, error) {
 	return struct {
 		From string `yaml:"from"`
 	}{c.From}, nil
+}
+
+// Set is a named set: its type and its one source, values or file. Refresh,
+// MaxStaleness and OnUnavailable belong to a file: they are errors with
+// values, whose set is always available.
+type Set struct {
+	Type   string     `yaml:"type"`
+	Values []SetValue `yaml:"values"`
+	// File is the path of the file. Load makes a relative path absolute.
+	File          string        `yaml:"file"`
+	Refresh       time.Duration `yaml:"refresh"`
+	MaxStaleness  time.Duration `yaml:"max_staleness"`
+	OnUnavailable string        `yaml:"on_unavailable"`
+	MaxEntries    int           `yaml:"max_entries"`
+}
+
+// SetValue is a value of sets.<name>.values, as the file writes it: a
+// string or, for an asn set, a YAML integer too, kept as written.
+type SetValue string
+
+func (s *Set) setDefaults() {
+	s.Refresh = DefaultSetRefresh
+	s.OnUnavailable = OnUnavailableFail
+	s.MaxEntries = DefaultMaxEntries
+}
+
+// MarshalYAML writes the keys of the source of the set only, so that the
+// printed configuration reads back.
+func (s Set) MarshalYAML() (any, error) {
+	if s.File == "" {
+		return struct {
+			Type       string     `yaml:"type"`
+			Values     []SetValue `yaml:"values"`
+			MaxEntries int        `yaml:"max_entries"`
+		}{s.Type, s.Values, s.MaxEntries}, nil
+	}
+	return struct {
+		Type          string        `yaml:"type"`
+		File          string        `yaml:"file"`
+		Refresh       time.Duration `yaml:"refresh"`
+		MaxStaleness  time.Duration `yaml:"max_staleness"`
+		OnUnavailable string        `yaml:"on_unavailable"`
+		MaxEntries    int           `yaml:"max_entries"`
+	}{s.Type, s.File, s.Refresh, s.MaxStaleness, s.OnUnavailable, s.MaxEntries}, nil
 }
 
 // Policy holds the decision rules.
@@ -208,6 +260,28 @@ const (
 	ClientIPXForwardedFor = "x_forwarded_for"
 )
 
+// The values of sets.<name>.type.
+const (
+	SetTypeCIDR   = string(sets.CIDR)
+	SetTypeASN    = string(sets.ASN)
+	SetTypeString = string(sets.String)
+)
+
+// The values of sets.<name>.on_unavailable.
+const (
+	OnUnavailableFail    = string(sets.Fail)
+	OnUnavailableMatch   = string(sets.Match)
+	OnUnavailableNoMatch = string(sets.NoMatch)
+)
+
+// The defaults and limits of a set.
+const (
+	DefaultSetRefresh = 10 * time.Second
+	MinSetRefresh     = time.Second
+	DefaultMaxEntries = 1_000_000
+	MaxSetNameLength  = 63
+)
+
 // The values of policy.default_action and policy.rules[].action.
 const (
 	ActionAllow = "allow"
@@ -249,14 +323,16 @@ func defaults() *Config {
 		Admin:    Admin{Listen: ":9090"},
 		Log:      Log{Level: LevelInfo, Format: FormatLogfmt, Decisions: DecisionsDeny},
 		ClientIP: ClientIP{From: ClientIPPeer},
+		Sets:     map[string]Set{},
 		Policy: Policy{
 			Mode:         ModeEnforce,
 			DenyResponse: Response{Status: 403, Headers: map[string]string{}},
 			Rules:        []Rule{},
 		},
-		nodes:   map[string]location{},
-		tainted: map[string]bool{},
-		keys:    map[string][]mapKey{},
-		styles:  map[string]yaml.Style{},
+		nodes:    map[string]location{},
+		tainted:  map[string]bool{},
+		keys:     map[string][]mapKey{},
+		integers: map[string]bool{},
+		styles:   map[string]yaml.Style{},
 	}
 }

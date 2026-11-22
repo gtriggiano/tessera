@@ -12,6 +12,9 @@ import (
 	"testing"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/gtriggiano/tessera/internal/sets"
+	"github.com/gtriggiano/tessera/internal/source"
 )
 
 // configSnippetInfo is the fence info string of a tessera configuration
@@ -216,8 +219,10 @@ func TestDocsConfigSnippets(t *testing.T) {
 // replaces the path with the address of the published schema.
 const exampleSchemaDirective = "# yaml-language-server: $schema=../public/config.schema.json"
 
-// TestRepositoryExamples loads every file in docs/examples/ as a complete
-// configuration, with every environment variable unset.
+// TestRepositoryExamples loads every .yaml file in docs/examples/ as a
+// complete configuration, with every environment variable unset, and reads
+// the file of each of its sets. A .txt file is the file of a set, which an
+// example reads.
 func TestRepositoryExamples(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join(examplesDir, "*"))
 	if err != nil {
@@ -226,13 +231,17 @@ func TestRepositoryExamples(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no file in docs/examples/")
 	}
+	read := map[string]bool{}
 	for _, file := range files {
 		if strings.HasPrefix(filepath.Base(file), ".") {
 			continue // Such as the .DS_Store of macOS, which Git ignores.
 		}
+		if filepath.Ext(file) == ".txt" {
+			continue // The file of a set, read with its example.
+		}
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			if filepath.Ext(file) != ".yaml" {
-				t.Fatal("docs/examples/ holds complete configurations only, as .yaml files")
+				t.Fatal("docs/examples/ holds complete configurations, as .yaml files, and the files of their sets, as .txt files")
 			}
 			data, err := os.ReadFile(file)
 			if err != nil {
@@ -248,7 +257,21 @@ func TestRepositoryExamples(t *testing.T) {
 			if _, err := c.Redacted(); err != nil {
 				t.Fatal(err)
 			}
+			for name, s := range c.Sets {
+				if s.File == "" {
+					continue
+				}
+				if _, _, err := source.ReadFile(s.File, sets.Type(s.Type), s.MaxEntries); err != nil {
+					t.Errorf("sets.%s.file: %v", name, err)
+				}
+				read[s.File] = true
+			}
 		})
+	}
+	for _, file := range files {
+		if abs, err := filepath.Abs(file); err == nil && filepath.Ext(file) == ".txt" && !read[abs] {
+			t.Errorf("%s: no example reads this file", filepath.Base(file))
+		}
 	}
 }
 
@@ -373,7 +396,7 @@ func TestParseConfigSnippet(t *testing.T) {
 			t.Fatalf("%q: default action %q, level %q", tc.snippet, c.Policy.DefaultAction, c.Log.Level)
 		}
 	}
-	for _, snippet := range []string{"", "- a\n", "log: [\n", "log: {}\n---\nlog: {}\n", "log:\n  level: 1\n", "sets: {}\n", "log:\n  level: ${LOG_LEVEL}\n", "policy: deny\n"} {
+	for _, snippet := range []string{"", "- a\n", "log: [\n", "log: {}\n---\nlog: {}\n", "log:\n  level: 1\n", "routes: {}\n", "log:\n  level: ${LOG_LEVEL}\n", "policy: deny\n"} {
 		if _, _, err := parseConfigSnippet(snippet); err == nil {
 			t.Fatalf("%q: invalid snippet accepted", snippet)
 		}

@@ -33,7 +33,7 @@ help:
 	@echo "make fmt             Format Go sources"
 	@echo "make test-e2e        Run tessera in Docker with Envoy and a test upstream (needs Docker)"
 	@echo "make fuzz            Run each fuzz target for $(FUZZ_TIME)"
-	@echo "make bench           Run the benchmarks of a decision for $(BENCH_TIME) each"
+	@echo "make bench           Run the benchmarks of a decision and of the sets for $(BENCH_TIME) each"
 	@echo "make vuln            Scan Go code using pinned govulncheck"
 	@echo "make workflows-check Validate GitHub Actions workflows"
 	@echo "make workflows-audit Audit workflows and Dependabot configuration using pinned zizmor (needs uv)"
@@ -75,11 +75,17 @@ test-e2e:
 fuzz:
 	$(GO) test ./internal/request -run='^$$' -fuzz=FuzzNormalize -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
 	$(GO) test ./internal/request -run='^$$' -fuzz=FuzzClientIP -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
+	$(GO) test ./internal/sets -run='^$$' -fuzz=FuzzRead -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
+	$(GO) test ./internal/sets -run='^$$' -fuzz=FuzzParseValue -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
 
-# The benchmarks of one decision over ten typical rules: time, memory and
-# allocations per decision, and the percentiles of the time of each.
+# The benchmarks of one decision over ten typical rules, alone and after a
+# rule on a set of 100,000 and of 1,000,000 networks: time, memory and
+# allocations per decision, and the percentiles of the time of each. Then the
+# lookups in those sets, the memory per entry of each type of set, and the
+# reading of a set of one million entries. One package at a time (-p 1), so
+# that their times do not mix.
 bench:
-	$(GO) test ./internal/engine -run='^$$' -bench=. -benchmem -benchtime=$(BENCH_TIME) -count=1
+	$(GO) test -p 1 ./internal/engine ./internal/sets ./internal/source -run='^$$' -bench=. -benchmem -benchtime=$(BENCH_TIME) -count=1
 
 mod-check:
 	$(GO) mod tidy -diff

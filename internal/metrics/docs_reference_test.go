@@ -32,7 +32,7 @@ type family struct {
 // see, so that no family escapes the comparison.
 func exportedFamilies(t *testing.T) map[string]family {
 	t.Helper()
-	m := New(testBuild, testHash, testPolicy)
+	m := New(testBuild, testHash, testPolicy, testSets)
 	got := map[string]family{}
 	for name, f := range gather(t, m) {
 		if !strings.HasPrefix(name, namespace+"_") {

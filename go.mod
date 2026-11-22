@@ -5,6 +5,7 @@ go 1.27.4
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/envoyproxy/go-control-plane/envoy v1.40.0
+	github.com/gaissmai/bart v0.30.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/spf13/cobra v1.10.2

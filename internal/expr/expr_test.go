@@ -66,7 +66,7 @@ func sampleRequest(clientIP string) *request.Request {
 // eval compiles and evaluates text for r.
 func eval(t *testing.T, env *Env, text string, r *request.Request) (bool, error) {
 	t.Helper()
-	return mustCompile(t, env, text).Eval(NewInput(r))
+	return mustCompile(t, env, text).Eval(NewInput(r, nil))
 }
 
 func cause(err error) Cause {
@@ -344,7 +344,7 @@ func TestPanics(t *testing.T) {
 	}}))
 	evalAs := func(rule, text string, r *request.Request) (bool, error) {
 		t.Helper()
-		in := NewInput(r)
+		in := NewInput(r, nil)
 		in.SetRule(rule)
 		return mustCompile(t, env, text).Eval(in)
 	}
@@ -379,7 +379,7 @@ func TestPanics(t *testing.T) {
 	// A field read that panics, here on a request that is not there, is
 	// guarded too, and reported with its rule.
 	reported = nil
-	in := NewInput(&request.Request{})
+	in := NewInput(&request.Request{}, nil)
 	in.SetRule("admin")
 	in.request.req = nil
 	_, err := mustCompile(t, env, `request.host == "x"`).Eval(in)
@@ -400,7 +400,7 @@ func TestInCidrNetworkParsedOnce(t *testing.T) {
 	c := mustCompile(t, env, `client.ip.inCidr("198.51.100.0/24") || client.ip.inCidr("203.0.113.0/24") || client.ip.inCidr("2001:db8::/32")`)
 	compiled := parses
 	for range 100 {
-		if ok, err := c.Eval(NewInput(sampleRequest("2001:db8::7"))); !ok || err != nil {
+		if ok, err := c.Eval(NewInput(sampleRequest("2001:db8::7"), nil)); !ok || err != nil {
 			t.Fatalf("Eval = %v, %v", ok, err)
 		}
 	}
@@ -421,7 +421,7 @@ func TestConcurrentEvaluations(t *testing.T) {
 	for w := range 8 {
 		wg.Go(func() {
 			for i := range 500 {
-				in := NewInput(sampleRequest(fmt.Sprintf("192.0.2.%d", (w*500+i)%250+1)))
+				in := NewInput(sampleRequest(fmt.Sprintf("192.0.2.%d", (w*500+i)%250+1)), nil)
 				for _, c := range conditions {
 					if ok, err := c.Eval(in); !ok || err != nil {
 						t.Errorf("Eval = %v, %v", ok, err)

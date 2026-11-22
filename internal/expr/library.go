@@ -16,15 +16,25 @@ import (
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
+
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // The overload IDs of tessera's functions. The decorator finds the calls of
 // inCidr by its ID.
 const (
-	overloadIPInCidr   = "tessera_ip_in_cidr_string"
-	overloadIPFamily   = "tessera_ip_family"
-	overloadIPToString = "tessera_ip_to_string"
+	overloadIPInCidr          = "tessera_ip_in_cidr_string"
+	overloadIPFamily          = "tessera_ip_family"
+	overloadIPToString        = "tessera_ip_to_string"
+	overloadCIDRSetContains   = "tessera_cidr_set_contains_ip"
+	overloadASNSetContains    = "tessera_asn_set_contains_int"
+	overloadStringSetContains = "tessera_string_set_contains_string"
 )
+
+// setContainsOverloads are the overloads of contains on a set. Each costs
+// one unit, whatever the size of the set: a lookup in a copy does not grow
+// with it the way a scan does.
+var setContainsOverloads = []string{overloadCIDRSetContains, overloadASNSetContains, overloadStringSetContains}
 
 // Panic is a panic that tessera recovered while it evaluated a condition.
 type Panic struct {
@@ -40,12 +50,14 @@ type Panic struct {
 
 func (p *Panic) Error() string { return fmt.Sprintf("panic: %v", p.Value) }
 
-// library holds tessera's functions, the validator of their arguments, the
+// library holds tessera's functions, the validators of their arguments, the
 // decorator that parses the network of inCidr in advance, and the guards
 // that turn a panic into an error. It holds no mutable state.
 type library struct {
 	onPanic      func(*Panic)
 	parseNetwork func(string) (netip.Prefix, error)
+	// sets are the declared sets: the fields of the variable sets.
+	sets []sets.Declaration
 }
 
 // The errors of an invalid network. They never repeat the configured value.
@@ -82,7 +94,16 @@ func (l *library) envOptions() []cel.EnvOption {
 		cel.Function("string",
 			cel.Overload(overloadIPToString, []*cel.Type{ipType}, cel.StringType,
 				cel.UnaryBinding(l.unary(ipToString)))),
+		// Merged with contains on strings, from the standard library.
+		cel.Function("contains",
+			cel.MemberOverload(overloadCIDRSetContains, []*cel.Type{cidrSetType, ipType}, cel.BoolType,
+				cel.BinaryBinding(l.binary(cidrSetContains))),
+			cel.MemberOverload(overloadASNSetContains, []*cel.Type{asnSetType, cel.IntType}, cel.BoolType,
+				cel.BinaryBinding(l.binary(asnSetContains))),
+			cel.MemberOverload(overloadStringSetContains, []*cel.Type{stringSetType, cel.StringType}, cel.BoolType,
+				cel.BinaryBinding(l.binary(stringSetContains)))),
 		cel.ASTValidators(
+			setsValidator{},
 			networkValidator{lib: l},
 			regexValidator{},
 			cel.ValidateHomogeneousAggregateLiterals(),
@@ -105,6 +126,76 @@ func ipFamily(v ref.Val) ref.Val {
 
 func ipToString(v ref.Val) ref.Val {
 	return types.String(v.(*ip).addr.String())
+}
+
+// The bindings of contains on a set: the copy answers when the set is
+// available, on_unavailable otherwise, whatever the argument.
+func cidrSetContains(set, addr ref.Val) ref.Val {
+	s, answer := set.(*setVal).inUse()
+	if s == nil {
+		return answer
+	}
+	return types.Bool(s.ContainsAddr(addr.(*ip).addr))
+}
+
+func asnSetContains(set, number ref.Val) ref.Val {
+	s, answer := set.(*setVal).inUse()
+	if s == nil {
+		return answer
+	}
+	return types.Bool(s.ContainsASN(int64(number.(types.Int))))
+}
+
+func stringSetContains(set, value ref.Val) ref.Val {
+	s, answer := set.(*setVal).inUse()
+	if s == nil {
+		return answer
+	}
+	return types.Bool(s.ContainsString(string(value.(types.String))))
+}
+
+// oneUnit is the cost of contains on a set.
+func oneUnit([]ref.Val, ref.Val) *uint64 {
+	one := uint64(1)
+	return &one
+}
+
+// costOptions give contains on a set its constant cost.
+func costOptions() []interpreter.CostTrackerOption {
+	var out []interpreter.CostTrackerOption
+	for _, id := range setContainsOverloads {
+		out = append(out, interpreter.OverloadCostTracker(id, oneUnit))
+	}
+	return out
+}
+
+// errSetUse is the message of a set used otherwise than as the target of
+// contains.
+var errSetUse = errors.New("a set can be used only as the target of contains, as in sets.<name>.contains(value)")
+
+// setsValidator checks that the variable sets is used only as
+// sets.<name>.contains(value): a set is not a value that an expression can
+// compare, test with has() or keep in a list. It reports each other use at
+// the position of sets.
+type setsValidator struct{}
+
+func (setsValidator) Name() string { return "tessera.validator.sets" }
+
+func (setsValidator) Validate(_ *cel.Env, _ cel.ValidatorConfig, a *ast.AST, iss *cel.Issues) {
+	isSets := func(e ast.Expr) bool {
+		return e.Kind() == ast.IdentKind && e.AsIdent() == "sets" && a.GetType(e.ID()).IsExactType(setsType)
+	}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(a), func(e ast.NavigableExpr) bool { return isSets(e) }) {
+		sel, ok := e.Parent()
+		if ok && sel.Kind() == ast.SelectKind && !sel.AsSelect().IsTestOnly() {
+			call, ok := sel.Parent()
+			if ok && call.Kind() == ast.CallKind && call.AsCall().FunctionName() == "contains" &&
+				call.AsCall().IsMemberFunction() && call.AsCall().Target().ID() == sel.ID() {
+				continue
+			}
+		}
+		iss.ReportErrorAtID(e.ID(), "%s", errSetUse)
+	}
 }
 
 // ipInCidrUnprepared is the binding of inCidr when its network was not
@@ -270,7 +361,7 @@ func (c *inCidrCall) Eval(act interpreter.Activation) ref.Val {
 // unary and binary guard a function binding: a panic becomes an error value
 // that wraps a *Panic with its stack, reported to onPanic, instead of an
 // "internal error" of cel-go for the whole evaluation.
-// Every function of tessera takes a tessera.IP, which leads to the
+// Every function of tessera takes a tessera.IP or a set, which leads to the
 // activation, and so to the rule being evaluated.
 func (l *library) unary(fn functions.UnaryOp) functions.UnaryOp {
 	return func(v ref.Val) (out ref.Val) {
@@ -286,19 +377,22 @@ func (l *library) binary(fn functions.BinaryOp) functions.BinaryOp {
 	}
 }
 
-// inputOf returns the activation of the first tessera.IP among values, or
-// nil.
+// inputOf returns the activation of the first tessera.IP or set among
+// values, or nil.
 func inputOf(values ...ref.Val) *Input {
 	for _, v := range values {
-		if a, ok := v.(*ip); ok {
-			return a.in
+		switch v := v.(type) {
+		case *ip:
+			return v.in
+		case *setVal:
+			return v.in
 		}
 	}
 	return nil
 }
 
 // guardGet guards the reading of a field in the same way: the field belongs
-// to the value of request or client, which leads to the activation.
+// to the value of request, client or sets, which leads to the activation.
 func (l *library) guardGet(get func(any) (any, error)) func(any) (any, error) {
 	return func(obj any) (out any, err error) {
 		defer func() {
@@ -308,6 +402,8 @@ func (l *library) guardGet(get func(any) (any, error)) func(any) (any, error) {
 				case *requestVal:
 					in = v.in
 				case *clientVal:
+					in = v.in
+				case *setsVal:
 					in = v.in
 				}
 				out, err = nil, l.recovered(r, in)

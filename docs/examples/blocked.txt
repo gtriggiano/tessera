@@ -1,0 +1,4 @@
+# Networks blocked during an incident.
+198.51.100.0/24
+2001:db8:bad::/48
+192.0.2.66          # one address

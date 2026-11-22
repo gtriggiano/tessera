@@ -46,20 +46,29 @@ func (c *Config) validatePolicy() error {
 	if len(p.Rules) > MaxRules {
 		return c.err("policy.rules", "more than "+strconv.Itoa(MaxRules)+" rules")
 	}
-	env, err := expr.NewEnv(expr.Options{})
+	env, err := expr.NewEnv(expr.Options{Sets: c.SetDeclarations()})
 	if err != nil {
 		return errors.New("configuration: cannot prepare the expressions")
 	}
 	names := map[string]int{}
+	used := map[string]bool{}
 	for i := range p.Rules {
-		if err := c.validateRule(env, i, names); err != nil {
+		if err := c.validateRule(env, i, names, used); err != nil {
 			return err
+		}
+	}
+	// A set that no rule reads is still loaded and checked.
+	for _, k := range c.keys["sets"] {
+		if !used[k.name] {
+			c.warnings = append(c.warnings, Warning{Path: childPath("sets", k.name), Line: k.at.line, Column: k.at.column, Problem: "the set is not used by any rule"})
 		}
 	}
 	return nil
 }
 
-func (c *Config) validateRule(env *expr.Env, i int, names map[string]int) error {
+// validateRule checks the rule i, and adds the sets that its condition reads
+// to used.
+func (c *Config) validateRule(env *expr.Env, i int, names map[string]int, used map[string]bool) error {
 	r := &c.Policy.Rules[i]
 	path := itemPath("policy.rules", i)
 	switch {
@@ -97,6 +106,9 @@ func (c *Config) validateRule(env *expr.Env, i int, names map[string]int) error 
 			return c.err(path+".when", "invalid expression")
 		}
 		return c.expressionError(path+".when", string(r.When), ce.Issues[0])
+	}
+	for _, name := range cond.Sets() {
+		used[name] = true
 	}
 	r.written.response = c.present(path + ".response")
 	r.written.status = c.present(path + ".response.status")

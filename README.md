@@ -12,7 +12,7 @@
 
 ## Status
 
-tessera is in development and has no release yet. `tessera serve` answers Envoy's external authorization requests with ordered rules, written in the Common Expression Language (CEL), on the host, method, path and headers of each request and on the client address; it logs the decisions, and serves health checks and Prometheus metrics on a separate admin listener. `tessera eval` shows how the rules decide a request. Lists, location data and the client software are not available yet.
+tessera is in development and has no release yet. `tessera serve` answers Envoy's external authorization requests with ordered rules, written in the Common Expression Language (CEL), on the host, method, path and headers of each request, on the client address, and on sets of networks, AS numbers or strings written in the configuration or read from local files, which it reloads when they change; it logs the decisions, and serves health checks and Prometheus metrics on a separate admin listener. `tessera eval` shows how the rules decide a request. Remote lists, location data and the client software are not available yet.
 
 ## Development
 

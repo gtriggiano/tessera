@@ -8,16 +8,29 @@ import (
 
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
+
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
-// The CEL types that tessera declares. Request and Client are object types
-// whose fields the provider describes; IP is opaque: expressions use it only
-// through the functions of library.go.
+// The CEL types that tessera declares. Request, Client and Sets are object
+// types whose fields the provider describes; IP and the types of the sets
+// are opaque: expressions use them only through the functions of library.go.
 var (
-	requestType = types.NewObjectType("tessera.Request")
-	clientType  = types.NewObjectType("tessera.Client")
-	ipType      = types.NewOpaqueType("tessera.IP")
+	requestType   = types.NewObjectType("tessera.Request")
+	clientType    = types.NewObjectType("tessera.Client")
+	setsType      = types.NewObjectType("tessera.Sets")
+	ipType        = types.NewOpaqueType("tessera.IP")
+	cidrSetType   = types.NewOpaqueType("tessera.CIDRSet")
+	asnSetType    = types.NewOpaqueType("tessera.ASNSet")
+	stringSetType = types.NewOpaqueType("tessera.StringSet")
 )
+
+// setTypes are the CEL types of the sets, by the type of a set.
+var setTypes = map[sets.Type]*types.Type{
+	sets.CIDR:   cidrSetType,
+	sets.ASN:    asnSetType,
+	sets.String: stringSetType,
+}
 
 // ip is the CEL value of an IP address, always unmapped: an IPv4-mapped IPv6
 // address is held as the IPv4 address it maps. in is the activation it
@@ -59,7 +72,8 @@ func (v *ip) Value() any     { return v.addr }
 
 // field is one field of an object type: its CEL type, whether it is set on a
 // value, and how to read it. The functions receive the Go value that the
-// activation returned for the variable, a *requestVal or a *clientVal.
+// activation returned for the variable, a *requestVal, a *clientVal or a
+// *setsVal.
 type field struct {
 	typ   *types.Type
 	isSet func(obj any) bool
@@ -82,8 +96,16 @@ func newProvider(lib *library) (*provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := reg.RegisterType(ipType); err != nil {
+	if err := reg.RegisterType(ipType, cidrSetType, asnSetType, stringSetType); err != nil {
 		return nil, err
+	}
+	setFields := make(map[string]field, len(lib.sets))
+	for i, d := range lib.sets {
+		f, err := setField(i, len(lib.sets), d)
+		if err != nil {
+			return nil, err
+		}
+		setFields[d.Name] = f
 	}
 	guard := func(fields map[string]field) map[string]field {
 		out := make(map[string]field, len(fields))
@@ -98,6 +120,7 @@ func newProvider(lib *library) (*provider, error) {
 		objects: map[string]map[string]field{
 			requestType.TypeName(): guard(requestFields),
 			clientType.TypeName():  guard(clientFields),
+			setsType.TypeName():    guard(setFields),
 		},
 	}, nil
 }

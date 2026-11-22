@@ -154,7 +154,7 @@ func NewRecorder(dest *Shared, o RecorderOptions) *Recorder {
 		if _, ok := r.panics[rule]; ok {
 			continue
 		}
-		for _, cause := range []expr.Cause{expr.CauseClientIPMissing, expr.CauseExpression, expr.CausePanic} {
+		for _, cause := range []expr.Cause{expr.CauseClientIPMissing, expr.CauseExpression, expr.CausePanic, expr.CauseSetUnavailable} {
 			r.errors[errorKey{rule, cause}] = &slot{rule: rule, cause: cause}
 		}
 		r.panics[rule] = &slot{rule: rule}
@@ -208,7 +208,7 @@ func (r *Recorder) Decision(d engine.Decision, req *request.Request) {
 	if d.Reason == engine.ReasonError {
 		attrs = append(attrs, slog.String("error", string(d.Cause)))
 	}
-	attrs = append(attrs, slog.Float64("duration_ms", milliseconds(d.Duration)))
+	attrs = append(attrs, slog.Float64("duration_ms", Milliseconds(d.Duration)))
 	r.logger.LogAttrs(ctx, level, "decision", attrs...)
 }
 
@@ -230,8 +230,9 @@ func (r *Recorder) logs(d engine.Decision) bool {
 	return false
 }
 
-// milliseconds returns d in milliseconds, rounded to the microsecond.
-func milliseconds(d time.Duration) float64 {
+// Milliseconds returns d in milliseconds, rounded to the microsecond: the
+// value of the duration_ms fields of the events.
+func Milliseconds(d time.Duration) float64 {
 	return math.Round(float64(d)/float64(time.Microsecond)) / 1000
 }
 

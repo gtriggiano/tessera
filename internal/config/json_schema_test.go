@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // docs/public/config.schema.json is the JSON Schema of the configuration file,
@@ -46,6 +48,7 @@ const (
 	jsonSchemaListenPattern   = `^(unix:.+|.*:[1-9][0-9]{0,4})$`
 	jsonSchemaHeaderPattern   = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
 	jsonSchemaRuleNamePattern = "^[a-z0-9-]{1,63}$"
+	jsonSchemaSetNamePattern  = "^[a-z][a-z0-9_]{0,62}$"
 )
 
 // jsonSchemaNote is what the types and defaults do not say about a key.
@@ -64,6 +67,12 @@ type jsonSchemaNote struct {
 	// inherited is the key whose value this key takes when the file does not
 	// write it. The schema states no default for it.
 	inherited string
+	// requiredUnless is the other key that makes this key optional: one of
+	// the two is required. The schema states neither this rule, which
+	// involves two keys, nor a default.
+	requiredUnless string
+	// names is the pattern of the names of a mapping of names.
+	names string
 }
 
 // condition is a key that has a value.
@@ -90,6 +99,15 @@ var jsonSchemaNotes = map[string]jsonSchemaNote{
 	"client_ip.from":         {doc: "The source of the client address: peer, the address of the connection to Envoy; header, a header that holds one address; x_forwarded_for, the X-Forwarded-For header, read from the right.", enum: []string{ClientIPPeer, ClientIPHeader, ClientIPXForwardedFor}},
 	"client_ip.header":       {doc: "The header that holds the client address, in any case. Required, and allowed only, when from is header.", requiredWhen: condition{"client_ip.from", ClientIPHeader}, pattern: jsonSchemaHeaderPattern},
 	"client_ip.trusted_hops": {doc: "The number of entries at the right end of X-Forwarded-For that trusted proxies wrote after the client address. Required, and allowed only, when from is x_forwarded_for.", requiredWhen: condition{"client_ip.from", ClientIPXForwardedFor}, nonNegative: true},
+
+	"sets":                       {doc: "The named sets that conditions read with sets.<name>.contains(value). A name is a lowercase letter followed by lowercase letters, digits and underscores, at most 63 characters, and not a reserved word of the expression language.", names: jsonSchemaSetNamePattern},
+	"sets.<name>.type":           {doc: "The type of the values: cidr, IP networks and addresses; asn, autonomous system numbers; string, strings compared exactly.", required: true, enum: []string{SetTypeCIDR, SetTypeASN, SetTypeString}},
+	"sets.<name>.values":         {doc: "The values of the set, written here: strings, or for an asn set integers too. A set has one source: values or file.", requiredUnless: "sets.<name>.file"},
+	"sets.<name>.file":           {doc: "The file of the set, relative to the configuration file when it is not absolute: one value per line, # starts a comment. A set has one source: values or file.", requiredUnless: "sets.<name>.values"},
+	"sets.<name>.refresh":        {doc: "How often tessera checks the file for a change. At least 1s. Only with file."},
+	"sets.<name>.max_staleness":  {doc: "The age of the last successful check of the file beyond which the set is unavailable. 0s sets no limit; any other value must be longer than refresh. Only with file."},
+	"sets.<name>.on_unavailable": {doc: "What contains answers when the set is unavailable: fail makes the condition indeterminate, which counts against allowing; match answers true; no_match answers false. Only with file.", enum: []string{OnUnavailableFail, OnUnavailableMatch, OnUnavailableNoMatch}},
+	"sets.<name>.max_entries":    {doc: "The largest number of values of the set, duplicates included; more is an error.", min: 1},
 
 	"policy":                          {doc: "How tessera decides.", required: true},
 	"policy.mode":                     {doc: "enforce applies the decisions; audit allows every request, and reports the denials it did not enforce with enforced=false, in the decision event and in tessera_decisions_total.", enum: []string{ModeEnforce, ModeAudit}},
@@ -257,6 +275,17 @@ func (b *jsonSchemaBuilder) field(t reflect.Type, path string, note jsonSchemaNo
 			out = append(out, jsonMember{"maxItems", note.maxItems})
 		}
 		out = append(out, jsonMember{"items", b.mapping(t.Elem(), path+"[]", listItem(t.Elem()))})
+	case t.Kind() == reflect.Slice && t.Elem() == setValueType:
+		out = append(out, jsonMember{"type", "array"}, jsonMember{"items", jsonObject{{"anyOf", []any{
+			jsonObject{{"type", "string"}},
+			jsonObject{{"type", "integer"}, {"minimum", 1}, {"maximum", sets.MaxASN}},
+		}}}})
+	case t.Kind() == reflect.Map && t.Elem().Kind() == reflect.Struct:
+		out = append(out, jsonMember{"type", "object"})
+		if note.names != "" {
+			out = append(out, jsonMember{"propertyNames", jsonObject{{"pattern", note.names}}})
+		}
+		out = append(out, jsonMember{"additionalProperties", b.mapping(t.Elem(), path+".<name>", listItem(t.Elem()))})
 	case t.Kind() == reflect.Map && t.Elem().Kind() == reflect.String:
 		out = append(out, jsonMember{"type", "object"}, jsonMember{"additionalProperties", jsonObject{{"type", "string"}}})
 	case t.Kind() == reflect.String:
@@ -274,7 +303,7 @@ func (b *jsonSchemaBuilder) field(t reflect.Type, path string, note jsonSchemaNo
 	default:
 		b.t.Fatalf("%s: no JSON Schema for the Go type %s", path, t)
 	}
-	if note.required || note.requiredWhen != (condition{}) || note.inherited != "" {
+	if note.required || note.requiredWhen != (condition{}) || note.inherited != "" || note.requiredUnless != "" {
 		return out
 	}
 	return append(out, jsonMember{"default", jsonSchemaLiteral(b.t, path, v)})
@@ -499,6 +528,12 @@ func jsonSchemaProblems(t *testing.T, root, schema map[string]any, value any, pa
 					}
 				}
 			}
+		case "propertyNames":
+			if m, ok := value.(map[string]any); ok {
+				for name := range m {
+					problems = append(problems, jsonSchemaProblems(t, root, rule.(map[string]any), name, childPath(path, name))...)
+				}
+			}
 		case "maxItems":
 			if items, ok := value.([]any); ok && float64(len(items)) > rule.(float64) {
 				report("more than %v items", rule)
@@ -589,6 +624,21 @@ policy:
     - name: everyone
       action: allow
       mode: audit
+sets:
+  office:
+    type: cidr
+    values: [192.0.2.0/24, "2001:db8::/32"]
+    max_entries: 100
+  networks:
+    type: asn
+    values: [64496, AS64497, "64498"]
+  partners:
+    type: string
+    file: /etc/tessera/partners.txt
+    refresh: 1m
+    max_staleness: 1h
+    on_unavailable: no_match
+    max_entries: 5000
 `,
 		"client address from a header": `
 client_ip:
@@ -610,6 +660,15 @@ log:
 client_ip:
   from: ${SOURCE}
   header: ${HEADER}
+sets:
+  hosts:
+    type: ${SET_TYPE:-string}
+    values: ["${HOST:-api.example.com}"]
+  blocked:
+    type: cidr
+    file: ${BLOCKED_FILE:-blocked.txt}
+    refresh: ${REFRESH:-30s}
+    on_unavailable: ${ANSWER:-match}
 policy:
   default_action: ${ACTION}
 `,
@@ -644,7 +703,17 @@ func TestJSONSchemaRejectsInvalidConfigurations(t *testing.T) {
 	for name, text := range map[string]string{
 		"missing policy":            "log:\n  level: info\n",
 		"missing default action":    "policy: {}\n",
-		"unknown top-level key":     "policy: {default_action: deny}\nsets: {}\n",
+		"unknown top-level key":     "policy: {default_action: deny}\nroutes: {}\n",
+		"set name":                  "policy: {default_action: deny}\nsets: {Office: {type: string, values: []}}\n",
+		"set without a type":        "policy: {default_action: deny}\nsets: {office: {values: []}}\n",
+		"set type":                  "policy: {default_action: deny}\nsets: {office: {type: area, file: a.json}}\n",
+		"unknown set key":           "policy: {default_action: deny}\nsets: {office: {type: cidr, values: [], url: x}}\n",
+		"set values not a list":     "policy: {default_action: deny}\nsets: {office: {type: cidr, values: 192.0.2.0/24}}\n",
+		"set value not a scalar":    "policy: {default_action: deny}\nsets: {office: {type: cidr, values: [[192.0.2.0/24]]}}\n",
+		"AS number zero":            "policy: {default_action: deny}\nsets: {asns: {type: asn, values: [0]}}\n",
+		"set answer":                "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, on_unavailable: allow}}\n",
+		"set refresh":               "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, refresh: 10}}\n",
+		"set max entries":           "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, max_entries: 0}}\n",
 		"unknown key":               "policy: {default_action: deny}\nserver:\n  lisen: :9001\n",
 		"unknown value":             "policy: {default_action: maybe}\n",
 		"unknown log level":         "policy: {default_action: deny}\nlog: {level: trace}\n",

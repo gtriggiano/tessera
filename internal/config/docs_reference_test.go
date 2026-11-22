@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -24,11 +25,15 @@ import (
 // that value. Such a key is checked with the other key set to its value. A
 // key that takes the value of another when omitted has the default
 // "inherited from `<key>`", checked with the other key set to a value that is
-// not its default.
+// not its default. One of two keys that are each "required unless `<key>` is
+// set" must be in the file: each is checked with the other one present, then
+// with neither, which must be an error at the key or at its block.
 //
 // The keys of the items of a list are written with [] after the list, as in
 // policy.rules[].name. They are checked in a list of one item, the minimal
-// item of referenceItems.
+// item of referenceItems. The keys of the blocks of a mapping of names are
+// written with <name> for the name, as in sets.<name>.type. They are checked
+// in a block named referenceName, the minimal block of referenceItems.
 //
 // An allowed line that starts with one of these forms is checked against
 // Parse; any text may follow a form after "; ":
@@ -37,6 +42,11 @@ import (
 //	`1` to `3`                the bounds load, their neighbors do not
 //	positive                  zero is rejected
 //	zero or positive          zero loads
+//	zero or longer than `<key>`
+//	                          zero loads, a negative value does not; with
+//	                          <key> at its default and at twice its default,
+//	                          a duration equal to it does not load, one
+//	                          second more does
 //	nonempty                  "" is rejected
 //
 // A list of values is complete: it equals the enumeration of the key in the
@@ -50,15 +60,17 @@ import (
 var referencePage = filepath.Join("..", "..", "docs", "reference", "configuration.md")
 
 var (
-	keyHeadingRE     = regexp.MustCompile("^#{2,6} `([a-z0-9_]+(?:\\[\\])?(?:\\.[a-z0-9_]+(?:\\[\\])?)*)`$")
+	keyHeadingRE     = regexp.MustCompile("^#{2,6} `([a-z0-9_]+(?:\\[\\])?(?:\\.(?:[a-z0-9_]+|<name>)(?:\\[\\])?)*)`$")
 	typeLineRE       = regexp.MustCompile(`^\*\*Type:\*\* (.+)$`)
 	defaultLiteralRE = regexp.MustCompile("^\\*\\*Default:\\*\\* `([^`]+)`$")
 	defaultWhenRE    = regexp.MustCompile("^\\*\\*Default:\\*\\* required when `([a-z0-9_.]+)` is `([^`]+)`$")
 	inheritedRE      = regexp.MustCompile("^\\*\\*Default:\\*\\* inherited from `([a-z0-9_.]+)`$")
+	unlessRE         = regexp.MustCompile("^\\*\\*Default:\\*\\* required unless `([a-z0-9_.<>]+)` is set$")
 	itemIndexRE      = regexp.MustCompile(`\[[0-9]+\]`)
 	allowedLineRE    = regexp.MustCompile(`^\*\*Allowed:\*\* (\S.*)$`)
 	allowedEnumRE    = regexp.MustCompile("^`[^`]+`(?:(?:, | or )`[^`]+`)+$")
 	allowedRangeRE   = regexp.MustCompile("^`(-?[0-9]+)` to `(-?[0-9]+)`$")
+	allowedLongerRE  = regexp.MustCompile("^zero or longer than `([a-z0-9_.<>]+)`$")
 	codeRE           = regexp.MustCompile("`([^`]+)`")
 	anchorRE         = regexp.MustCompile(`[^a-z0-9]+`)
 )
@@ -71,10 +83,16 @@ const (
 )
 
 // referenceItems is the smallest valid item of each list, which the keys of
-// its items are checked in.
+// its items are checked in, and the smallest valid block of each mapping of
+// names, named referenceName.
 var referenceItems = map[string]string{
 	"policy.rules": "{name: reference-rule, action: deny}",
+	"sets":         "{type: string, file: reference.txt}",
 }
+
+// referenceName is the name of the block of a mapping of names that its keys
+// are checked in.
+const referenceName = "reference_name"
 
 type schemaKey struct {
 	path string
@@ -90,6 +108,7 @@ type referenceEntry struct {
 	required bool
 	when     condition // the value of another key that makes it required
 	from     string    // the key that it is inherited from
+	unless   string    // the key whose presence makes it optional
 }
 
 // base is the configuration that the key is checked in: referenceBase, with
@@ -140,15 +159,20 @@ func TestDocsConfigReference(t *testing.T) {
 		if entry.from != jsonSchemaNotes[key.path].inherited {
 			t.Errorf("%s:%d: %s: documented as inherited from %q, but the JSON Schema (jsonSchemaNotes) has %q", referencePage, entry.line, key.path, entry.from, jsonSchemaNotes[key.path].inherited)
 		}
+		if entry.unless != jsonSchemaNotes[key.path].requiredUnless {
+			t.Errorf("%s:%d: %s: documented as required unless %q is set, but the JSON Schema (jsonSchemaNotes) has %q", referencePage, entry.line, key.path, entry.unless, jsonSchemaNotes[key.path].requiredUnless)
+		}
 		switch {
 		case entry.required || entry.when != (condition{}):
 			checkRequired(t, key.path, entry)
+		case entry.unless != "":
+			checkRequiredUnless(t, key, entry, documented[entry.unless])
 		case entry.from != "":
 			checkInherited(t, key, entry, documented[entry.from])
 		default:
 			checkDefault(t, key.path, entry)
 		}
-		checkAllowed(t, key, entry)
+		checkAllowed(t, key, entry, documented)
 	}
 	// The page lists the keys in the order of the configuration types,
 	// which config print, the JSON Schema and the examples follow.
@@ -179,9 +203,12 @@ func collectSchemaKeys(t reflect.Type, prefix string, keys *[]schemaKey) {
 		}
 		path := childPath(prefix, yamlName(f))
 		*keys = append(*keys, schemaKey{path, f.Type})
-		if f.Type.Kind() == reflect.Slice {
+		switch f.Type.Kind() {
+		case reflect.Slice:
 			collectSchemaKeys(f.Type.Elem(), path+"[]", keys)
-		} else {
+		case reflect.Map:
+			collectSchemaKeys(f.Type.Elem(), path+".<name>", keys)
+		default:
 			collectSchemaKeys(f.Type, path, keys)
 		}
 	}
@@ -198,12 +225,18 @@ func typeName(t reflect.Type) string {
 	}
 	switch t.Kind() {
 	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Struct {
+		switch {
+		case t.Elem().Kind() == reflect.Struct:
 			return "list"
+		case t.Elem() == setValueType:
+			return "list of values"
 		}
 	case reflect.Map:
-		if t.Key().Kind() == reflect.String && t.Elem().Kind() == reflect.String {
+		switch {
+		case t.Key().Kind() == reflect.String && t.Elem().Kind() == reflect.String:
 			return "mapping of strings"
+		case t.Key().Kind() == reflect.String && t.Elem().Kind() == reflect.Struct:
+			return "mapping of mappings"
 		}
 	case reflect.String:
 		return "string"
@@ -312,8 +345,10 @@ func parseReferencePage(t *testing.T, page string) map[string]referenceEntry {
 			entry.when, entry.summary = condition{m[1], m[2]}, strings.TrimPrefix(body[1], "**Default:** ")
 		case inheritedRE.MatchString(body[1]):
 			entry.from, entry.summary = inheritedRE.FindStringSubmatch(body[1])[1], strings.TrimPrefix(body[1], "**Default:** ")
+		case unlessRE.MatchString(body[1]):
+			entry.unless, entry.summary = unlessRE.FindStringSubmatch(body[1])[1], strings.TrimPrefix(body[1], "**Default:** ")
 		default:
-			t.Errorf("%s:%d: %s: the line after **Type:** must be **Default:** followed by `<yaml literal>`, required, required when `<key>` is `<value>`, or inherited from `<key>`", referencePage, line, path)
+			t.Errorf("%s:%d: %s: the line after **Type:** must be **Default:** followed by `<yaml literal>`, required, required when `<key>` is `<value>`, required unless `<key>` is set, or inherited from `<key>`", referencePage, line, path)
 			continue
 		}
 		if len(body) == 3 {
@@ -365,9 +400,52 @@ func checkRequired(t *testing.T, path string, entry referenceEntry) {
 	}
 }
 
+// checkRequiredUnless checks a key that one other key makes optional: the
+// configuration loads without it when the other is present, and fails at
+// the key or at its block when both are missing.
+func checkRequiredUnless(t *testing.T, key schemaKey, entry, other referenceEntry) {
+	t.Helper()
+	at := fmt.Sprintf("%s:%d: %s", referencePage, entry.line, key.path)
+	if other.line == 0 {
+		t.Errorf("%s: required unless %s is set, which has no heading", at, entry.unless)
+		return
+	}
+	base := []byte(referenceBase)
+	// The other key, with a value of its type when the minimal block lacks
+	// it.
+	segments := strings.Split(entry.unless, ".")
+	if len(segments) < 3 || segments[len(segments)-2] != "<name>" {
+		t.Errorf("%s: the test checks required unless only for the keys of a mapping of names", at)
+		return
+	}
+	block, err := yamlValue(referenceItems[strings.Join(segments[:len(segments)-2], ".")])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mappingValue(block, segments[len(segments)-1]) == nil {
+		literal := map[string]string{"list of values": "[]", "string": "tessera-unless"}[other.typ]
+		value, err := yamlValue(literal)
+		if err != nil {
+			t.Errorf("%s: the test cannot set the %s %s", at, other.typ, entry.unless)
+			return
+		}
+		base = referenceVariant(t, base, entry.unless, value)
+	}
+	if _, err := Parse(referenceVariant(t, base, key.path, nil), nil); err != nil {
+		t.Errorf("%s: required unless %s is set, but omitting it with %s set fails: %v", at, entry.unless, entry.unless, err)
+	}
+	_, err = Parse(referenceVariant(t, referenceVariant(t, base, entry.unless, nil), key.path, nil), nil)
+	parent := key.path[:strings.LastIndexByte(key.path, '.')]
+	var invalid *Error
+	if !errors.As(err, &invalid) || listPath(invalid.Path) != key.path && listPath(invalid.Path) != parent {
+		t.Errorf("%s: required unless %s is set, but omitting both does not fail at %s or %s (error: %v)", at, entry.unless, key.path, parent, err)
+	}
+}
+
 // listPath writes the path of an error as the page writes it, with [] for
-// the index of an item.
+// the index of an item and <name> for the name of the reference block.
 func listPath(path string) string {
+	path = strings.ReplaceAll(path, "."+referenceName, ".<name>")
 	return itemIndexRE.ReplaceAllString(path, "[]")
 }
 
@@ -426,7 +504,7 @@ func loads(t *testing.T, base []byte, path, literal string) bool {
 
 // checkAllowed checks the **Allowed:** line of a key against Parse. Numbers
 // always have one: every integer and duration is constrained.
-func checkAllowed(t *testing.T, key schemaKey, entry referenceEntry) {
+func checkAllowed(t *testing.T, key schemaKey, entry referenceEntry, documented map[string]referenceEntry) {
 	t.Helper()
 	path, typ, base := key.path, typeName(key.typ), entry.base(t)
 	at := fmt.Sprintf("%s:%d: %s", referencePage, entry.line, path)
@@ -486,12 +564,43 @@ func checkAllowed(t *testing.T, key schemaKey, entry referenceEntry) {
 		} else if loads(t, base, path, minusOne) {
 			t.Errorf("%s: documented as zero or positive, but `%s` loads", at, minusOne)
 		}
+	case allowedLongerRE.MatchString(form):
+		other := allowedLongerRE.FindStringSubmatch(form)[1]
+		checkLonger(t, at, key, base, other, documented[other])
 	default:
 		if typ == "integer" || typ == "duration" {
 			t.Errorf("%s: a %s needs an **Allowed:** line that starts with positive, zero or positive, a range (`1` to `3`) or a list of values", at, typ)
 		}
 		if entry.allowed == "" && typ == "string" && !loads(t, base, path, zero) {
 			t.Errorf("%s: `%s` is rejected, so the key needs an **Allowed:** line", at, zero)
+		}
+	}
+}
+
+// checkLonger checks a duration documented as zero or longer than the key
+// other: zero loads and -1s does not; with other at its default, then at
+// twice its default, a value equal to other does not load, and one second
+// more does.
+func checkLonger(t *testing.T, at string, key schemaKey, base []byte, other string, entry referenceEntry) {
+	t.Helper()
+	def, err := time.ParseDuration(entry.literal)
+	if key.typ != durationType || err != nil || def <= 0 {
+		t.Errorf("%s: zero or longer than %s needs a duration, and a key with a positive default duration", at, other)
+		return
+	}
+	if !loads(t, base, key.path, "0s") || loads(t, base, key.path, "-1s") {
+		t.Errorf("%s: documented as zero or longer than %s, but `0s` is rejected or `-1s` loads", at, other)
+	}
+	for _, v := range []time.Duration{def, 2 * def} {
+		variant := base
+		if v != def {
+			variant = referenceVariant(t, base, other, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v.String()})
+		}
+		if loads(t, variant, key.path, v.String()) {
+			t.Errorf("%s: documented as longer than %s, but `%s` loads with %s at %s", at, other, v, other, v)
+		}
+		if longer := v + time.Second; !loads(t, variant, key.path, longer.String()) {
+			t.Errorf("%s: documented as longer than %s, but `%s` is rejected with %s at %s", at, other, longer, other, v)
 		}
 	}
 }
@@ -579,6 +688,27 @@ func referenceVariant(t *testing.T, base []byte, path string, value *yaml.Node) 
 	node := doc.Content[0]
 	for i, segment := range segments {
 		last := i == len(segments)-1
+		if segment == "<name>" && !last {
+			// The reference block, created as the minimal block.
+			k := -1
+			for j := 0; j < len(node.Content); j += 2 {
+				if node.Content[j].Value == referenceName {
+					k = j
+					break
+				}
+			}
+			if k < 0 {
+				item, err := yamlValue(referenceItems[strings.Join(segments[:i], ".")])
+				if err != nil {
+					t.Fatalf("%s: no block in referenceItems: %v", path, err)
+				}
+				item.Style = 0
+				node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: referenceName}, item)
+				k = len(node.Content) - 2
+			}
+			node = node.Content[k+1]
+			continue
+		}
 		if list, ok := strings.CutSuffix(segment, "[]"); ok && !last {
 			// The first item of the list, created as its minimal item.
 			k := -1
@@ -618,7 +748,7 @@ func referenceVariant(t *testing.T, base []byte, path string, value *yaml.Node) 
 			node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: segment}, value)
 		case k >= 0:
 			node = node.Content[k+1]
-		case value == nil:
+		case value == nil && segments[i+1] != "<name>":
 			return mustMarshal(t, &doc) // nothing to remove
 		default:
 			child := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
@@ -642,6 +772,10 @@ func mustMarshal(t *testing.T, doc *yaml.Node) []byte {
 func valueAt(c *Config, path string) reflect.Value {
 	v := reflect.ValueOf(c).Elem()
 	for segment := range strings.SplitSeq(path, ".") {
+		if segment == "<name>" {
+			v = v.MapIndex(reflect.ValueOf(referenceName))
+			continue
+		}
 		name, item := strings.CutSuffix(segment, "[]")
 		for i := range v.NumField() {
 			if f := v.Type().Field(i); f.IsExported() && yamlName(f) == name {

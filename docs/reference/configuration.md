@@ -35,7 +35,9 @@ The schema does not check the rules between two keys, nor values that contain `$
 | duration | A string of decimal numbers, each followed by a unit: `ns`, `us` (or `µs`), `ms`, `s`, `m` or `h`. Fractions (`1.5s`, `.5s`) and a leading sign are accepted, and units combine: `1h30m`. Write zero as `0s`. | `5`, `"0"`, `1d` |
 | expression | A string that holds an expression of the [expression language](./expressions.md). Write it in a literal block (`\|`), which YAML never reads otherwise, or in quotes, when YAML would read it as something else: when it starts with a character that YAML reserves (`!`, `&`, `*`, `\|`, `>`, `'`, `"`, `%`, `@`, a backtick, `#`, `,`, `[`, `]`, `{`, `}`, or `-`, `?` or `:` followed by a space), when it contains `: ` or ` #`, or when it is `true` or `false`. | `true` (a boolean), `!has(client.ip)` (a tag) |
 | list | A YAML sequence of mappings. | A mapping, a string |
+| list of values | A YAML sequence of strings; in an `asn` set, of strings and integers. | A mapping, a string |
 | mapping of strings | A YAML mapping from strings to strings. | A list, a value that is not a string |
+| mapping of mappings | A YAML mapping from names to mappings. | A list, a value that is not a mapping |
 
 No key accepts a negative duration.
 
@@ -57,7 +59,7 @@ log:
 
 ### Relative paths
 
-A relative path is relative to the directory of the configuration file, not to the working directory. The only path today is the socket in [`server.listen`](#server-listen).
+A relative path is relative to the directory of the configuration file, not to the working directory. The paths are the socket in [`server.listen`](#server-listen) and the files of the sets, [`sets.<name>.file`](#sets-name-file).
 
 ### Error messages
 
@@ -72,6 +74,7 @@ tessera: server.drain_delay (line 3, column 16): expected a duration with units,
 - A YAML syntax error reports the line where the parser stopped, which can be before the mistake, with column 1: `configuration (line 2, column 1): invalid YAML syntax`. Some syntax errors, such as invalid UTF-8, have no line: `configuration: invalid YAML syntax`.
 - An unknown key is reported by its path, unless it is not a lowercase name of letters, digits and underscores: then it is reported as `<unknown>`.
 - The path of an item of a list has its index, from 0: `policy.rules[2].name`. An error about a key of a mapping of strings, such as a header name, names the mapping and has the position of the key.
+- The path of a key of a set has the name of the set: `sets.partners.file`. An invalid set name is reported as `sets`, at the position of the name.
 - Messages never repeat a configured value. They name keys, and the variable of a failed substitution. The one exception is an error in an expression, which can name an identifier or a type of the expression, such as `undefined field 'hots'`, but never a literal of it: a syntax error has only its position (see [`policy.rules[].when`](#policy-rules-when)).
 
 ## `server`
@@ -269,6 +272,152 @@ The number of entries at the right end of `X-Forwarded-For` that proxies you tru
 With `trusted_hops: 1`, the header `192.0.2.66, 203.0.113.10, 198.51.100.5` gives the client address `203.0.113.10`.
 
 A header that is missing, or that has no more than `trusted_hops` entries, gives no client address, and so does an entry in that position that is not an address in a form that [`client_ip.from`](#client-ip-from) lists: tessera does not look for another entry. A request with several `X-Forwarded-For` headers has one list, since Envoy joins their values with commas.
+
+## `sets`
+
+**Type:** mapping of mappings\
+**Default:** `{}`
+
+The named sets that the conditions of the rules read with [`sets.<name>.contains(value)`](./expressions.md#sets): lists of networks, autonomous system numbers or strings, kept apart from the rules. Each key of `sets` is the name of a set, and its value declares the set: a type, and one source, the `values` written in this file or a `file`.
+
+```yaml [config.yaml]
+sets:
+  office:
+    type: cidr
+    values:
+      - 203.0.113.0/24
+      - 2001:db8:cafe::/48
+  partners:
+    type: string
+    file: partners.txt
+policy:
+  default_action: deny
+  rules:
+    - name: partners-from-the-office
+      action: allow
+      when: sets.partners.contains(request.host) && sets.office.contains(client.ip)
+```
+
+A name starts with a lowercase letter, followed by lowercase letters, digits and underscores, has at most 63 characters, and is not a reserved word of the expression language: `as`, `break`, `const`, `continue`, `else`, `false`, `for`, `function`, `if`, `import`, `in`, `let`, `loop`, `namespace`, `null`, `package`, `return`, `true`, `var`, `void`, `while`. A condition reads the set `partners` as `sets.partners`.
+
+tessera reads every set when `tessera serve` starts, before it opens a socket, and so do `tessera config validate` and `tessera eval`, but for the sets that [`--set`](./cli.md#sets) replaces. A file that does not exist or cannot be read, an invalid value and a ceiling exceeded are configuration errors, which name the key and its position and, for a file, the line of the file and the problem, never the content of the file or its path:
+
+```text
+tessera: sets.partners.file (line 9, column 11): line 12 of the file: the value has a control character
+```
+
+A set that no rule reads is read and checked all the same, and `tessera config validate` warns about it (see [`tessera config validate`](./cli.md#tessera-config-validate)). While it runs, `tessera serve` checks the file of each set every [`sets.<name>.refresh`](#sets-name-refresh), and replaces the copy of the set when the file has new valid content. [Use sets](../guide/sets.md) shows how to declare, use and update sets.
+
+| Key | Type | Default | Allowed |
+| --- | --- | --- | --- |
+| [`sets.<name>.type`](#sets-name-type) | string | required | `cidr`, `asn`, `string` |
+| [`sets.<name>.values`](#sets-name-values) | list of values | required unless `sets.<name>.file` is set | values of the type, each at most 4 KiB; not with `file` |
+| [`sets.<name>.file`](#sets-name-file) | string | required unless `sets.<name>.values` is set | nonempty; a path, not with `values` |
+| [`sets.<name>.refresh`](#sets-name-refresh) | duration | `10s` | positive; at least `1s`, only with `file` |
+| [`sets.<name>.max_staleness`](#sets-name-max-staleness) | duration | `0s` | zero or longer than `sets.<name>.refresh`; only with `file` |
+| [`sets.<name>.on_unavailable`](#sets-name-on-unavailable) | string | `fail` | `fail`, `match`, `no_match`; only with `file` |
+| [`sets.<name>.max_entries`](#sets-name-max-entries) | integer | `1000000` | positive |
+
+### `sets.<name>.type`
+
+**Type:** string\
+**Default:** required\
+**Allowed:** `cidr`, `asn`, `string`
+
+The type of the values of the set, which is also the type of the argument of `contains`:
+
+| Type | A value is | `contains` takes |
+| --- | --- | --- |
+| `cidr` | An IPv4 or IPv6 network, such as `203.0.113.0/24` or `2001:db8::/32`, or an address, such as `203.0.113.7`, which is the network of that one address (`/32` or `/128`). | An address, such as `client.ip`. |
+| `asn` | An autonomous system number from `1` to `4294967295`, with or without the prefix `AS` in any case: `64496`, `AS64496`, `as64496`. | An `int`. |
+| `string` | Any text, compared exactly, case included. | A `string`. |
+
+- **`cidr`.** A network with bits set after its prefix length, such as `192.0.2.1/24`, is an error: write its first address, `192.0.2.0/24`. An IPv4-mapped IPv6 address or network, such as `::ffff:192.0.2.0/120`, is the IPv4 network it maps, `192.0.2.0/24`. An IPv6 zone, such as `fe80::1%eth0`, is an error. IPv4 and IPv6 values mix in one set, and networks can overlap. An IPv4 address is never in an IPv6 network, `::/0` included.
+- **`asn`.** The number has no sign and no leading zeros: `+64496`, `064496` and `AS 64496` are errors. `0`, or `AS0`, is an error.
+- **`string`.** An empty value, invalid UTF-8 and a control character, a tab included, are errors.
+
+Spaces and tabs around a value are ignored, for every type.
+
+### `sets.<name>.values`
+
+**Type:** list of values\
+**Default:** required unless `sets.<name>.file` is set\
+**Allowed:** values of the type, each at most 4 KiB; not with `file`
+
+The values of the set, written in the configuration file, one item each, in the forms of [`sets.<name>.type`](#sets-name-type). An item is a YAML string, which can be quoted; in an `asn` set, it can be a YAML integer too, such as `64496`. `#` is part of a value here, not a comment. `values: []` declares an empty set.
+
+A set of values is always available: [`sets.<name>.refresh`](#sets-name-refresh), [`sets.<name>.max_staleness`](#sets-name-max-staleness) and [`sets.<name>.on_unavailable`](#sets-name-on-unavailable) are errors with `values`.
+
+### `sets.<name>.file`
+
+**Type:** string\
+**Default:** required unless `sets.<name>.values` is set\
+**Allowed:** nonempty; a path, not with `values`
+
+The path of a file that holds the values of the set, relative to the directory of the configuration file when it is not absolute. The file is a regular file, or a symbolic link to one, of at most 256 MiB, with one value per line, in the forms of [`sets.<name>.type`](#sets-name-type):
+
+- a UTF-8 byte order mark at the start of the file is ignored;
+- a blank line is ignored;
+- `#` starts a comment that runs to the end of the line, in a set of any type: a `string` value cannot hold `#`;
+- spaces and tabs around a value are ignored, and so is the carriage return of a line that ends with CR LF;
+- any other line is a value.
+
+```text [partners.txt]
+# The partners that call the API.
+api.partner-one.example.com
+api.partner-two.example.com   # since November
+```
+
+A line has at most 4 KiB, its comment included. An invalid value, a line longer than 4 KiB, a file larger than 256 MiB and more values than [`sets.<name>.max_entries`](#sets-name-max-entries) make the whole file invalid: tessera never uses part of a file.
+
+### `sets.<name>.refresh`
+
+**Type:** duration\
+**Default:** `10s`\
+**Allowed:** positive; at least `1s`, only with `file`
+
+How often tessera checks the file of the set, counted from the end of the previous check. tessera starts the checks once it is ready, and the first comes `refresh` later. A check reads the state of the file, following symbolic links. A file with the device, inode, size and modification time of the one that the copy in use was read from is unchanged, and is not read, once tessera trusts that state (see below). Any other file is read whole, as at startup:
+
+- valid content that differs from that of the copy in use replaces the copy, atomically: the decisions in progress finish with the copy they had;
+- content equal to that of the copy in use changes nothing, as when a Kubernetes ConfigMap changes another of its files;
+- invalid content, a ceiling exceeded or more entries than [`sets.<name>.max_entries`](#sets-name-max-entries) reject the whole file, and the copy in use stays; tessera does not read that version of the file again until it changes;
+- a file that does not exist, cannot be opened or read, or is not a regular file fails the check, and the copy in use stays.
+
+Some file systems record the modification time to the second, or to two seconds: a file rewritten in place with the same size, within that time, keeps the same state. So tessera trusts the state of a version of the file only once its modification time is at least 2 seconds older than the moment tessera started to read it: until then, each check reads the file whole again, and a content equal to that of the copy in use changes nothing. A modification time in the future, as a clock ahead on a network file system gives, keeps the file read at each check until the clock of tessera passes it by 2 seconds.
+
+A check that finds the file unchanged, or that replaces the copy, is successful. [`tessera_set_refreshes_total`](./metrics.md#tessera-set-refreshes-total) counts every check by its result, and the events [`set_loaded`](./logs.md#set-loaded) and [`set_load_failed`](./logs.md#set-load-failed) report a new copy and a new failure. A file written in place can be read while it is half written: see [Update the file of a set](../guide/sets.md#update-the-file-of-a-set).
+
+### `sets.<name>.max_staleness`
+
+**Type:** duration\
+**Default:** `0s`\
+**Allowed:** zero or longer than `sets.<name>.refresh`; only with `file`
+
+How long the copy of the set in use stays valid since the last successful check of the file (see [`sets.<name>.refresh`](#sets-name-refresh)): beyond that age, the set is unavailable, and `contains` answers what [`sets.<name>.on_unavailable`](#sets-name-on-unavailable) says. A check that finds the file unchanged is successful, so the age grows only while the file is missing, unreadable or invalid. Until the first check, the age counts from when tessera starts the checks, once it is ready, not from when it read the file at startup. `0s` sets no limit: the last valid copy stays in use until a new one replaces it.
+
+The set becomes unavailable as soon as its age passes the limit, between two checks too, and available again at the next successful check. [`tessera_set_available`](./metrics.md#tessera-set-available) and the events [`set_unavailable`](./logs.md#set-unavailable) and [`set_available`](./logs.md#set-available) report each change. A limit must be longer than [`sets.<name>.refresh`](#sets-name-refresh): a shorter one would make the set unavailable before each check, so it is a configuration error.
+
+### `sets.<name>.on_unavailable`
+
+**Type:** string\
+**Default:** `fail`\
+**Allowed:** `fail`, `match`, `no_match`; only with `file`
+
+What `contains` answers when the set is unavailable, because its last successful check is older than [`sets.<name>.max_staleness`](#sets-name-max-staleness), whatever its argument:
+
+| Value | `contains` |
+| --- | --- |
+| `fail` | Fails, and the condition is indeterminate with the cause `set_unavailable`, unless `&&` or `\|\|` absorbs the failure: a `deny` rule that depends on the set denies, an `allow` rule does not match. See [Indeterminate conditions](./expressions.md#indeterminate-conditions). |
+| `match` | Answers `true`. |
+| `no_match` | Answers `false`. |
+
+### `sets.<name>.max_entries`
+
+**Type:** integer\
+**Default:** `1000000`\
+**Allowed:** positive
+
+The largest number of entries of the set. An entry is a value of the source: an item of `values`, or a line of `file` that holds a value. A value written twice counts twice, so the limit bounds both the memory of the set and the work of reading it. More entries make the whole source invalid, at the first value beyond the limit.
 
 ## `policy`
 

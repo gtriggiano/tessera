@@ -7,11 +7,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/gtriggiano/tessera/internal/engine"
 	"github.com/gtriggiano/tessera/internal/expr"
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 var testBuild = BuildInfo{Version: "1.2.3", Revision: "abc123", GoVersion: "go1.test"}
@@ -24,6 +26,13 @@ var testPolicy = engine.Policy{DefaultAction: engine.Deny, Rules: []engine.Rule{
 	{Name: "watch", Action: engine.Deny, Audit: true},
 	{Name: "office", Action: engine.Allow},
 }}
+
+// testSets has a set of each type, read from a file or of values.
+var testSets = []sets.Declaration{
+	{Name: "blocked", Type: sets.CIDR, Source: sets.SourceFile, OnUnavailable: sets.Fail},
+	{Name: "networks", Type: sets.ASN, Source: sets.SourceValues, OnUnavailable: sets.Fail},
+	{Name: "partners", Type: sets.String, Source: sets.SourceFile, OnUnavailable: sets.NoMatch},
+}
 
 func gather(t *testing.T, m *Metrics) map[string]*dto.MetricFamily {
 	t.Helper()
@@ -47,7 +56,7 @@ func labels(m *dto.Metric) map[string]string {
 }
 
 func TestInfoGauges(t *testing.T) {
-	families := gather(t, New(testBuild, testHash, testPolicy))
+	families := gather(t, New(testBuild, testHash, testPolicy, testSets))
 	for _, tc := range []struct {
 		name   string
 		labels map[string]string
@@ -82,7 +91,7 @@ func TestInfoGauges(t *testing.T) {
 }
 
 func TestConnectionRefused(t *testing.T) {
-	m := New(testBuild, testHash, testPolicy)
+	m := New(testBuild, testHash, testPolicy, testSets)
 	value := func() float64 {
 		f := gather(t, m)["tessera_grpc_connections_refused_total"]
 		if f.GetType() != dto.MetricType_COUNTER || len(f.GetMetric()) != 1 || len(f.GetMetric()[0].GetLabel()) != 0 {
@@ -102,7 +111,7 @@ func TestConnectionRefused(t *testing.T) {
 
 func TestHandlerServesTheTextFormat(t *testing.T) {
 	rec := httptest.NewRecorder()
-	New(testBuild, testHash, testPolicy).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	New(testBuild, testHash, testPolicy, testSets).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
 		t.Fatalf("status %d, content type %q", rec.Code, rec.Header().Get("Content-Type"))
@@ -137,7 +146,7 @@ func TestDecisionSeries(t *testing.T) {
 	for _, audit := range []bool{false, true} {
 		p := testPolicy
 		p.Audit = audit
-		m := New(testBuild, testHash, p)
+		m := New(testBuild, testHash, p, testSets)
 		before := series(t, m)
 		enforced := "true"
 		if audit {
@@ -151,6 +160,8 @@ func TestDecisionSeries(t *testing.T) {
 			`tessera_audit_matches_total{rule="watch"}`,
 			`tessera_rule_evaluation_errors_total{cause="client_ip_missing",rule="office"}`,
 			`tessera_rule_evaluation_errors_total{cause="panic",rule="watch"}`,
+			`tessera_rule_evaluation_errors_total{cause="set_unavailable",rule="office"}`,
+			`tessera_rule_evaluation_errors_total{cause="set_unavailable",rule="watch"}`,
 			`tessera_decision_duration_seconds_bucket{action="allow",le="2.5e-05"}`,
 			`tessera_decision_duration_seconds_count{action="deny"}`,
 			`tessera_decision_logs_dropped_total`,
@@ -217,3 +228,108 @@ func TestDecisionSeries(t *testing.T) {
 }
 
 func metricLabels(m *dto.Metric) map[string]string { return labels(m) }
+
+// value returns the value of the series of name with labels: a counter, a
+// gauge, or the count of a histogram.
+func value(t *testing.T, m *Metrics, name string, labels map[string]string) float64 {
+	t.Helper()
+	for _, metric := range gather(t, m)[name].GetMetric() {
+		if got := metricLabels(metric); maps.Equal(got, labels) {
+			switch {
+			case metric.GetCounter() != nil:
+				return metric.GetCounter().GetValue()
+			case metric.GetGauge() != nil:
+				return metric.GetGauge().GetValue()
+			case metric.GetHistogram() != nil:
+				return float64(metric.GetHistogram().GetSampleCount())
+			}
+		}
+	}
+	t.Fatalf("%s %v: no series", name, labels)
+	return 0
+}
+
+// Every declared set has its series of entries and availability from the
+// start, labelled with its source; a set that refreshes also has its series
+// of refreshes, with every result of tessera_set_refreshes_total, and a set
+// of values has none. Recording a check adds no series.
+func TestSetSeries(t *testing.T) {
+	m := New(testBuild, testHash, testPolicy, testSets)
+	before := series(t, m)
+	for _, d := range testSets {
+		labels := `set="` + d.Name + `",source="` + string(d.Source) + `",type="` + string(d.Type) + `"`
+		for _, line := range []string{
+			`tessera_set_entries{` + labels + `}`,
+			`tessera_set_available{` + labels + `}`,
+		} {
+			if !slices.Contains(before, line) {
+				t.Errorf("no series %s at startup", line)
+			}
+		}
+		refreshes := []string{
+			`tessera_set_last_refresh_success_timestamp_seconds{` + labels + `}`,
+			`tessera_set_refreshes_total{result="updated",` + labels + `}`,
+			`tessera_set_refreshes_total{result="unchanged",` + labels + `}`,
+			`tessera_set_refreshes_total{result="rejected",` + labels + `}`,
+			`tessera_set_refreshes_total{result="error",` + labels + `}`,
+			`tessera_set_refresh_duration_seconds_bucket{` + labels + `,le="0.0001"}`,
+			`tessera_set_refresh_duration_seconds_count{` + labels + `}`,
+		}
+		for _, line := range refreshes {
+			if got := slices.Contains(before, line); got != d.Source.Refreshes() {
+				t.Errorf("series %s at startup: %t, want %t", line, got, d.Source.Refreshes())
+			}
+		}
+	}
+
+	at := time.Date(2026, 11, 22, 10, 15, 0, 500_000_000, time.UTC)
+	m.SetRefreshed("blocked", sets.RefreshUpdated, 2*time.Millisecond, at)
+	m.SetEntries("blocked", 3)
+	m.SetAvailable("blocked", true)
+	m.SetRefreshed("blocked", sets.RefreshUnchanged, 50*time.Microsecond, at.Add(10*time.Second))
+	// A failed check does not move the time of the last success.
+	m.SetRefreshed("blocked", sets.RefreshRejected, time.Millisecond, at.Add(20*time.Second))
+	m.SetRefreshed("blocked", sets.RefreshError, time.Millisecond, at.Add(30*time.Second))
+	m.SetAvailable("blocked", false)
+	// A set of values has no refresh to record.
+	m.SetRefreshed("networks", sets.RefreshUpdated, time.Millisecond, at)
+	m.SetEntries("networks", 2)
+	m.SetAvailable("networks", true)
+	if after := series(t, m); !slices.Equal(before, after) {
+		t.Errorf("recording changed the series:\n%s\nwant:\n%s", strings.Join(after, "\n"), strings.Join(before, "\n"))
+	}
+	blocked := map[string]string{"set": "blocked", "type": "cidr", "source": "file"}
+	result := func(r string) map[string]string {
+		return map[string]string{"set": "blocked", "type": "cidr", "source": "file", "result": r}
+	}
+	networks := map[string]string{"set": "networks", "type": "asn", "source": "values"}
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   float64
+	}{
+		{"tessera_set_entries", blocked, 3},
+		{"tessera_set_available", blocked, 0},
+		{"tessera_set_last_refresh_success_timestamp_seconds", blocked, float64(at.Add(10*time.Second).UnixNano()) / 1e9},
+		{"tessera_set_refreshes_total", result("updated"), 1},
+		{"tessera_set_refreshes_total", result("unchanged"), 1},
+		{"tessera_set_refreshes_total", result("rejected"), 1},
+		{"tessera_set_refreshes_total", result("error"), 1},
+		{"tessera_set_refresh_duration_seconds", blocked, 4},
+		{"tessera_set_refreshes_total", map[string]string{"set": "partners", "type": "string", "source": "file", "result": "updated"}, 0},
+		{"tessera_set_entries", networks, 2},
+		{"tessera_set_available", networks, 1},
+	} {
+		if got := value(t, m, tc.name, tc.labels); got != tc.want {
+			t.Errorf("%s %v = %v, want %v", tc.name, tc.labels, got, tc.want)
+		}
+	}
+	// The unchanged check, of 50 µs, is in the first bucket.
+	for _, metric := range gather(t, m)["tessera_set_refresh_duration_seconds"].GetMetric() {
+		if metricLabels(metric)["set"] == "blocked" {
+			if b := metric.GetHistogram().GetBucket()[0]; b.GetUpperBound() != 0.0001 || b.GetCumulativeCount() != 1 {
+				t.Errorf("first bucket %v", b)
+			}
+		}
+	}
+}

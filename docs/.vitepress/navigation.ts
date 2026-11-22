@@ -22,6 +22,7 @@ export const sidebar: DefaultTheme.SidebarMulti = {
       items: [
         { text: 'Write rules', link: '/guide/write-rules' },
         { text: 'Client address', link: '/guide/client-address' },
+        { text: 'Use sets', link: '/guide/sets' },
       ],
     },
   ],

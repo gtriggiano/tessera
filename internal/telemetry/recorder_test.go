@@ -312,6 +312,8 @@ func TestEvaluationErrorReports(t *testing.T) {
 		t.Fatalf("a second report within the interval:\n%s", dest)
 	}
 	waitFor(t, dest, "rule=office cause=client_ip_missing count=4")
+	r.EvaluationError("admin", expr.CauseSetUnavailable)
+	waitFor(t, dest, "rule=admin cause=set_unavailable count=1")
 	// A rule that the configuration does not have is reported without a name.
 	r.EvaluationError("unknown", expr.CausePanic)
 	_ = r.Close(context.Background())
@@ -319,6 +321,7 @@ func TestEvaluationErrorReports(t *testing.T) {
 		"level=warn msg=evaluation_error rule=office cause=client_ip_missing count=1",
 		"level=warn msg=evaluation_error rule=admin cause=expression count=1",
 		"level=warn msg=evaluation_error rule=office cause=client_ip_missing count=4",
+		"level=warn msg=evaluation_error rule=admin cause=set_unavailable count=1",
 		`level=warn msg=evaluation_error rule="" cause=panic count=1`,
 	}
 	if got := dest.lines(); strings.Join(got, "\n") != strings.Join(want, "\n") {

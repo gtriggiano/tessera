@@ -19,11 +19,14 @@ func serveCommand(opts Options) *cobra.Command {
 		Long: "Answer Envoy's external authorization requests on server.listen, and the health\n" +
 			"checks and metrics on admin.listen. The configuration file is selected with\n" +
 			"--config or, when the flag is absent, with the TESSERA_CONFIG environment\n" +
-			"variable. Log events go to standard output.\n\n" +
+			"variable. Every set is loaded, its file read, before a socket opens; then the\n" +
+			"file of each set is checked every sets.<name>.refresh. Log events go to\n" +
+			"standard output.\n\n" +
 			"SIGINT or SIGTERM shuts down gracefully, within server.drain_delay and\n" +
 			"server.shutdown_timeout; a second signal closes every connection at once.\n\n" +
 			"Exit status: 0 after a graceful shutdown; 1 when a listener cannot open or\n" +
-			"fails, or when the shutdown is forced; 2 for usage and configuration errors.",
+			"fails, or when the shutdown is forced; 2 for usage and configuration errors,\n" +
+			"an invalid set included.",
 		Args: noArgs,
 		// serve receives every signal itself, so that a second one can force
 		// the shutdown.
@@ -35,6 +38,11 @@ func serveCommand(opts Options) *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			selected, cfg, err := loadConfig(cmd, opts.LookupEnv, path)
+			if err != nil {
+				return err
+			}
+			// An invalid set stops the startup as a configuration error.
+			loaded, err := app.LoadSets(cfg, nil)
 			if err != nil {
 				return err
 			}
@@ -51,6 +59,7 @@ func serveCommand(opts Options) *cobra.Command {
 				ConfigPath: selected,
 				ConfigHash: hex.EncodeToString(hash[:]),
 				Signals:    opts.Signals,
+				Sets:       loaded,
 			})
 			if err != nil {
 				return loggedError{err}

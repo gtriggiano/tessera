@@ -45,8 +45,10 @@ Each package under `internal/` has one role.
 | `internal/app/` | `serve`: builds the components from a valid configuration, opens the listeners, and shuts down on a signal. |
 | `internal/extauthz/` | The adapter between Envoy and tessera: the gRPC server of the external authorization and health services, from a `CheckRequest` to a request and from a decision to a `CheckResponse`. The only package that imports Envoy's types. |
 | `internal/request/` | The request that tessera decides, independent of Envoy: its normalization, and its client address, read from the source that `client_ip` declares. |
-| `internal/expr/` | The expression environment of the conditions: the CEL types, the `request` and `client` attributes, the functions on addresses, the limits, compile errors with positions and the causes of indeterminate conditions. |
-| `internal/engine/` | Decides a request with the ordered rules of the policy: indeterminate conditions, audit mode, the default action and the response of a denial. Depends on `internal/expr` and `internal/request` only. |
+| `internal/expr/` | The expression environment of the conditions: the CEL types, the `request`, `client` and `sets` attributes, the functions on addresses and sets, the limits, compile errors with positions and the causes of indeterminate conditions. |
+| `internal/engine/` | Decides a request with the ordered rules of the policy, on one snapshot of the sets: indeterminate conditions, audit mode, the default action and the response of a denial. Depends on `internal/expr`, `internal/sets` and `internal/request` only. |
+| `internal/sets/` | The sets that conditions read: their types (`cidr`, `asn`, `string`), the strict parsers of a value and of a file, with their ceilings, the immutable copies, and the store from which each decision takes one snapshot of every set, with its availability. |
+| `internal/source/` | Reads the content of a set from a file, through the open descriptor, with the identity of the file it read, and runs the refreshers that check the file of each set, replace its copy in the store and mark it unavailable when it is stale. |
 | `internal/admin/` | The admin listener: `/livez`, `/readyz` and `/metrics`. |
 | `internal/metrics/` | Prometheus metrics on a private registry; the test that compares the metrics reference with the registry. |
 | `internal/telemetry/` | Log events, in logfmt or JSON: the `decision` event and its bounded queue, and the rate-limited reports of dropped events, indeterminate conditions and recovered panics. |
@@ -56,9 +58,9 @@ Each package under `internal/` has one role.
 
 ## Design rules
 
-These hold across the code base. A change that weakens one needs the maintainer's agreement first: open an issue before the pull request. Rule 1 is the direction of the design, not yet final: follow it, and ask in an issue before code depends on a detail it does not settle.
+These hold across the code base. A change that weakens one needs the maintainer's agreement first: open an issue before the pull request.
 
-1. **A decision does no I/O** *(direction)*. The request path reads memory only. Networks, disks and databases are touched in the background.
+1. **A decision does no I/O**. The request path reads memory only. Networks, disks and databases are touched in the background.
 2. **Fail closed**. A condition that cannot be evaluated counts against allowing: a `deny` rule denies, an `allow` rule does not match. Missing data never turns a denial into an allow, unless the configuration declares otherwise for that data.
 3. **Configuration is immutable; data refreshes.** Everything in the file is built and validated before any socket opens. Sets, databases and certificates are replaced atomically.
 4. **Every resource has a configured ceiling.** tessera refuses excess work instead of queueing it.
@@ -73,10 +75,10 @@ These hold across the code base. A change that weakens one needs the maintainer'
 | --- | --- |
 | `make build` | Builds `bin/tessera`. |
 | `make check` | Checks Go formatting and module tidiness, runs `go vet` (on the end-to-end test too), runs the tests with the race detector, and builds the binary. |
-| `make test-e2e` | Builds a Linux binary and an image of tessera from the working tree with the `Dockerfile`, and runs it in Docker with Envoy and a test upstream: a request through Envoy is denied with 403 or reaches the upstream, as the policy decides, and tessera stops with status 0 on a signal; a policy with rules on hosts, paths and networks lets the allowed requests reach the upstream, sends the configured responses of the denials, names the rule in every `decision` event, keeps the client address when the client writes `X-Forwarded-For`, and lets every request through in audit mode. Needs Docker; not part of `make check` or `make ci`. |
+| `make test-e2e` | Builds a Linux binary and an image of tessera from the working tree with the `Dockerfile`, and runs it in Docker with Envoy and a test upstream: a request through Envoy is denied with 403 or reaches the upstream, as the policy decides, and tessera stops with status 0 on a signal; a policy with rules on hosts, paths and networks lets the allowed requests reach the upstream, sends the configured responses of the denials, names the rule in every `decision` event, keeps the client address when the client writes `X-Forwarded-For`, and lets every request through in audit mode; a file renamed over the file of a set, in a mounted directory, changes the decisions without a restart, and an invalid one changes nothing and is counted as `rejected`. Needs Docker; not part of `make check` or `make ci`. |
 | `make fmt` | Formats the Go sources. |
 | `make fuzz` | Fuzzes each fuzz target for 10 seconds; set `FUZZ_TIME`, for example `make fuzz FUZZ_TIME=30s`. Each fuzz target has its own line in the Makefile. |
-| `make bench` | Runs the benchmarks of one decision over ten typical rules, decided by the last rule and by an early one, for 2 seconds each (`BENCH_TIME`): time, memory and allocations per decision, and the 50th, 99th and 99.9th percentiles of the time of each decision. Not part of `make check` or `make ci`: compare its results before and after a change to the engine or the expressions, on the same machine. |
+| `make bench` | Runs the benchmarks for 2 seconds each (`BENCH_TIME`), one package at a time: one decision over ten typical rules, decided by the last rule and by an early one, and over the same rules after a rule on a `cidr` set of 100,000 and of 1,000,000 networks, with the time, memory and allocations per decision and the 50th, 99th and 99.9th percentiles of the time of each decision; the lookups of matching and missing IPv4 and IPv6 addresses in those sets; the reading of sets of one million entries of each type, networks of several shapes among them, with the time, the heap that one copy holds, and the peak of the heap while two copies coexist, as during a refresh; and the reading of a file of one million networks. The data is generated in `240.0.0.0/4` and `2001:db8::/32`. Not part of `make check` or `make ci`: compare its results before and after a change to the engine, the expressions or the sets, on the same machine. |
 | `make vuln` | Scans the Go code with `govulncheck`, at the version pinned in the Makefile. |
 | `make workflows-check` | Lints `.github/workflows/*.yml` with `actionlint`, at the version pinned in the Makefile, without ShellCheck. |
 | `make workflows-audit` | Audits the workflows and the Dependabot configuration with `zizmor`, at the version pinned in the Makefile, without its online audits. Needs `uvx`. |
@@ -109,7 +111,7 @@ export npm_config_cache="$PWD/.cache/npm"
 - Fuzz seed cases run with the ordinary tests; `make fuzz` runs the bounded fuzzing.
 - Some tests read the documentation: see [Pages guarded by tests](#pages-guarded-by-tests).
 - The default suite tests the gRPC and admin listeners with clients in the same process, on loopback. The end-to-end test, `make test-e2e`, runs the image with a real Envoy in Docker, and is a job of its own in CI.
-- Never put production credentials, `.env` files or real hostnames and addresses in fixtures. Use `example.com` hostnames, the documentation IP ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 and 2001:db8::/32) and the reserved AS numbers 64496 to 64511.
+- Never put production credentials, `.env` files or real hostnames and addresses in fixtures. Use `example.com` hostnames, the documentation IP ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 and 2001:db8::/32) and the reserved AS numbers 64496 to 64511. A benchmark that needs more IPv4 networks than the documentation ranges hold generates them in 240.0.0.0/4, which is reserved for future use.
 
 ## Documentation
 

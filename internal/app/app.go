@@ -4,14 +4,29 @@
 //
 // # Startup
 //
-// Run builds the engine, logs starting, then builds the metrics, the gRPC
-// server and the admin server before it opens any socket. It opens the gRPC
-// listener, then the admin listener, resolving their host names within
-// listenTimeout; if one cannot open, the other is closed, startup_failed is
-// logged and Run fails. A signal received while a listener opens cancels it.
-// Once both are open, Run logs listening for each, makes both report ready
-// (/readyz 200, gRPC health SERVING), logs ready, and starts answering. A
-// signal received before then starts the shutdown at once.
+// The sets are loaded before Run, by LoadSets: an invalid one is a
+// configuration error. Run builds the engine on them and the metrics, logs
+// starting, a config_warning for each warning of the configuration and a
+// set_loaded for each set, then builds the gRPC server and the admin server
+// before it opens any socket. It opens the gRPC listener, then the admin
+// listener, resolving their host names within listenTimeout; if one cannot
+// open, the other is closed, startup_failed is logged and Run fails. A signal
+// received while a listener opens cancels it. Once both are open, Run logs
+// listening for each, makes both report ready (/readyz 200, gRPC health
+// SERVING), logs ready, starts the refreshers of the sets read from files,
+// and starts answering. A signal received before then starts the shutdown at
+// once.
+//
+// # Sets
+//
+// Each set read from a file has a refresher, which checks the file every
+// sets.<name>.refresh and replaces the copy of the set when the file has a
+// new valid content, and marks the set unavailable while its last successful
+// check, or the start of the checks before the first, is older than
+// sets.<name>.max_staleness. The refreshers record what they do in the
+// tessera_set_* metrics and in the set_loaded, set_load_failed,
+// set_unavailable and set_available events, from their own goroutines: a
+// decision only reads the store of the sets.
 //
 // # Shutdown
 //
@@ -23,15 +38,18 @@
 //  3. The gRPC server stops gracefully: it closes its listener, asks every
 //     client to close its connection and waits for the calls in progress,
 //     until server.shutdown_timeout has passed since the end of step 2.
-//  4. The admin server stops, within the same deadline.
-//  5. The decision events still queued are written, within the same
+//  4. The refreshers of the sets stop, within the same deadline: a check in
+//     progress is cut short, and records nothing.
+//  5. The admin server stops, within the same deadline.
+//  6. The decision events still queued are written, within the same
 //     deadline.
-//  6. A listener that failed during the shutdown is logged as
+//  7. A listener that failed during the shutdown is logged as
 //     listener_failed, then shutdown_complete is logged.
 //
-// A second signal, at any step, or the deadline of steps 3 to 5, closes
-// every remaining connection at once, cancelling the calls in progress, and
-// drops the decision events still queued: shutdown_complete then reports
+// A second signal, at any step, or the deadline of steps 3 to 6, closes
+// every remaining connection at once, cancelling the calls in progress,
+// stops the refreshers without waiting for a check in progress, and drops
+// the decision events still queued: shutdown_complete then reports
 // outcome=forced, and stays the last event.
 //
 // # Decisions
@@ -48,7 +66,8 @@
 // call finished. It returns an error when a listener could not open or
 // failed, and after a forced shutdown. It logs every such error before
 // returning it. It also fails, before it builds anything else, when the
-// policy does not compile, which a valid configuration rules out.
+// policy does not compile, which a valid configuration rules out, and when
+// Options.Sets is nil and the sets cannot be loaded.
 package app
 
 import (
@@ -71,6 +90,8 @@ import (
 	"github.com/gtriggiano/tessera/internal/extauthz"
 	"github.com/gtriggiano/tessera/internal/metrics"
 	"github.com/gtriggiano/tessera/internal/request"
+	"github.com/gtriggiano/tessera/internal/sets"
+	"github.com/gtriggiano/tessera/internal/source"
 	"github.com/gtriggiano/tessera/internal/telemetry"
 )
 
@@ -101,6 +122,9 @@ type Options struct {
 	// shutdown, and one received during the shutdown forces it. Nil delivers
 	// none.
 	Signals <-chan os.Signal
+	// Sets are the sets of the configuration, as LoadSets loaded them. Nil
+	// makes Run load them.
+	Sets *Sets
 	// Listen opens a listener: the gRPC listener, then the admin listener.
 	// ctx ends when a signal arrives or when the opening takes too long. Nil
 	// uses net.ListenConfig.
@@ -109,12 +133,15 @@ type Options struct {
 	// The hooks of the tests. decider replaces the engine; afterDrain runs at
 	// the end of server.drain_delay, before the gRPC server stops; flushing
 	// runs before the queued decision events are written; served runs when
-	// the server of a listener returns; listenTimeout replaces the constant.
+	// the server of a listener returns; listenTimeout replaces the constant;
+	// setTime changes the refresh and the max_staleness of every set, so that
+	// a test can use less than the minimum of the configuration.
 	decider       extauthz.Decider
 	afterDrain    func()
 	flushing      func()
 	served        func(listener string, err error)
 	listenTimeout time.Duration
+	setTime       func(time.Duration) time.Duration
 }
 
 // Run serves cfg, a loaded and valid configuration, until a shutdown. See
@@ -128,8 +155,16 @@ func Run(cfg *config.Config, opts Options) error {
 	// destination.
 	shared := telemetry.NewShared(logs)
 	logs = shared
+	loaded := opts.Sets
+	if loaded == nil {
+		var err error
+		if loaded, err = LoadSets(cfg, nil); err != nil {
+			return err
+		}
+	}
 	policy := EnginePolicy(cfg.Policy)
-	m := metrics.New(opts.Build, opts.ConfigHash, policy)
+	declared := loaded.Store.Declarations()
+	m := metrics.New(opts.Build, opts.ConfigHash, policy, declared)
 	rules := make([]string, len(policy.Rules))
 	for i, r := range policy.Rules {
 		rules[i] = r.Name
@@ -137,7 +172,7 @@ func Run(cfg *config.Config, opts Options) error {
 	recorder := telemetry.NewRecorder(shared, telemetry.RecorderOptions{Log: cfg.Log, Rules: rules, Dropped: m.DecisionLogDropped})
 	var decider extauthz.Decider = opts.decider
 	if decider == nil {
-		e, err := engine.New(policy, engine.Options{OnPanic: recorder.Panic})
+		e, err := engine.New(policy, engine.Options{OnPanic: recorder.Panic, Sets: loaded.Store})
 		if err != nil {
 			_ = recorder.Close(context.Background())
 			return err
@@ -147,6 +182,21 @@ func Run(cfg *config.Config, opts Options) error {
 	decider = observed{decider: decider, metrics: m, recorder: recorder}
 	logger := telemetry.NewLogger(logs, cfg.Log)
 	logger.Info("starting", "version", opts.Build.Version, "revision", opts.Build.Revision, "config_path", opts.ConfigPath)
+	for _, w := range cfg.Warnings() {
+		logger.Warn("config_warning", "key", w.Path, "warning", w.Problem)
+	}
+	// The load at startup of each set that refreshes is its first refresh;
+	// SetRefreshed records nothing for the others.
+	reports := newSetReports(m, logger, declared)
+	snapshot := loaded.Store.Snapshot()
+	for i, d := range declared {
+		e, load := snapshot.Entry(i), loaded.Loads[d.Name]
+		m.SetRefreshed(d.Name, source.Updated, load.Duration, load.At)
+		m.SetAvailable(d.Name, e.Available)
+		if e.Set != nil {
+			reports.Loaded(d.Name, e.Set.Entries(), load.Duration)
+		}
+	}
 
 	grpcServer := extauthz.NewServer(decider, extauthz.Options{
 		MaxConnections:       cfg.Server.MaxConnections,
@@ -173,6 +223,7 @@ func Run(cfg *config.Config, opts Options) error {
 	adminServer.SetReady()
 	grpcServer.SetServing(true)
 	logger.Info("ready")
+	refreshers := source.Start(fileSets(cfg, loaded, opts.setTime), loaded.Store, reports)
 
 	var serving sync.WaitGroup
 	failed := make(chan string, 2)
@@ -208,7 +259,7 @@ func Run(cfg *config.Config, opts Options) error {
 			logger.Info("shutdown_started", "reason", "listener_failed")
 		}
 	}
-	forcedBy := shutdown(cfg.Server, opts, logger, grpcServer, adminServer, recorder)
+	forcedBy := shutdown(cfg.Server, opts, logger, grpcServer, refreshers, adminServer, recorder)
 	serving.Wait()
 	for len(failed) > 0 {
 		listenerFailed(<-failed)
@@ -285,11 +336,12 @@ func open(cfg *config.Config, opts Options, logger *slog.Logger) (grpcListener, 
 	return grpcListener, adminListener, false, nil
 }
 
-// shutdown runs steps 1 to 5 of the shutdown, and returns what forced it:
-// "signal", "timeout", or "" when every call and request finished and every
-// queued decision event was written. A forced shutdown discards the decision
-// events still queued, so that shutdown_complete is the last event.
-func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *extauthz.Server, adminServer *admin.Server, recorder *telemetry.Recorder) string {
+// shutdown runs steps 1 to 6 of the shutdown, and returns what forced it:
+// "signal", "timeout", or "" when every call and request finished, every
+// refresher stopped and every queued decision event was written. A forced
+// shutdown discards the decision events still queued, so that
+// shutdown_complete is the last event.
+func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *extauthz.Server, refreshers *source.Refreshers, adminServer *admin.Server, recorder *telemetry.Recorder) string {
 	expired, cancelExpired := context.WithCancel(context.Background())
 	cancelExpired()
 	adminServer.SetNotReady(admin.ReasonShuttingDown)
@@ -321,6 +373,7 @@ func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *
 	case <-drain.C:
 	case <-force.Done():
 		grpcServer.Stop()
+		_ = refreshers.Stop(expired)
 		_ = adminServer.Close()
 		_ = recorder.Close(expired)
 		return forcedBy()
@@ -350,6 +403,12 @@ func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *
 		}
 	}
 	if forced {
+		_ = refreshers.Stop(expired)
+		_ = adminServer.Close()
+		_ = recorder.Close(expired)
+		return forcedBy()
+	}
+	if err := refreshers.Stop(ctx); err != nil {
 		_ = adminServer.Close()
 		_ = recorder.Close(expired)
 		return forcedBy()
@@ -411,10 +470,150 @@ func (o observed) Decide(r *request.Request) engine.Decision {
 	return d
 }
 
-// NewEngine builds the engine of a valid policy. onPanic, when set, receives
-// the panics recovered while a condition is evaluated.
-func NewEngine(p config.Policy, onPanic func(*expr.Panic)) (*engine.Engine, error) {
-	return engine.New(EnginePolicy(p), engine.Options{OnPanic: onPanic})
+// NewEngine builds the engine of a valid policy, whose conditions read the
+// sets of store. onPanic, when set, receives the panics recovered while a
+// condition is evaluated.
+func NewEngine(p config.Policy, store *sets.Store, onPanic func(*expr.Panic)) (*engine.Engine, error) {
+	return engine.New(EnginePolicy(p), engine.Options{OnPanic: onPanic, Sets: store})
+}
+
+// Sets is the first copy of every set of a configuration.
+type Sets struct {
+	// Store holds the copies, every one available: the decisions read it.
+	Store *sets.Store
+	// Files is the identity of the file that each set with a file was read
+	// from, by the name of the set.
+	Files map[string]source.Identity
+	// Loads is the load of each set, by its name.
+	Loads map[string]Load
+}
+
+// Load is the load of the first copy of a set: when it ended, and how long
+// it took.
+type Load struct {
+	At       time.Time
+	Duration time.Duration
+}
+
+// LoadSets loads every set of cfg, a valid configuration, in the order of
+// the file: it reads the file of each set that has one, and builds each set
+// of values. A set in replace takes that copy instead, of the type of the
+// set, and its file is not read. A file that cannot be read, or whose content
+// is invalid, is a *config.Error at sets.<name>.file, with the line of the
+// file and the problem, never the content or the path.
+func LoadSets(cfg *config.Config, replace map[string]*sets.Set) (*Sets, error) {
+	decls := cfg.SetDeclarations()
+	store, err := sets.NewStore(decls)
+	if err != nil {
+		return nil, err
+	}
+	out := &Sets{Store: store, Files: map[string]source.Identity{}, Loads: map[string]Load{}}
+	for _, d := range decls {
+		s := cfg.Sets[d.Name]
+		begin := time.Now()
+		set, ok := replace[d.Name]
+		switch {
+		case ok:
+		case s.File != "":
+			var id source.Identity
+			set, id, err = source.ReadFile(s.File, d.Type, s.MaxEntries)
+			if err != nil {
+				return nil, cfg.ErrorAt("sets."+d.Name+".file", source.Problem(err))
+			}
+			out.Files[d.Name] = id
+		default:
+			values := make([]string, len(s.Values))
+			for i, v := range s.Values {
+				values[i] = string(v)
+			}
+			if set, err = sets.FromValues(d.Type, values, s.MaxEntries); err != nil {
+				// A valid configuration has valid values.
+				return nil, cfg.ErrorAt("sets."+d.Name+".values", err.Error())
+			}
+		}
+		if err := store.Replace(d.Name, set); err != nil {
+			return nil, err
+		}
+		end := time.Now()
+		out.Loads[d.Name] = Load{At: end, Duration: end.Sub(begin)}
+	}
+	return out, nil
+}
+
+// fileSets returns the sets of cfg read from files, as their refreshers need
+// them, with the identity of the copy in loaded and the start of its read.
+// setTime, when not nil, changes their refresh and max_staleness.
+func fileSets(cfg *config.Config, loaded *Sets, setTime func(time.Duration) time.Duration) []source.File {
+	if setTime == nil {
+		setTime = func(d time.Duration) time.Duration { return d }
+	}
+	var files []source.File
+	for _, d := range cfg.SetDeclarations() {
+		s := cfg.Sets[d.Name]
+		if s.File == "" {
+			continue
+		}
+		files = append(files, source.File{
+			Name:         d.Name,
+			Path:         s.File,
+			Type:         d.Type,
+			MaxEntries:   s.MaxEntries,
+			Refresh:      setTime(s.Refresh),
+			MaxStaleness: setTime(s.MaxStaleness),
+			Identity:     loaded.Files[d.Name],
+			Read:         loaded.Loads[d.Name].At.Add(-loaded.Loads[d.Name].Duration),
+		})
+	}
+	return files
+}
+
+// setReports records what the refreshers of the sets do, in the metrics and
+// in log events.
+type setReports struct {
+	metrics  *metrics.Metrics
+	logger   *slog.Logger
+	declared map[string]sets.Declaration
+}
+
+// newSetReports returns the reports of the sets declared, the declarations
+// that m labels its series with, so that the events and the metrics name a
+// set with the same type and source.
+func newSetReports(m *metrics.Metrics, logger *slog.Logger, declared []sets.Declaration) setReports {
+	r := setReports{metrics: m, logger: logger, declared: make(map[string]sets.Declaration, len(declared))}
+	for _, d := range declared {
+		r.declared[d.Name] = d
+	}
+	return r
+}
+
+// fields returns the first fields of an event about the set name, followed
+// by more: set, set_type and set_source.
+func (r setReports) fields(name string, more ...any) []any {
+	d := r.declared[name]
+	return append([]any{"set", name, "set_type", string(d.Type), "set_source", string(d.Source)}, more...)
+}
+
+func (r setReports) Checked(set string, result source.Result, took time.Duration, at time.Time) {
+	r.metrics.SetRefreshed(set, result, took, at)
+}
+
+func (r setReports) Loaded(set string, entries int, took time.Duration) {
+	r.metrics.SetEntries(set, entries)
+	r.logger.Info("set_loaded", r.fields(set, "entries", entries, "duration_ms", telemetry.Milliseconds(took))...)
+}
+
+func (r setReports) Failed(set string, err error) {
+	r.logger.Warn("set_load_failed", r.fields(set, "error", source.Problem(err))...)
+}
+
+func (r setReports) Unavailable(set string) {
+	r.metrics.SetAvailable(set, false)
+	r.logger.Warn("set_unavailable", r.fields(set, "reason", "stale")...)
+}
+
+func (r setReports) Available(set string) {
+	r.metrics.SetAvailable(set, true)
+	r.logger.Info("set_available", r.fields(set)...)
 }
 
 // EnginePolicy translates a valid policy for the engine.

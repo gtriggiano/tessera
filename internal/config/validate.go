@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 func (c *Config) validate() error {
@@ -62,7 +64,99 @@ func (c *Config) validate() error {
 	if err := c.validateClientIP(); err != nil {
 		return err
 	}
+	if err := c.validateSets(); err != nil {
+		return err
+	}
 	return c.validatePolicy()
+}
+
+// validateSets checks each set, in the order of the file. The files of the
+// sets are not read here: their loader reports their errors with ErrorAt.
+func (c *Config) validateSets() error {
+	for _, k := range c.keys["sets"] {
+		if err := c.validateSet(k.name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateSet(name string) error {
+	s, p := c.Sets[name], childPath("sets", name)
+	switch {
+	case !c.present(p + ".type"):
+		return c.err(p+".type", "required")
+	case s.Type != SetTypeCIDR && s.Type != SetTypeASN && s.Type != SetTypeString:
+		return c.err(p+".type", "expected cidr, asn or string")
+	}
+	values, file := c.present(p+".values"), c.present(p+".file")
+	switch {
+	case !values && !file:
+		return c.err(p, "needs a source: values or file")
+	case values && file:
+		later := ".file"
+		if c.nodes[p+".values"].line > c.nodes[p+".file"].line {
+			later = ".values"
+		}
+		return c.err(p+later, "values and file are both set: a set has one source")
+	}
+	if s.MaxEntries < 1 {
+		return c.err(p+".max_entries", "must be positive")
+	}
+	if values {
+		for _, key := range []string{"refresh", "max_staleness", "on_unavailable"} {
+			if c.present(p + "." + key) {
+				return c.err(p+"."+key, "allowed only with file: a set of values is always available")
+			}
+		}
+		if len(s.Values) > s.MaxEntries {
+			return c.err(p+".values", "more values than max_entries")
+		}
+		for i, v := range s.Values {
+			item := itemPath(p+".values", i)
+			if c.integers[item] && s.Type != SetTypeASN {
+				return c.err(item, "expected a string")
+			}
+			if err := sets.ParseValue(sets.Type(s.Type), string(v)); err != nil {
+				return c.err(item, err.Error())
+			}
+		}
+		return nil
+	}
+	switch {
+	case s.File == "":
+		return c.err(p+".file", "must not be empty")
+	case !printable(s.File):
+		return c.err(p+".file", "expected a path")
+	case s.Refresh < MinSetRefresh:
+		return c.err(p+".refresh", "must be at least 1s")
+	case s.MaxStaleness < 0:
+		return c.err(p+".max_staleness", "must not be negative")
+	case s.MaxStaleness != 0 && s.MaxStaleness <= s.Refresh:
+		// The set would be unavailable before each check.
+		return c.err(p+".max_staleness", "must be longer than refresh, or 0s for no limit")
+	}
+	switch s.OnUnavailable {
+	case OnUnavailableFail, OnUnavailableMatch, OnUnavailableNoMatch:
+	default:
+		return c.err(p+".on_unavailable", "expected fail, match or no_match")
+	}
+	return nil
+}
+
+// SetDeclarations returns the sets as the expressions declare them, in the
+// order of the file.
+func (c *Config) SetDeclarations() []sets.Declaration {
+	out := make([]sets.Declaration, 0, len(c.Sets))
+	for _, k := range c.keys["sets"] {
+		s := c.Sets[k.name]
+		source := sets.SourceValues
+		if s.File != "" {
+			source = sets.SourceFile
+		}
+		out = append(out, sets.Declaration{Name: k.name, Type: sets.Type(s.Type), Source: source, OnUnavailable: sets.OnUnavailable(s.OnUnavailable)})
+	}
+	return out
 }
 
 func (c *Config) validateClientIP() error {

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -42,6 +43,26 @@ func (e *Error) Error() string {
 	return e.Path + ": " + e.Problem
 }
 
+// Warning is a problem of a valid configuration: tessera runs with it. It
+// names the key and its position, and never repeats a configured value.
+type Warning struct {
+	Path         string
+	Line, Column int
+	Problem      string
+}
+
+func (w Warning) String() string {
+	return (&Error{Path: w.Path, Line: w.Line, Column: w.Column, Problem: w.Problem}).Error()
+}
+
+// Warnings returns the warnings of the configuration, in the order of the
+// file.
+func (c *Config) Warnings() []Warning { return c.warnings }
+
+// ErrorAt returns the *Error of problem for the key at path, such as
+// sets.partners.file, with its position in the file.
+func (c *Config) ErrorAt(path, problem string) error { return c.err(path, problem) }
+
 // err returns an Error for path, at the position of path or, when path is
 // not in the file, of its nearest parent that is.
 func (c *Config) err(path, problem string) error {
@@ -62,7 +83,8 @@ func (c *Config) errAt(path string, l location, problem string) error {
 }
 
 // Load reads and checks the configuration file at path. It reads nothing but
-// that file, and makes the relative paths in it relative to its directory.
+// that file, not even the files of the sets, and makes the relative paths in
+// it relative to its directory.
 func Load(path string, lookup LookupEnv) (*Config, error) {
 	data, err := readFile(path)
 	if err != nil {
@@ -72,15 +94,29 @@ func Load(path string, lookup LookupEnv) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if socket, ok := strings.CutPrefix(c.Server.Listen, UnixPrefix); ok {
-		if !filepath.IsAbs(socket) {
-			dir, err := filepath.Abs(filepath.Dir(path))
-			if err != nil {
-				return nil, errors.New("configuration file: cannot resolve its directory")
-			}
-			socket = filepath.Join(dir, socket)
-			c.Server.Listen = UnixPrefix + socket
+	absolute := func(p string) (string, error) {
+		if filepath.IsAbs(p) {
+			return p, nil
 		}
+		dir, err := filepath.Abs(filepath.Dir(path))
+		if err != nil {
+			return "", errors.New("configuration file: cannot resolve its directory")
+		}
+		return filepath.Join(dir, p), nil
+	}
+	for name, s := range c.Sets {
+		if s.File != "" {
+			if s.File, err = absolute(s.File); err != nil {
+				return nil, err
+			}
+			c.Sets[name] = s
+		}
+	}
+	if socket, ok := strings.CutPrefix(c.Server.Listen, UnixPrefix); ok {
+		if socket, err = absolute(socket); err != nil {
+			return nil, err
+		}
+		c.Server.Listen = UnixPrefix + socket
 		if len(socket) > MaxSocketPathBytes {
 			return nil, c.err("server.listen", fmt.Sprintf("the socket path, made absolute, is longer than %d bytes", MaxSocketPathBytes))
 		}
@@ -164,6 +200,7 @@ func syntaxError(err error) error {
 var (
 	durationType   = reflect.TypeFor[time.Duration]()
 	expressionType = reflect.TypeFor[Expression]()
+	setValueType   = reflect.TypeFor[SetValue]()
 	integerRE      = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 	envNameRE      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	// keyRE matches the keys that an error can name: a key that does not
@@ -211,6 +248,24 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 			return c.err(path, "expected a duration with units, such as 5s")
 		}
 		v.SetInt(int64(d))
+		return nil
+	}
+	if v.Type() == setValueType {
+		// An integer is kept as the file writes it, for an asn set to
+		// check; validate rejects it in a set of another type.
+		if n.Kind == yaml.ScalarNode && n.Tag == "!!int" {
+			c.integers[path] = true
+			v.SetString(n.Value)
+			return nil
+		}
+		if n.Kind != yaml.ScalarNode || n.Tag != "!!str" {
+			return c.err(path, "expected a string, or, in an asn set, a decimal integer without leading zeros, such as 64496")
+		}
+		s, err := c.expand(n.Value, path, lookup)
+		if err != nil {
+			return err
+		}
+		v.SetString(s)
 		return nil
 	}
 	switch v.Kind() {
@@ -264,6 +319,9 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 		}
 		v.Set(items)
 	case reflect.Map:
+		if v.Type().Key().Kind() == reflect.String && v.Type().Elem().Kind() == reflect.Struct {
+			return c.decodeNamed(n, v, path, lookup)
+		}
 		if v.Type().Key().Kind() != reflect.String || v.Type().Elem().Kind() != reflect.String {
 			return c.err(path, "unsupported configuration type")
 		}
@@ -322,6 +380,54 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 	default:
 		return c.err(path, "unsupported configuration type")
 	}
+	return nil
+}
+
+// setNameRE is the form of a set name: it is a field in expressions and a
+// label value of metrics.
+var setNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// celReserved are the words that the expression language reserves: a set of
+// such a name could not be read as sets.<name>.
+var celReserved = []string{"false", "in", "null", "true", "as", "break", "const", "continue", "else", "for", "function", "if", "import", "let", "loop", "package", "namespace", "return", "var", "void", "while"}
+
+// decodeNamed stores n, a mapping from names to blocks, such as sets, into
+// the map v. Each name is a key of the paths below it; a name that is not
+// valid is reported at its position, under the path of the mapping, since
+// it could be any text.
+func (c *Config) decodeNamed(n *yaml.Node, v reflect.Value, path string, lookup LookupEnv) error {
+	if n.Kind != yaml.MappingNode || n.Tag != "!!map" {
+		return c.err(path, "expected a mapping")
+	}
+	m := reflect.MakeMapWithSize(v.Type(), len(n.Content)/2)
+	seen := map[string]bool{}
+	for i := 0; i < len(n.Content); i += 2 {
+		k, value := n.Content[i], n.Content[i+1]
+		at := location{k.Line, k.Column}
+		switch {
+		case k.Kind != yaml.ScalarNode || k.Tag != "!!str" || k.Value == "<<":
+			return c.errAt(path, at, "keys must be plain strings; merge keys are not allowed")
+		case len(k.Value) > MaxSetNameLength || !setNameRE.MatchString(k.Value) || slices.Contains(celReserved, k.Value):
+			return c.errAt(path, at, "expected a name of lowercase letters, digits and underscores that starts with a letter, at most "+strconv.Itoa(MaxSetNameLength)+" characters and not a reserved word of the expression language")
+		}
+		p := childPath(path, k.Value)
+		if seen[k.Value] {
+			return c.errAt(p, at, "duplicate key")
+		}
+		seen[k.Value] = true
+		item := reflect.New(v.Type().Elem()).Elem()
+		if d, ok := item.Addr().Interface().(defaulter); ok {
+			d.setDefaults()
+		}
+		if err := c.decode(value, item, p, lookup); err != nil {
+			return err
+		}
+		// The block is where its name is.
+		c.nodes[p] = at
+		c.keys[path] = append(c.keys[path], mapKey{name: k.Value, at: at})
+		m.SetMapIndex(reflect.ValueOf(k.Value), item)
+	}
+	v.Set(m)
 	return nil
 }
 

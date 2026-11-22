@@ -177,6 +177,92 @@
         }
       }
     },
+    "sets": {
+      "description": "The named sets that conditions read with sets.<name>.contains(value). A name is a lowercase letter followed by lowercase letters, digits and underscores, at most 63 characters, and not a reserved word of the expression language.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,62}$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "description": "The type of the values: cidr, IP networks and addresses; asn, autonomous system numbers; string, strings compared exactly.",
+            "type": "string",
+            "anyOf": [
+              {
+                "enum": [
+                  "cidr",
+                  "asn",
+                  "string"
+                ]
+              },
+              {
+                "$ref": "#/$defs/environment"
+              }
+            ]
+          },
+          "values": {
+            "description": "The values of the set, written here: strings, or for an asn set integers too. A set has one source: values or file.",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295
+                }
+              ]
+            }
+          },
+          "file": {
+            "description": "The file of the set, relative to the configuration file when it is not absolute: one value per line, # starts a comment. A set has one source: values or file.",
+            "type": "string"
+          },
+          "refresh": {
+            "description": "How often tessera checks the file for a change. At least 1s. Only with file.",
+            "$ref": "#/$defs/duration",
+            "default": "10s"
+          },
+          "max_staleness": {
+            "description": "The age of the last successful check of the file beyond which the set is unavailable. 0s sets no limit; any other value must be longer than refresh. Only with file.",
+            "$ref": "#/$defs/duration",
+            "default": "0s"
+          },
+          "on_unavailable": {
+            "description": "What contains answers when the set is unavailable: fail makes the condition indeterminate, which counts against allowing; match answers true; no_match answers false. Only with file.",
+            "type": "string",
+            "anyOf": [
+              {
+                "enum": [
+                  "fail",
+                  "match",
+                  "no_match"
+                ]
+              },
+              {
+                "$ref": "#/$defs/environment"
+              }
+            ],
+            "default": "fail"
+          },
+          "max_entries": {
+            "description": "The largest number of values of the set, duplicates included; more is an error.",
+            "type": "integer",
+            "minimum": 1,
+            "default": 1000000
+          }
+        }
+      },
+      "default": {}
+    },
     "policy": {
       "description": "How tessera decides.",
       "type": "object",

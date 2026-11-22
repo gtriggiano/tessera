@@ -1,0 +1,25 @@
+# The policy of TestEnvoySets: a deny rule on a set read from a file, which
+# the test replaces while tessera runs. The file is in a directory mounted as
+# a volume at /etc/tessera/sets, so that a file renamed over it on the host is
+# seen in the container. Envoy, the only proxy in front of tessera, appends
+# the address of its peer to X-Forwarded-For; the test writes the client
+# address before it.
+server:
+  drain_delay: 1s
+log:
+  format: json
+  decisions: all
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 1
+sets:
+  blocked:
+    type: cidr
+    file: sets/blocked.txt
+    refresh: 1s
+policy:
+  default_action: allow
+  rules:
+    - name: blocked
+      action: deny
+      when: sets.blocked.contains(client.ip)

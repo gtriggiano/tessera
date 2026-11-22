@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../public/config.schema.json
+sets:
+  # Networks blocked during an incident, one per line in a file next to this
+  # one.
+  blocked:
+    type: cidr
+    file: blocked.txt
+  office:
+    type: cidr
+    values:
+      - 203.0.113.0/24
+      - 2001:db8:cafe::/48
+  internal_hosts:
+    type: string
+    values:
+      - admin.example.com
+      - grafana.example.com
+
+policy:
+  default_action: allow
+  rules:
+    - name: blocked-networks
+      description: Networks blocked during an incident.
+      action: deny
+      when: sets.blocked.contains(client.ip)
+
+    - name: internal-hosts
+      description: The internal hosts, from the office only.
+      action: deny
+      when: sets.internal_hosts.contains(request.host) && !sets.office.contains(client.ip)
+      response:
+        status: 404
