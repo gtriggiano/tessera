@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/gtriggiano/tessera/internal/config"
 )
 
 // BuildInfo identifies the binary. Empty version, revision and GoVersion values
@@ -23,18 +25,20 @@ type BuildInfo struct {
 	BuildTime string
 }
 
-// Options supplies process dependencies. Nil writers discard output.
+// Options supplies process dependencies. Nil writers discard output, and a nil
+// LookupEnv reports every environment variable as unset.
 type Options struct {
-	Out   io.Writer
-	Err   io.Writer
-	Build BuildInfo
+	Out       io.Writer
+	Err       io.Writer
+	LookupEnv config.LookupEnv
+	Build     BuildInfo
 	// Signals delivers the process's shutdown signals. The first cancels the
 	// running command, like a signal-cancelled context. Nil delivers none.
 	Signals <-chan os.Signal
 }
 
-// Run executes a new command tree. It returns 0 on success, 2 for usage
-// errors, and 1 for runtime failures such as writing output.
+// Run executes a new command tree. It returns 0 on success, 2 for usage or
+// configuration errors, and 1 for runtime failures such as writing output.
 func Run(ctx context.Context, args []string, opts Options) int {
 	opts = defaults(opts)
 	// Ends the signal watcher of a command, if any, when Run returns.
@@ -104,7 +108,7 @@ func newCommand(opts Options) *cobra.Command {
 		},
 	})
 	root.RunE = help
-	root.AddCommand(versionCommand(opts.Build))
+	root.AddCommand(versionCommand(opts.Build), configCommand(opts.LookupEnv))
 	return root
 }
 
@@ -131,6 +135,9 @@ func defaults(opts Options) Options {
 	}
 	if opts.Err == nil {
 		opts.Err = io.Discard
+	}
+	if opts.LookupEnv == nil {
+		opts.LookupEnv = func(string) (string, bool) { return "", false }
 	}
 	if opts.Build.Version == "" {
 		opts.Build.Version = "dev"
@@ -181,6 +188,61 @@ func versionCommand(build BuildInfo) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&format, "output", "text", "output format: text or json")
 	return cmd
+}
+
+func configCommand(lookup config.LookupEnv) *cobra.Command {
+	var path string
+	parent := &cobra.Command{
+		Use:   "config",
+		Short: "Check or print the configuration",
+		Long:  "Check or print the configuration file, selected with --config or, when the flag is\nabsent, with the TESSERA_CONFIG environment variable. These commands read only\nthat file.",
+		Args:  noArgs,
+		RunE:  help,
+	}
+	parent.PersistentFlags().StringVar(&path, "config", "", "configuration file (overrides TESSERA_CONFIG)")
+	load := func(cmd *cobra.Command) (*config.Config, error) {
+		selected, ok := path, cmd.Flags().Changed("config")
+		if !ok {
+			selected, ok = lookup("TESSERA_CONFIG")
+		}
+		switch {
+		case !ok:
+			return nil, errors.New("no configuration file; use --config or TESSERA_CONFIG")
+		case selected == "":
+			return nil, errors.New("configuration file path must not be empty")
+		}
+		return config.Load(selected, lookup)
+	}
+	validate := &cobra.Command{
+		Use:   "validate",
+		Short: "Check the configuration",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if _, err := load(cmd); err != nil {
+				return err
+			}
+			return write(cmd.OutOrStdout(), []byte("configuration valid\n"))
+		},
+	}
+	printCommand := &cobra.Command{
+		Use:   "print",
+		Short: "Print the configuration with its defaults",
+		Long:  "Print the configuration with its defaults applied, as YAML. Every value that\ncontains a ${...} substitution is replaced with [REDACTED].",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := load(cmd)
+			if err != nil {
+				return err
+			}
+			data, err := cfg.Redacted()
+			if err != nil {
+				return runtimeError{errors.New("cannot render the configuration")}
+			}
+			return write(cmd.OutOrStdout(), data)
+		},
+	}
+	parent.AddCommand(validate, printCommand)
+	return parent
 }
 
 func noArgs(_ *cobra.Command, args []string) error {

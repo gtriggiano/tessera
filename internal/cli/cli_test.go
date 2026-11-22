@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,8 +17,17 @@ import (
 var testBuild = BuildInfo{Version: "v0.1.0", Revision: "abc123", GoVersion: "go1.test", BuildTime: "2026-11-06T12:00:00Z"}
 
 func execute(args []string) (int, string, string) {
+	return executeWithEnv(args, nil)
+}
+
+// executeWithEnv runs args with vars as the only environment variables.
+func executeWithEnv(args []string, vars map[string]string) (int, string, string) {
 	var stdout, stderr bytes.Buffer
-	code := Run(context.Background(), args, Options{Out: &stdout, Err: &stderr, Build: testBuild})
+	lookup := func(name string) (string, bool) {
+		v, ok := vars[name]
+		return v, ok
+	}
+	code := Run(context.Background(), args, Options{Out: &stdout, Err: &stderr, Build: testBuild, LookupEnv: lookup})
 	return code, stdout.String(), stderr.String()
 }
 
@@ -25,6 +35,7 @@ func TestHelpAndVersionSucceed(t *testing.T) {
 	for _, args := range [][]string{
 		nil, {"--help"}, {"help"}, {"help", "version"},
 		{"version"}, {"version", "--help"}, {"version", "--output", "json"}, {"version", "--output=text"},
+		{"config"}, {"config", "--help"}, {"help", "config", "validate"}, {"config", "print", "--help"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			code, out, errOut := execute(args)
@@ -78,6 +89,8 @@ func TestUsageErrorsDoNotEchoArguments(t *testing.T) {
 		{secret}, {"help", secret}, {"help", "version", secret}, {"version", secret},
 		{"--" + secret}, {"version", "--" + secret}, {"-version"},
 		{"version", "--output", secret}, {"version", "--output"},
+		{"config", secret}, {"config", "validate", secret}, {"config", "print", "--" + secret},
+		{"config", "validate", "--config", secret}, {"config", "print", "--config"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			code, out, errOut := execute(args)
@@ -163,5 +176,70 @@ func TestSignalCancelsTheCommandContext(t *testing.T) {
 	case <-commandCtx.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("signal did not cancel the command context")
+	}
+}
+
+// writeConfig writes a configuration file in a new directory and returns its
+// path.
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestConfigValidate(t *testing.T) {
+	valid := writeConfig(t, "policy:\n  default_action: deny\n")
+	invalid := writeConfig(t, "policy:\n  default_action: secret-accidentally-pasted-value\n")
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		vars     map[string]string
+		code     int
+		out, err string
+	}{
+		{"flag", []string{"config", "validate", "--config", valid}, nil, 0, "configuration valid\n", ""},
+		{"flag before the command", []string{"config", "--config", valid, "validate"}, nil, 0, "configuration valid\n", ""},
+		{"environment", []string{"config", "validate"}, map[string]string{"TESSERA_CONFIG": valid}, 0, "configuration valid\n", ""},
+		{"flag over environment", []string{"config", "validate", "--config", valid}, map[string]string{"TESSERA_CONFIG": invalid}, 0, "configuration valid\n", ""},
+		{"no file", []string{"config", "validate"}, nil, 2, "", "tessera: no configuration file; use --config or TESSERA_CONFIG\n"},
+		{"empty flag", []string{"config", "validate", "--config", ""}, map[string]string{"TESSERA_CONFIG": valid}, 2, "", "tessera: configuration file path must not be empty\n"},
+		{"empty environment", []string{"config", "validate"}, map[string]string{"TESSERA_CONFIG": ""}, 2, "", "tessera: configuration file path must not be empty\n"},
+		{"missing file", []string{"config", "validate", "--config", valid + ".missing"}, nil, 2, "", "tessera: configuration file: not found\n"},
+		{"invalid", []string{"config", "validate", "--config", invalid}, nil, 2, "", "tessera: policy.default_action (line 2, column 19): expected allow or deny\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out, errOut := executeWithEnv(tc.args, tc.vars)
+			if code != tc.code || out != tc.out || errOut != tc.err {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
+			}
+		})
+	}
+}
+
+func TestConfigPrint(t *testing.T) {
+	path := writeConfig(t, "policy:\n  default_action: deny\nlog:\n  level: ${LEVEL}\n")
+	code, out, errOut := executeWithEnv([]string{"config", "print", "--config", path}, map[string]string{"LEVEL": "debug"})
+	if code != 0 || errOut != "" {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	if !strings.Contains(out, "  level: '[REDACTED]'\n") || strings.Contains(out, "debug") || !strings.Contains(out, "  default_action: deny\n") || !strings.Contains(out, "  shutdown_timeout: 20s\n") {
+		t.Fatalf("stdout=%q", out)
+	}
+	code, out, errOut = executeWithEnv([]string{"config", "print", "--config", path}, nil)
+	if code != 2 || out != "" || errOut != "tessera: log.level (line 4, column 10): environment variable LEVEL is not set\n" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+}
+
+func TestConfigOutputFailuresReturnOne(t *testing.T) {
+	path := writeConfig(t, "policy:\n  default_action: deny\n")
+	for _, command := range []string{"validate", "print"} {
+		var stderr bytes.Buffer
+		if code := Run(context.Background(), []string{"config", command, "--config", path}, Options{Out: failingWriter{}, Err: &stderr}); code != 1 || stderr.String() != "tessera: cannot write output\n" {
+			t.Fatalf("%s: code=%d stderr=%q", command, code, stderr.String())
+		}
 	}
 }

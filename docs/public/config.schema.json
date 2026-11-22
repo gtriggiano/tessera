@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gtriggiano.github.io/tessera/config.schema.json",
+  "title": "tessera configuration",
+  "description": "The configuration file of tessera, an external authorization service for Envoy. This schema checks key names, types, allowed values, integer bounds and the form of some strings. It does not check the rules that involve two keys (such as two listeners on the same port), the syntax of hosts and socket paths, or environment variables: a string value can take text from the environment with ${NAME} or ${NAME:-default}, and such a value is checked only after substitution. `tessera config validate` is the authority on whether a file is valid.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy"
+  ],
+  "properties": {
+    "server": {
+      "description": "The gRPC listener for Envoy.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listen": {
+          "description": "The address of the gRPC listener: host:port, or unix: followed by the path of a socket, relative to the configuration file when it is not absolute.",
+          "type": "string",
+          "anyOf": [
+            {
+              "pattern": "^(unix:.+|.*:[1-9][0-9]{0,4})$"
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ],
+          "default": ":9001"
+        },
+        "max_concurrent_streams": {
+          "description": "The largest number of concurrent calls on one connection from Envoy.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1024
+        },
+        "max_connection_age": {
+          "description": "The age at which a connection from Envoy is closed gracefully, so that the load spreads across replicas. 0s sets no limit.",
+          "$ref": "#/$defs/duration",
+          "default": "0s"
+        },
+        "drain_delay": {
+          "description": "At shutdown, the time between reporting not ready and closing the connections.",
+          "$ref": "#/$defs/duration",
+          "default": "5s"
+        },
+        "shutdown_timeout": {
+          "description": "At shutdown, the longest time to finish the calls in progress. Positive.",
+          "$ref": "#/$defs/duration",
+          "default": "20s"
+        }
+      }
+    },
+    "admin": {
+      "description": "The listener of the health checks and the metrics.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listen": {
+          "description": "The address of the admin listener, as host:port. It must not share its address and port with server.listen.",
+          "type": "string",
+          "anyOf": [
+            {
+              "pattern": "^.*:[1-9][0-9]{0,4}$"
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ],
+          "default": ":9090"
+        }
+      }
+    },
+    "log": {
+      "description": "The log events, written to standard error.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "description": "The lowest level of the events that are written.",
+          "type": "string",
+          "anyOf": [
+            {
+              "enum": [
+                "debug",
+                "info",
+                "warn",
+                "error"
+              ]
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ],
+          "default": "info"
+        },
+        "format": {
+          "description": "The format of the events: one line of key=value pairs, or one JSON object per line.",
+          "type": "string",
+          "anyOf": [
+            {
+              "enum": [
+                "logfmt",
+                "json"
+              ]
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ],
+          "default": "logfmt"
+        }
+      }
+    },
+    "policy": {
+      "description": "How tessera decides.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default_action"
+      ],
+      "properties": {
+        "default_action": {
+          "description": "The decision for a request. It has no default, so that every configuration states whether requests are allowed or denied.",
+          "type": "string",
+          "anyOf": [
+            {
+              "enum": [
+                "allow",
+                "deny"
+              ]
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "duration": {
+      "description": "A duration with units, such as 500ms, 30s, 5m or 1h30m. Write 0s for zero: a number without a unit is an error.",
+      "type": "string",
+      "anyOf": [
+        {
+          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|μs|ms|s|m|h))+$"
+        },
+        {
+          "$ref": "#/$defs/environment"
+        }
+      ]
+    },
+    "environment": {
+      "description": "A string that takes all or part of its value from the environment, with ${NAME} or ${NAME:-default}. The value is checked after substitution.",
+      "type": "string",
+      "pattern": "\\$\\{[A-Za-z_][A-Za-z0-9_]*(:-[^}]*)?\\}"
+    }
+  }
+}

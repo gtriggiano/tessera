@@ -40,7 +40,8 @@ Each package under `internal/` has one role.
 | Package | Role |
 | --- | --- |
 | `cmd/tessera/` | Entry point. |
-| `internal/cli/` | Commands: `help` and `version`. |
+| `internal/cli/` | Commands: `help`, `version`, `config validate` and `config print`. |
+| `internal/config/` | The configuration file: types, defaults, strict reading, checks and printing; the tests that generate its JSON Schema. |
 | `internal/release/` | Tests only: version references in the documentation and the README. |
 | `internal/agentdocs/` | Tests only: consistency of `AGENTS.md`, `CLAUDE.md` and the skills. |
 
@@ -95,6 +96,7 @@ export npm_config_cache="$PWD/.cache/npm"
 - Cover each behavior change with a behavioral test of the contract: the decisions tessera returns, failure modes and resource limits. A test of the observable result is worth more than a test of internals.
 - Keep the suite passing with the race detector (`make check`).
 - Fuzz seed cases run with the ordinary tests; `make fuzz` runs the bounded fuzzing.
+- `docs/public/config.schema.json`, the JSON Schema of the configuration that the site publishes for editors, is generated from the configuration types, the defaults and the notes in `internal/config/json_schema_test.go`. `TestJSONSchema` fails when the file differs: add a note for a new key, then regenerate the file with `go test ./internal/config -run TestJSONSchema -update`. Two more tests check that the schema accepts files that tessera accepts, and that each kind of rule in it rejects a file that tessera rejects too. The schema states only what a file states on its own: leave out a rule that involves two keys or the environment.
 - Never put production credentials, `.env` files or real hostnames and addresses in fixtures. Use `example.com` hostnames, the documentation IP ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 and 2001:db8::/32) and the reserved AS numbers 64496 to 64511.
 
 ## Documentation

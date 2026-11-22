@@ -12,7 +12,7 @@
 
 ## Status
 
-tessera is in development and has no release yet. The binary has only the `help` and `version` commands.
+tessera is in development and has no release yet. The binary prints its build information and checks a configuration file, but does not serve requests yet.
 
 ## Development
 

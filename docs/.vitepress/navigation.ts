@@ -8,7 +8,7 @@ import type { DefaultTheme } from 'vitepress'
 
 export const nav: DefaultTheme.NavItem[] = [
   { text: 'Guide', link: '/guide/what-is-tessera', activeMatch: '^/guide/' },
-  { text: 'Reference', link: '/reference/versioning', activeMatch: '^/reference/' },
+  { text: 'Reference', link: '/reference/configuration', activeMatch: '^/reference/' },
 ]
 
 export const sidebar: DefaultTheme.SidebarMulti = {
@@ -19,6 +19,13 @@ export const sidebar: DefaultTheme.SidebarMulti = {
     },
   ],
   '/reference/': [
+    {
+      text: 'Reference',
+      items: [
+        { text: 'Configuration', link: '/reference/configuration' },
+        { text: 'CLI', link: '/reference/cli' },
+      ],
+    },
     {
       text: 'Releases',
       items: [

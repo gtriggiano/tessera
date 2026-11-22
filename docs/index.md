@@ -18,6 +18,6 @@ hero:
 
 ## Status
 
-**tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/), in development. The binary has only the `help` and `version` commands. Each feature gets its page in this documentation when it lands.
+**tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/), in development. The binary prints its build information and [checks a configuration file](./reference/configuration.md), but does not serve requests yet. Each feature gets its page in this documentation when it lands.
 
 [What is tessera?](./guide/what-is-tessera.md) describes the problem it addresses and what it leaves to other tools.

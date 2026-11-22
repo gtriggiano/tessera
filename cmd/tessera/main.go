@@ -27,9 +27,10 @@ func main() {
 	// path.
 	signal.Ignore(syscall.SIGPIPE)
 	os.Exit(cli.Run(context.Background(), os.Args[1:], cli.Options{
-		Out:     os.Stdout,
-		Err:     os.Stderr,
-		Build:   cli.BuildInfo{Version: version, Revision: revision, BuildTime: buildTime},
-		Signals: signals,
+		Out:       os.Stdout,
+		Err:       os.Stderr,
+		LookupEnv: os.LookupEnv,
+		Build:     cli.BuildInfo{Version: version, Revision: revision, BuildTime: buildTime},
+		Signals:   signals,
 	}))
 }
