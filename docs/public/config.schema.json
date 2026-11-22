@@ -27,6 +27,13 @@
           ],
           "default": ":9001"
         },
+        "max_connections": {
+          "description": "The largest number of open connections from Envoy to the gRPC listener; a connection beyond it is closed at once.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536,
+          "default": 1024
+        },
         "max_concurrent_streams": {
           "description": "The largest number of concurrent calls on one connection from Envoy.",
           "type": "integer",
@@ -72,7 +79,7 @@
       }
     },
     "log": {
-      "description": "The log events, written to standard error.",
+      "description": "The log events, written to standard output.",
       "type": "object",
       "additionalProperties": false,
       "properties": {

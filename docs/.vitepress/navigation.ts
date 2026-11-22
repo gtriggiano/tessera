@@ -24,6 +24,10 @@ export const sidebar: DefaultTheme.SidebarMulti = {
       items: [
         { text: 'Configuration', link: '/reference/configuration' },
         { text: 'CLI', link: '/reference/cli' },
+        { text: 'gRPC API', link: '/reference/grpc-api' },
+        { text: 'Admin endpoints', link: '/reference/admin-endpoints' },
+        { text: 'Metrics', link: '/reference/metrics' },
+        { text: 'Logs', link: '/reference/logs' },
       ],
     },
     {

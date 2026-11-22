@@ -1,0 +1,4 @@
+server:
+  drain_delay: 1s
+policy:
+  default_action: allow

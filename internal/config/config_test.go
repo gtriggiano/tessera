@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,7 @@ func mustParse(t *testing.T, yaml string, vars map[string]string) *Config {
 func TestDefaults(t *testing.T) {
 	c := mustParse(t, "policy:\n  default_action: deny\n", nil)
 	want := Config{
-		Server: Server{Listen: ":9001", MaxConcurrentStreams: 1024, DrainDelay: 5 * time.Second, ShutdownTimeout: 20 * time.Second},
+		Server: Server{Listen: ":9001", MaxConnections: 1024, MaxConcurrentStreams: 1024, DrainDelay: 5 * time.Second, ShutdownTimeout: 20 * time.Second},
 		Admin:  Admin{Listen: ":9090"},
 		Log:    Log{Level: "info", Format: "logfmt"},
 		Policy: Policy{DefaultAction: "deny"},
@@ -50,6 +51,7 @@ func TestEveryKey(t *testing.T) {
 	c := mustParse(t, `
 server:
   listen: 127.0.0.1:9101
+  max_connections: 256
   max_concurrent_streams: 64
   max_connection_age: 30m
   drain_delay: 0s
@@ -63,7 +65,7 @@ policy:
   default_action: allow
 `, nil)
 	want := Config{
-		Server: Server{Listen: "127.0.0.1:9101", MaxConcurrentStreams: 64, MaxConnectionAge: 30 * time.Minute, ShutdownTimeout: 90 * time.Second},
+		Server: Server{Listen: "127.0.0.1:9101", MaxConnections: 256, MaxConcurrentStreams: 64, MaxConnectionAge: 30 * time.Minute, ShutdownTimeout: 90 * time.Second},
 		Admin:  Admin{Listen: "[::1]:9102"},
 		Log:    Log{Level: "debug", Format: "json"},
 		Policy: Policy{DefaultAction: "allow"},
@@ -117,9 +119,12 @@ func TestInvalidConfigurations(t *testing.T) {
 		{"listen bad host", "policy: {default_action: deny}\nserver: {listen: \"-bad-.example.com:9001\"}\n", "server.listen (line 2, column 18): expected host:port or unix: followed by a path"},
 		{"empty socket path", "policy: {default_action: deny}\nserver: {listen: \"unix:\"}\n", "server.listen (line 2, column 18): expected host:port or unix: followed by a path"},
 		{"control character in socket path", "policy: {default_action: deny}\nserver: {listen: \"unix:/run/a\\nb\"}\n", "server.listen (line 2, column 18): expected host:port or unix: followed by a path"},
+		{"abstract socket", "policy: {default_action: deny}\nserver: {listen: \"unix:@tessera\"}\n", "server.listen (line 2, column 18): abstract Unix sockets are not supported; write a path"},
 		{"admin listen socket", "policy: {default_action: deny}\nadmin: {listen: \"unix:/run/admin.sock\"}\n", "admin.listen (line 2, column 17): expected host:port"},
 		{"same port", "policy: {default_action: deny}\nserver: {listen: \"127.0.0.1:9000\"}\nadmin: {listen: \"localhost:9000\"}\n", "admin.listen (line 3, column 17): must not share its address and port with server.listen"},
 		{"same port as default admin", "policy: {default_action: deny}\nserver: {listen: \"192.0.2.10:9090\"}\n", "server.listen (line 2, column 18): must not share its address and port with admin.listen"},
+		{"connections zero", "policy: {default_action: deny}\nserver: {max_connections: 0}\n", "server.max_connections (line 2, column 27): expected an integer from 1 to 65536"},
+		{"connections too many", "policy: {default_action: deny}\nserver: {max_connections: 65537}\n", "server.max_connections (line 2, column 27): expected an integer from 1 to 65536"},
 		{"streams zero", "policy: {default_action: deny}\nserver: {max_concurrent_streams: 0}\n", "server.max_concurrent_streams (line 2, column 34): expected an integer from 1 to 4294967295"},
 		{"streams too many", "policy: {default_action: deny}\nserver: {max_concurrent_streams: 4294967296}\n", "server.max_concurrent_streams (line 2, column 34): expected an integer from 1 to 4294967295"},
 		{"negative connection age", "policy: {default_action: deny}\nserver: {max_connection_age: -1s}\n", "server.max_connection_age (line 2, column 30): must not be negative"},
@@ -234,6 +239,7 @@ func TestRedacted(t *testing.T) {
 	}
 	want := `server:
   listen: :9001
+  max_connections: 1024
   max_concurrent_streams: 1024
   max_connection_age: 0s
   drain_delay: 5s
@@ -290,6 +296,19 @@ func TestLoad(t *testing.T) {
 	c, err = Load(write("tcp.yaml", "policy: {default_action: deny}\n"), nil)
 	if err != nil || c.Server.Listen != ":9001" {
 		t.Fatalf("listen=%q err=%v", c.Server.Listen, err)
+	}
+	// A socket path is checked once it is absolute.
+	longest := "/" + strings.Repeat("s", MaxSocketPathBytes-1)
+	if c, err := Load(write("longest.yaml", "policy: {default_action: deny}\nserver: {listen: \"unix:"+longest+"\"}\n"), nil); err != nil || c.Server.Listen != "unix:"+longest {
+		t.Fatalf("socket path of %d bytes: listen=%q err=%v", len(longest), c.Server.Listen, err)
+	}
+	tooLong := fmt.Sprintf("server.listen (line 2, column 18): the socket path, made absolute, is longer than %d bytes", MaxSocketPathBytes)
+	if _, err := Load(write("too-long.yaml", "policy: {default_action: deny}\nserver: {listen: \"unix:"+longest+"s\"}\n"), nil); err == nil || err.Error() != tooLong {
+		t.Fatalf("socket path of %d bytes: err=%v", len(longest)+1, err)
+	}
+	relative := strings.Repeat("s", MaxSocketPathBytes-len(dir))
+	if _, err := Load(write("relative-too-long.yaml", "policy: {default_action: deny}\nserver: {listen: \"unix:"+relative+"\"}\n"), nil); err == nil || err.Error() != tooLong {
+		t.Fatalf("relative socket path of %d bytes: err=%v", len(relative), err)
 	}
 	largest := "policy: {default_action: deny}\n#"
 	largest += strings.Repeat("x", MaxFileBytes-len(largest))

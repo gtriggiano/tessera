@@ -4,11 +4,7 @@ description: "Every key of the tessera configuration file, with its type, defaul
 
 # Configuration reference
 
-**tessera** reads its configuration from one YAML file. This page describes how the file is read and lists every key with its type, its default and the values it allows. The [CLI reference](./cli.md) describes the commands that check and print the file.
-
-::: warning In development
-No command serves requests yet: `tessera config validate` and `tessera config print` read and check this file, and nothing else uses it.
-:::
+**tessera** reads its configuration from one YAML file. This page describes how the file is read and lists every key with its type, its default and the values it allows. The [CLI reference](./cli.md) describes the commands that read the file: `tessera serve`, which reads it once at startup, and the commands that check and print it.
 
 ## JSON Schema
 
@@ -79,11 +75,12 @@ tessera: server.drain_delay (line 3, column 16): expected a duration with units,
 **Type:** mapping\
 **Default:** `{}`
 
-The gRPC listener for Envoy.
+The gRPC listener for Envoy. The [gRPC API reference](./grpc-api.md) describes what it serves.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
 | [`server.listen`](#server-listen) | string | `":9001"` | `host:port`, or `unix:` followed by a path |
+| [`server.max_connections`](#server-max-connections) | integer | `1024` | `1` to `65536` |
 | [`server.max_concurrent_streams`](#server-max-concurrent-streams) | integer | `1024` | `1` to `4294967295` |
 | [`server.max_connection_age`](#server-max-connection-age) | duration | `0s` | zero or positive |
 | [`server.drain_delay`](#server-drain-delay) | duration | `5s` | zero or positive |
@@ -98,9 +95,19 @@ The gRPC listener for Envoy.
 The address of the gRPC listener for Envoy.
 
 - `host:port` listens on TCP. The host is empty, for every address, an IP address, such as `127.0.0.1` or `[::1]`, or a DNS name, such as `localhost`. A name whose last label is all digits, such as `127.1`, is an error: write the address in full. The port is a decimal number from `1` to `65535`, without a sign or leading zeros.
-- `unix:` followed by a path listens on a Unix socket: `unix:/run/tessera/grpc.sock`. A relative path is [relative to the configuration file](#relative-paths). The path has no control characters.
+- `unix:` followed by a path listens on a Unix socket: `unix:/run/tessera/grpc.sock`. A relative path is [relative to the configuration file](#relative-paths). The path has no control characters, does not start with `@`, since abstract sockets are not supported, and once absolute is at most 107 bytes long on Linux and 103 on macOS. tessera creates the socket when it starts and removes it when it stops; a file that already exists at the path stops the startup.
 
 On TCP, the address must not compete for a socket with [`admin.listen`](#admin-listen): the two are an error when their ports are equal and their hosts are equal, either host is empty or unspecified (`0.0.0.0`, `::`), or both hosts are loopback (`localhost`, `127.0.0.1`, `::1`).
+
+### `server.max_connections`
+
+**Type:** integer\
+**Default:** `1024`\
+**Allowed:** `1` to `65536`
+
+The largest number of open connections from Envoy to the gRPC listener, those still in their handshake included. tessera refuses the excess instead of letting it wait: a connection beyond the limit is closed as soon as it is accepted, before any HTTP/2 exchange. Envoy sees the connection close at once and fails the call as it fails any call that cannot reach tessera (see [What Envoy needs](./grpc-api.md#what-envoy-needs)), and [`tessera_grpc_connections_refused_total`](./metrics.md#tessera-grpc-connections-refused-total) counts the refusal.
+
+Envoy opens about one HTTP/2 connection to tessera per worker thread, so a replica of tessera needs about the number of worker threads of all the Envoy instances that reach it, with room for the connections of Envoy instances that start while others stop.
 
 ### `server.max_concurrent_streams`
 
@@ -108,7 +115,7 @@ On TCP, the address must not compete for a socket with [`admin.listen`](#admin-l
 **Default:** `1024`\
 **Allowed:** `1` to `4294967295`
 
-The largest number of concurrent calls on one connection from Envoy.
+The largest number of concurrent calls on one connection from Envoy. tessera announces it to Envoy when the connection opens, and refuses a call beyond it (see [Limits](./grpc-api.md#limits)).
 
 ### `server.max_connection_age`
 
@@ -116,7 +123,7 @@ The largest number of concurrent calls on one connection from Envoy.
 **Default:** `0s`\
 **Allowed:** zero or positive
 
-The age at which a connection from Envoy is closed gracefully, so that Envoy opens a new one and the load spreads across replicas. `0s` sets no limit.
+The age at which a connection from Envoy is closed gracefully, so that Envoy opens a new one and the load spreads across replicas. tessera adds a random variation of up to 10%, asks Envoy to close the connection, and lets the calls in progress on it finish. `0s` sets no limit.
 
 ### `server.drain_delay`
 
@@ -124,7 +131,7 @@ The age at which a connection from Envoy is closed gracefully, so that Envoy ope
 **Default:** `5s`\
 **Allowed:** zero or positive
 
-At shutdown, the time between reporting not ready and closing the connections.
+At shutdown, the time between reporting not ready and closing the gRPC listener. During this time tessera keeps answering on both listeners, so that Envoy and the orchestrator see that it is not ready and stop sending it requests. See [Signals of `serve`](./cli.md#signals-of-serve).
 
 ### `server.shutdown_timeout`
 
@@ -132,14 +139,14 @@ At shutdown, the time between reporting not ready and closing the connections.
 **Default:** `20s`\
 **Allowed:** positive
 
-At shutdown, the longest time to finish the calls in progress.
+At shutdown, the longest time to finish the calls in progress, counted from the end of [`server.drain_delay`](#server-drain-delay). It bounds the admin requests in progress too. When it passes, tessera cancels what is left, closes every connection and exits with status 1.
 
 ## `admin`
 
 **Type:** mapping\
 **Default:** `{}`
 
-The listener of the health checks and the metrics.
+The listener of the health checks and the metrics. The [admin endpoints reference](./admin-endpoints.md) describes what it serves.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
@@ -158,7 +165,7 @@ The address of the admin listener, in the `host:port` form of [`server.listen`](
 **Type:** mapping\
 **Default:** `{}`
 
-The log events, written to standard error.
+The log events, written to standard output. The [log reference](./logs.md) lists every event.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
@@ -198,4 +205,4 @@ How tessera decides.
 **Default:** required\
 **Allowed:** `allow`, `deny`
 
-The decision for a request. It has no default, so that every configuration states whether requests are allowed or denied.
+The decision for every request: `allow` lets Envoy send the request on, `deny` makes Envoy answer 403 Forbidden (see [Authorization service](./grpc-api.md#authorization-service)). It has no default, so that every configuration states whether requests are allowed or denied.

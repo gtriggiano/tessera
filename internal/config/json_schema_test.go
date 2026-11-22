@@ -58,6 +58,7 @@ type jsonSchemaNote struct {
 var jsonSchemaNotes = map[string]jsonSchemaNote{
 	"server":                        {doc: "The gRPC listener for Envoy."},
 	"server.listen":                 {doc: "The address of the gRPC listener: host:port, or unix: followed by the path of a socket, relative to the configuration file when it is not absolute.", pattern: jsonSchemaListenPattern},
+	"server.max_connections":        {doc: "The largest number of open connections from Envoy to the gRPC listener; a connection beyond it is closed at once.", min: 1, max: MaxConnectionsLimit},
 	"server.max_concurrent_streams": {doc: "The largest number of concurrent calls on one connection from Envoy.", min: 1, max: 4294967295},
 	"server.max_connection_age":     {doc: "The age at which a connection from Envoy is closed gracefully, so that the load spreads across replicas. 0s sets no limit."},
 	"server.drain_delay":            {doc: "At shutdown, the time between reporting not ready and closing the connections."},
@@ -66,7 +67,7 @@ var jsonSchemaNotes = map[string]jsonSchemaNote{
 	"admin":        {doc: "The listener of the health checks and the metrics."},
 	"admin.listen": {doc: "The address of the admin listener, as host:port. It must not share its address and port with server.listen.", pattern: jsonSchemaPortPattern},
 
-	"log":        {doc: "The log events, written to standard error."},
+	"log":        {doc: "The log events, written to standard output."},
 	"log.level":  {doc: "The lowest level of the events that are written.", enum: []string{LevelDebug, LevelInfo, LevelWarn, LevelError}},
 	"log.format": {doc: "The format of the events: one line of key=value pairs, or one JSON object per line.", enum: []string{FormatLogfmt, FormatJSON}},
 

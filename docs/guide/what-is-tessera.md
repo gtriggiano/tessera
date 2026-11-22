@@ -7,7 +7,7 @@ description: "The problem tessera is being built to solve, what it leaves to oth
 **tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/), in development. This page describes the problem it is being built to solve, what it leaves to other tools, and how it compares with the alternatives.
 
 ::: warning In development
-tessera has no release yet, and the binary does not serve requests: it prints its build information and checks a configuration file. Nothing else on this page works yet: each feature gets its own page when it lands.
+tessera has no release yet. [`tessera serve`](../reference/cli.md#tessera-serve) answers Envoy's authorization requests, but gives every request the same decision, [`policy.default_action`](../reference/configuration.md#policy-default-action): none of the rules, lists or location data described on this page work yet. Each feature gets its own page when it lands.
 :::
 
 ## The problem

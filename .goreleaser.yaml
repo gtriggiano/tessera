@@ -56,6 +56,9 @@ dockers_v2:
     # the smoke test.
     tags: ["{{ .Version }}"]
     platforms: [linux/amd64, linux/arm64]
+    # Copied into the build context, next to the binaries: the Dockerfile puts
+    # them in /usr/share/doc/tessera/.
+    extra_files: [LICENSE, NOTICE]
     sbom: true
     labels:
       org.opencontainers.image.title: tessera

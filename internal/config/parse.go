@@ -21,6 +21,10 @@ import (
 // MaxFileBytes is the largest configuration file.
 const MaxFileBytes = 1 << 20
 
+// MaxSocketPathBytes is the longest path of a Unix socket that the operating
+// system accepts: 107 bytes on Linux, 103 on macOS.
+const MaxSocketPathBytes = len(syscall.RawSockaddrUnix{}.Path) - 1
+
 type location struct{ line, column int }
 
 // Error is an invalid configuration. It names the key and, when the key is in
@@ -63,12 +67,18 @@ func Load(path string, lookup LookupEnv) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if socket, ok := strings.CutPrefix(c.Server.Listen, UnixPrefix); ok && !filepath.IsAbs(socket) {
-		dir, err := filepath.Abs(filepath.Dir(path))
-		if err != nil {
-			return nil, errors.New("configuration file: cannot resolve its directory")
+	if socket, ok := strings.CutPrefix(c.Server.Listen, UnixPrefix); ok {
+		if !filepath.IsAbs(socket) {
+			dir, err := filepath.Abs(filepath.Dir(path))
+			if err != nil {
+				return nil, errors.New("configuration file: cannot resolve its directory")
+			}
+			socket = filepath.Join(dir, socket)
+			c.Server.Listen = UnixPrefix + socket
 		}
-		c.Server.Listen = UnixPrefix + filepath.Join(dir, socket)
+		if len(socket) > MaxSocketPathBytes {
+			return nil, c.err("server.listen", fmt.Sprintf("the socket path, made absolute, is longer than %d bytes", MaxSocketPathBytes))
+		}
 	}
 	return c, nil
 }

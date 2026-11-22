@@ -29,6 +29,7 @@ type Server struct {
 	// Listen is host:port, or unix: followed by the path of a socket. Load
 	// makes a relative socket path absolute.
 	Listen               string        `yaml:"listen"`
+	MaxConnections       int           `yaml:"max_connections"`
 	MaxConcurrentStreams int           `yaml:"max_concurrent_streams"`
 	MaxConnectionAge     time.Duration `yaml:"max_connection_age"`
 	DrainDelay           time.Duration `yaml:"drain_delay"`
@@ -71,6 +72,9 @@ const (
 	ActionDeny  = "deny"
 )
 
+// MaxConnectionsLimit is the largest value of server.max_connections.
+const MaxConnectionsLimit = 65536
+
 // UnixPrefix starts a server.listen value that names a Unix socket.
 const UnixPrefix = "unix:"
 
@@ -78,6 +82,7 @@ func defaults() *Config {
 	return &Config{
 		Server: Server{
 			Listen:               ":9001",
+			MaxConnections:       1024,
 			MaxConcurrentStreams: 1024,
 			DrainDelay:           5 * time.Second,
 			ShutdownTimeout:      20 * time.Second,

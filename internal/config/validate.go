@@ -14,8 +14,14 @@ func (c *Config) validate() error {
 		if socket == "" || !printable(socket) {
 			return c.err("server.listen", "expected host:port or unix: followed by a path")
 		}
+		if strings.HasPrefix(socket, "@") {
+			return c.err("server.listen", "abstract Unix sockets are not supported; write a path")
+		}
 	} else if !validListener(s.Listen) {
 		return c.err("server.listen", "expected host:port or unix: followed by a path")
+	}
+	if s.MaxConnections < 1 || s.MaxConnections > MaxConnectionsLimit {
+		return c.err("server.max_connections", "expected an integer from 1 to "+strconv.Itoa(MaxConnectionsLimit))
 	}
 	if s.MaxConcurrentStreams < 1 || int64(s.MaxConcurrentStreams) > math.MaxUint32 {
 		return c.err("server.max_concurrent_streams", "expected an integer from 1 to 4294967295")

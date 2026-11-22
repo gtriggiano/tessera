@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gtriggiano/tessera/internal/app"
 	"github.com/gtriggiano/tessera/internal/config"
 )
 
@@ -33,8 +34,15 @@ type Options struct {
 	LookupEnv config.LookupEnv
 	Build     BuildInfo
 	// Signals delivers the process's shutdown signals. The first cancels the
-	// running command, like a signal-cancelled context. Nil delivers none.
+	// running command, like a signal-cancelled context, except for serve,
+	// which receives them all. Nil delivers none.
 	Signals <-chan os.Signal
+	// Serve runs serve with a valid configuration. Nil uses app.Run.
+	Serve func(*config.Config, app.Options) error
+
+	// logs is Out as the caller gave it, for the log events of serve: a
+	// failed write of an event must not make the command fail.
+	logs io.Writer
 }
 
 // Run executes a new command tree. It returns 0 on success, 2 for usage or
@@ -44,12 +52,17 @@ func Run(ctx context.Context, args []string, opts Options) int {
 	// Ends the signal watcher of a command, if any, when Run returns.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	opts.logs = opts.Out
 	output := &checkedWriter{writer: opts.Out}
 	opts.Out = output
 	opts.Err = &checkedWriter{writer: opts.Err}
 	cmd := newCommand(opts)
 	cmd.SetArgs(args)
 	if err := cmd.ExecuteContext(ctx); err != nil {
+		var logged loggedError
+		if errors.As(err, &logged) {
+			return 1
+		}
 		// Cobra's lookup errors include the argument. Avoid echoing arbitrary
 		// user input, which may contain a mistakenly pasted credential.
 		message := err.Error()
@@ -108,7 +121,7 @@ func newCommand(opts Options) *cobra.Command {
 		},
 	})
 	root.RunE = help
-	root.AddCommand(versionCommand(opts.Build), configCommand(opts.LookupEnv))
+	root.AddCommand(serveCommand(opts), versionCommand(opts.Build), configCommand(opts.LookupEnv))
 	return root
 }
 
@@ -147,6 +160,9 @@ func defaults(opts Options) Options {
 	}
 	if opts.Build.GoVersion == "" {
 		opts.Build.GoVersion = runtime.Version()
+	}
+	if opts.Serve == nil {
+		opts.Serve = app.Run
 	}
 	return opts
 }
@@ -190,6 +206,26 @@ func versionCommand(build BuildInfo) *cobra.Command {
 	return cmd
 }
 
+const configFlagUsage = "configuration file (overrides TESSERA_CONFIG)"
+
+// loadConfig reads the configuration file named by the --config flag of cmd,
+// whose value is flag, when present, or else by TESSERA_CONFIG. It returns
+// the path it read.
+func loadConfig(cmd *cobra.Command, lookup config.LookupEnv, flag string) (string, *config.Config, error) {
+	selected, ok := flag, cmd.Flags().Changed("config")
+	if !ok {
+		selected, ok = lookup("TESSERA_CONFIG")
+	}
+	switch {
+	case !ok:
+		return "", nil, errors.New("no configuration file; use --config or TESSERA_CONFIG")
+	case selected == "":
+		return "", nil, errors.New("configuration file path must not be empty")
+	}
+	cfg, err := config.Load(selected, lookup)
+	return selected, cfg, err
+}
+
 func configCommand(lookup config.LookupEnv) *cobra.Command {
 	var path string
 	parent := &cobra.Command{
@@ -199,19 +235,10 @@ func configCommand(lookup config.LookupEnv) *cobra.Command {
 		Args:  noArgs,
 		RunE:  help,
 	}
-	parent.PersistentFlags().StringVar(&path, "config", "", "configuration file (overrides TESSERA_CONFIG)")
+	parent.PersistentFlags().StringVar(&path, "config", "", configFlagUsage)
 	load := func(cmd *cobra.Command) (*config.Config, error) {
-		selected, ok := path, cmd.Flags().Changed("config")
-		if !ok {
-			selected, ok = lookup("TESSERA_CONFIG")
-		}
-		switch {
-		case !ok:
-			return nil, errors.New("no configuration file; use --config or TESSERA_CONFIG")
-		case selected == "":
-			return nil, errors.New("configuration file path must not be empty")
-		}
-		return config.Load(selected, lookup)
+		_, cfg, err := loadConfig(cmd, lookup, path)
+		return cfg, err
 	}
 	validate := &cobra.Command{
 		Use:   "validate",
@@ -260,6 +287,10 @@ func help(cmd *cobra.Command, _ []string) error {
 }
 
 type runtimeError struct{ error }
+
+// loggedError is a runtime failure that serve has already reported as a log
+// event: Run prints nothing more.
+type loggedError struct{ error }
 
 type checkedWriter struct {
 	writer io.Writer

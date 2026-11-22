@@ -23,13 +23,14 @@ SYFT_DIR := $(TOOLS_DIR)/syft-$(SYFT_VERSION)
 SNAPSHOT_FLAGS ?=
 FUZZ_TIME ?= 10s
 
-.PHONY: help build fmt fmt-check vet test fuzz mod-check check ci vuln workflows-check workflows-audit release-check release-snapshot docs-install docs-audit docs-dev docs-build docs-check docs-preview
+.PHONY: help build fmt fmt-check vet test test-e2e fuzz mod-check check ci vuln workflows-check workflows-audit release-check release-snapshot docs-install docs-audit docs-dev docs-build docs-check docs-preview
 
 help:
 	@echo "make check           Check Go formatting, modules, vet, tests and build"
 	@echo "make ci              Run Go checks, fuzzing, vulnerability scan, workflow lint, docs build and checks"
 	@echo "make build           Build tessera in bin/"
 	@echo "make fmt             Format Go sources"
+	@echo "make test-e2e        Run tessera in Docker with Envoy and a test upstream (needs Docker)"
 	@echo "make fuzz            Run each fuzz target for $(FUZZ_TIME) (none yet)"
 	@echo "make vuln            Scan Go code using pinned govulncheck"
 	@echo "make workflows-check Validate GitHub Actions workflows"
@@ -54,11 +55,18 @@ fmt-check:
 	@git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "make fmt-check: not inside a Git work tree; run gofmt -l on the Go files instead" >&2; exit 1; }
 	@files=$$(git ls-files -z --cached --others --exclude-standard -- '*.go' | xargs -0 "$(GOFMT)" -l) || exit $$?; if [ -n "$$files" ]; then echo "Go files need formatting:"; echo "$$files"; exit 1; fi
 
+# The end-to-end test builds only with the e2e tag: vet compiles it too.
 vet:
 	$(GO) vet ./...
+	$(GO) vet -tags e2e ./internal/e2e
 
 test:
 	$(GO) test -race -count=1 ./...
+
+# Builds an image of tessera from the working tree with the Dockerfile, and
+# runs it in Docker with Envoy and a test upstream (internal/e2e).
+test-e2e:
+	$(GO) test -tags e2e -count=1 -v -timeout 10m ./internal/e2e
 
 # Each fuzz target gets one line, as in:
 #	$(GO) test ./internal/<package> -run='^$$' -fuzz=Fuzz<Name> -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
