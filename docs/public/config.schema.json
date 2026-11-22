@@ -116,6 +116,64 @@
             }
           ],
           "default": "logfmt"
+        },
+        "decisions": {
+          "description": "The decisions that a decision event reports: none; deny, the denials, and the allows in which an audit rule with action deny matched; or all.",
+          "type": "string",
+          "anyOf": [
+            {
+              "enum": [
+                "none",
+                "deny",
+                "all"
+              ]
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ],
+          "default": "deny"
+        }
+      }
+    },
+    "client_ip": {
+      "description": "Where tessera reads the client address of a request: from one source, without falling back on another.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "description": "The source of the client address: peer, the address of the connection to Envoy; header, a header that holds one address; x_forwarded_for, the X-Forwarded-For header, read from the right.",
+          "type": "string",
+          "anyOf": [
+            {
+              "enum": [
+                "peer",
+                "header",
+                "x_forwarded_for"
+              ]
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ],
+          "default": "peer"
+        },
+        "header": {
+          "description": "The header that holds the client address, in any case. Required, and allowed only, when from is header.",
+          "type": "string",
+          "anyOf": [
+            {
+              "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ]
+        },
+        "trusted_hops": {
+          "description": "The number of entries at the right end of X-Forwarded-For that trusted proxies wrote after the client address. Required, and allowed only, when from is x_forwarded_for.",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -127,8 +185,24 @@
         "default_action"
       ],
       "properties": {
+        "mode": {
+          "description": "enforce applies the decisions; audit allows every request, and reports the denials it did not enforce with enforced=false, in the decision event and in tessera_decisions_total.",
+          "type": "string",
+          "anyOf": [
+            {
+              "enum": [
+                "enforce",
+                "audit"
+              ]
+            },
+            {
+              "$ref": "#/$defs/environment"
+            }
+          ],
+          "default": "enforce"
+        },
         "default_action": {
-          "description": "The decision for a request. It has no default, so that every configuration states whether requests are allowed or denied.",
+          "description": "The decision for a request that no rule decides. It has no default, so that every configuration states whether such requests are allowed or denied.",
           "type": "string",
           "anyOf": [
             {
@@ -141,6 +215,126 @@
               "$ref": "#/$defs/environment"
             }
           ]
+        },
+        "deny_response": {
+          "description": "What Envoy answers the client when a request is denied, unless the rule that denies it states otherwise.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "description": "The HTTP status of a denial.",
+              "type": "integer",
+              "minimum": 400,
+              "maximum": 599,
+              "default": 403
+            },
+            "body": {
+              "description": "The body of a denial, at most 8 KiB. Envoy adds content-type: text/plain to a body when the headers have no content-type.",
+              "type": "string",
+              "default": ""
+            },
+            "headers": {
+              "description": "The headers of a denial, by name. A header that Envoy sets itself or that describes the connection, such as content-length, is not allowed.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            }
+          }
+        },
+        "rules": {
+          "description": "The rules, evaluated in order: the first whose condition is true decides. At most 1000.",
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "action"
+            ],
+            "properties": {
+              "name": {
+                "description": "The name of the rule: lowercase letters, digits and hyphens, at most 63 characters, unique. default is reserved.",
+                "type": "string",
+                "anyOf": [
+                  {
+                    "pattern": "^[a-z0-9-]{1,63}$"
+                  },
+                  {
+                    "$ref": "#/$defs/environment"
+                  }
+                ]
+              },
+              "description": {
+                "description": "A description of the rule, at most 1024 bytes.",
+                "type": "string",
+                "default": ""
+              },
+              "action": {
+                "description": "What the rule does with the requests it matches.",
+                "type": "string",
+                "anyOf": [
+                  {
+                    "enum": [
+                      "allow",
+                      "deny"
+                    ]
+                  },
+                  {
+                    "$ref": "#/$defs/environment"
+                  }
+                ]
+              },
+              "mode": {
+                "description": "enforce lets the rule decide; audit never lets it decide: a true condition shows in audit_rules of the decision event and in tessera_audit_matches_total, and tessera goes on to the next rule.",
+                "type": "string",
+                "anyOf": [
+                  {
+                    "enum": [
+                      "enforce",
+                      "audit"
+                    ]
+                  },
+                  {
+                    "$ref": "#/$defs/environment"
+                  }
+                ],
+                "default": "enforce"
+              },
+              "when": {
+                "description": "The condition of the rule, a CEL expression whose result is a bool. Without it, the rule matches every request.",
+                "type": "string",
+                "default": "true"
+              },
+              "response": {
+                "description": "The response of a deny rule: each key it does not write comes from policy.deny_response. Not allowed on an allow rule.",
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "status": {
+                    "description": "The HTTP status of the denial. By default, policy.deny_response.status.",
+                    "type": "integer",
+                    "minimum": 400,
+                    "maximum": 599
+                  },
+                  "body": {
+                    "description": "The body of the denial, at most 8 KiB. By default, policy.deny_response.body.",
+                    "type": "string"
+                  },
+                  "headers": {
+                    "description": "The headers of the denial, which replace policy.deny_response.headers as a whole. By default, policy.deny_response.headers.",
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": []
         }
       }
     }

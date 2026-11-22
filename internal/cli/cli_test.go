@@ -243,3 +243,31 @@ func TestConfigOutputFailuresReturnOne(t *testing.T) {
 		}
 	}
 }
+
+// config validate compiles the conditions of the rules: an unknown attribute
+// or a wrong type stops it with status 2, at its position in the file.
+func TestConfigValidateExpressions(t *testing.T) {
+	const head = "policy:\n  default_action: deny\n  rules:\n    - name: office\n      action: allow\n"
+	for _, tc := range []struct {
+		name, when string
+		code       int
+		err        string
+	}{
+		{"valid", "      when: client.ip.inCidr(\"192.0.2.0/24\") && request.path.startsWith(\"/admin\")\n", 0, ""},
+		{"unknown attribute", "      when: geo.country == \"IT\"\n", 2, "tessera: policy.rules[0].when (line 6, column 13): undeclared reference to 'geo'\n"},
+		{"unknown field", "      when: |\n        has(client.ip) &&\n          request.hots == \"www.example.com\"\n", 2, "tessera: policy.rules[0].when (line 8, column 18): undefined field 'hots'\n"},
+		{"wrong type", "      when: request.host == 443\n", 2, "tessera: policy.rules[0].when (line 6, column 26): found no matching overload for '_==_' applied to '(string, int)'\n"},
+		{"not a bool", "      when: request.path\n", 2, "tessera: policy.rules[0].when (line 6, column 13): the condition must be a bool, not string\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out, errOut := executeWithEnv([]string{"config", "validate", "--config", writeConfig(t, head+tc.when)}, nil)
+			wantOut := ""
+			if tc.code == 0 {
+				wantOut = "configuration valid\n"
+			}
+			if code != tc.code || out != wantOut || errOut != tc.err {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
+			}
+		})
+	}
+}

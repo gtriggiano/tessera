@@ -121,7 +121,7 @@ func newCommand(opts Options) *cobra.Command {
 		},
 	})
 	root.RunE = help
-	root.AddCommand(serveCommand(opts), versionCommand(opts.Build), configCommand(opts.LookupEnv))
+	root.AddCommand(serveCommand(opts), evalCommand(opts.LookupEnv), versionCommand(opts.Build), configCommand(opts.LookupEnv))
 	return root
 }
 

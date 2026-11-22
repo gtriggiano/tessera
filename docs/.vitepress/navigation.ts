@@ -17,17 +17,26 @@ export const sidebar: DefaultTheme.SidebarMulti = {
       text: 'Get started',
       items: [{ text: 'What is tessera?', link: '/guide/what-is-tessera' }],
     },
+    {
+      text: 'Set up',
+      items: [
+        { text: 'Write rules', link: '/guide/write-rules' },
+        { text: 'Client address', link: '/guide/client-address' },
+      ],
+    },
   ],
   '/reference/': [
     {
       text: 'Reference',
       items: [
         { text: 'Configuration', link: '/reference/configuration' },
+        { text: 'Expression language', link: '/reference/expressions' },
         { text: 'CLI', link: '/reference/cli' },
         { text: 'gRPC API', link: '/reference/grpc-api' },
         { text: 'Admin endpoints', link: '/reference/admin-endpoints' },
         { text: 'Metrics', link: '/reference/metrics' },
         { text: 'Logs', link: '/reference/logs' },
+        { text: 'Failure modes', link: '/reference/failure-modes' },
       ],
     },
     {

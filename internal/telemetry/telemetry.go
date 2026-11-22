@@ -6,6 +6,12 @@
 // event. The event names and their attributes are a public interface. The
 // handlers of log/slog quote and escape every value, so a value cannot start
 // a second line.
+//
+// NewLogger writes events as they happen. A Recorder writes the events about
+// decisions without ever making a decision wait for the output: the decision
+// events through a bounded queue, and the reports of dropped events,
+// indeterminate conditions and recovered panics, rate-limited, from its
+// writer goroutine.
 package telemetry
 
 import (

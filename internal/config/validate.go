@@ -54,15 +54,48 @@ func (c *Config) validate() error {
 	default:
 		return c.err("log.format", "expected logfmt or json")
 	}
-	if !c.present("policy.default_action") {
-		return c.err("policy.default_action", "required")
-	}
-	switch c.Policy.DefaultAction {
-	case ActionAllow, ActionDeny:
+	switch c.Log.Decisions {
+	case DecisionsNone, DecisionsDeny, DecisionsAll:
 	default:
-		return c.err("policy.default_action", "expected allow or deny")
+		return c.err("log.decisions", "expected none, deny or all")
+	}
+	if err := c.validateClientIP(); err != nil {
+		return err
+	}
+	return c.validatePolicy()
+}
+
+func (c *Config) validateClientIP() error {
+	from := c.ClientIP.From
+	switch from {
+	case ClientIPPeer, ClientIPHeader, ClientIPXForwardedFor:
+	default:
+		return c.err("client_ip.from", "expected peer, header or x_forwarded_for")
+	}
+	switch {
+	case from == ClientIPHeader && !c.present("client_ip.header"):
+		return c.err("client_ip.header", "required when client_ip.from is header")
+	case from == ClientIPHeader && !headerName(c.ClientIP.Header):
+		return c.err("client_ip.header", "expected a header name")
+	case from != ClientIPHeader && c.present("client_ip.header"):
+		return c.err("client_ip.header", "allowed only when client_ip.from is header")
+	}
+	switch {
+	case from == ClientIPXForwardedFor && !c.present("client_ip.trusted_hops"):
+		return c.err("client_ip.trusted_hops", "required when client_ip.from is x_forwarded_for")
+	case from == ClientIPXForwardedFor && c.ClientIP.TrustedHops < 0:
+		return c.err("client_ip.trusted_hops", "must not be negative")
+	case from != ClientIPXForwardedFor && c.present("client_ip.trusted_hops"):
+		return c.err("client_ip.trusted_hops", "allowed only when client_ip.from is x_forwarded_for")
 	}
 	return nil
+}
+
+// headerName reports whether s is a field name of HTTP: a token of RFC 9110.
+func headerName(s string) bool {
+	return s != "" && !strings.ContainsFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", r))
+	})
 }
 
 // printable reports whether s has no control characters.

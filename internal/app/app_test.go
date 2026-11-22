@@ -5,18 +5,24 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -89,7 +95,12 @@ func launch(t *testing.T, yaml string, opts Options) *harness {
 		t.Fatal(err)
 	}
 	h := &harness{t: t, path: path, logs: &syncBuffer{}, signals: make(chan os.Signal, 4), done: make(chan error, 1), bound: map[string]net.Listener{}}
-	opts.Logs, opts.Signals, opts.Build, opts.ConfigPath, opts.Listen = h.logs, h.signals, testBuild, path, h.listen
+	var logs io.Writer = h.logs
+	if g, ok := opts.Logs.(*gate); ok {
+		g.dest = h.logs
+		logs = g
+	}
+	opts.Logs, opts.Signals, opts.Build, opts.ConfigPath, opts.Listen = logs, h.signals, testBuild, path, h.listen
 	go func() { h.done <- Run(cfg, opts) }()
 	t.Cleanup(func() {
 		select {
@@ -286,7 +297,20 @@ func TestServe(t *testing.T) {
 			if err := h.stop(); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			wantEvents(t, h.events(), []string{
+			// With the default log.decisions, deny, a denial has its event.
+			var decisions []string
+			events := slices.DeleteFunc(h.events(), func(e string) bool {
+				if strings.Contains(e, " msg=decision ") {
+					decisions = append(decisions, e[:strings.Index(e, " duration_ms=")])
+					return true
+				}
+				return false
+			})
+			wantDecisions := map[string][]string{"allow": nil, "deny": {`level=warn msg=decision request_id="" host="" method="" path="" client_ip="" action=deny enforced=true rule=default reason=default`}}[tc.defaultAction]
+			if !slices.Equal(decisions, wantDecisions) {
+				t.Fatalf("decision events %q, want %q", decisions, wantDecisions)
+			}
+			wantEvents(t, events, []string{
 				`level=info msg=starting version=1.2.3 revision=abc123 config_path=` + h.path,
 				`level=info msg=listening listener=grpc address=` + grpcAddress,
 				`level=info msg=listening listener=admin address=` + adminAddress,
@@ -711,5 +735,415 @@ func TestMaxConnections(t *testing.T) {
 	}
 	if err := h.stop(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// clientAddresses records the client address of each request it decides.
+type clientAddresses struct {
+	mu   sync.Mutex
+	seen []netip.Addr
+}
+
+func (c *clientAddresses) Decide(r *request.Request) engine.Decision {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen = append(c.seen, r.ClientIP)
+	return engine.Decision{Action: engine.Allow}
+}
+
+// serve reads the client address from the source that client_ip declares.
+func TestClientIPSource(t *testing.T) {
+	req := &authv3.CheckRequest{Attributes: &authv3.AttributeContext{
+		Source: &authv3.AttributeContext_Peer{Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{Address: "2001:db8::5"},
+		}}},
+		Request: &authv3.AttributeContext_Request{Http: &authv3.AttributeContext_HttpRequest{Headers: map[string]string{
+			"x-forwarded-for":          "192.0.2.66, 203.0.113.10, 2001:db8::5",
+			"x-envoy-external-address": "198.51.100.7",
+		}}},
+	}}
+	for _, tc := range []struct{ clientIP, want string }{
+		{"", "2001:db8::5"},
+		{"client_ip:\n  from: header\n  header: x-envoy-external-address\n", "198.51.100.7"},
+		{"client_ip:\n  from: x_forwarded_for\n  trusted_hops: 1\n", "203.0.113.10"},
+	} {
+		decider := &clientAddresses{}
+		h := launch(t, baseConfig("deny", "  drain_delay: 0s\n")+tc.clientIP, Options{decider: decider})
+		grpcAddress, _ := h.addresses()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err := authv3.NewAuthorizationClient(dialGRPC(t, grpcAddress)).Check(ctx, req)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.stop(); err != nil {
+			t.Fatal(err)
+		}
+		decider.mu.Lock()
+		if len(decider.seen) != 1 || decider.seen[0] != netip.MustParseAddr(tc.want) {
+			t.Errorf("%q: client addresses %v, want %s", tc.clientIP, decider.seen, tc.want)
+		}
+		decider.mu.Unlock()
+	}
+}
+
+// serve decides with the rules of the configuration, and sends the response
+// of a denial; a policy in audit mode allows every request.
+func TestServeDecidesWithTheRules(t *testing.T) {
+	const policy = `
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 1
+policy:
+  mode: %s
+  default_action: deny
+  deny_response:
+    body: Forbidden.
+  rules:
+    - name: blocked
+      action: deny
+      when: client.ip.inCidr("198.51.100.0/24")
+      response:
+        status: 451
+        headers:
+          Cache-Control: no-store
+    - name: office
+      action: allow
+      when: client.ip.inCidr("192.0.2.0/24") && request.path.startsWith("/admin")
+`
+	checkFrom := func(conn *grpc.ClientConn, xff, path string) *authv3.CheckResponse {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := authv3.NewAuthorizationClient(conn).Check(ctx, &authv3.CheckRequest{Attributes: &authv3.AttributeContext{
+			Request: &authv3.AttributeContext_Request{Http: &authv3.AttributeContext_HttpRequest{
+				Host: "www.example.com", Path: path, Headers: map[string]string{"x-forwarded-for": xff},
+			}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	for _, tc := range []struct {
+		mode, xff, path string
+		code            codes.Code
+		status          int32
+		body            string
+		headers         int
+	}{
+		{"enforce", "192.0.2.10, 2001:db8::5", "/admin/users", codes.OK, 0, "", 0},
+		{"enforce", "198.51.100.7, 2001:db8::5", "/admin/users", codes.PermissionDenied, 451, "Forbidden.", 1},
+		{"enforce", "203.0.113.9, 2001:db8::5", "/", codes.PermissionDenied, 403, "Forbidden.", 0},
+		// Without a client address, the deny rule denies.
+		{"enforce", "2001:db8::5", "/admin/users", codes.PermissionDenied, 451, "Forbidden.", 1},
+		{"audit", "198.51.100.7, 2001:db8::5", "/admin/users", codes.OK, 0, "", 0},
+		{"audit", "203.0.113.9, 2001:db8::5", "/", codes.OK, 0, "", 0},
+	} {
+		h := launch(t, "server:\n  listen: "+grpcPlaceholder+"\n  drain_delay: 0s\nadmin:\n  listen: "+adminPlaceholder+"\n"+fmt.Sprintf(policy, tc.mode), Options{})
+		grpcAddress, _ := h.addresses()
+		resp := checkFrom(dialGRPC(t, grpcAddress), tc.xff, tc.path)
+		denied := resp.GetDeniedResponse()
+		if codes.Code(resp.GetStatus().GetCode()) != tc.code || int32(denied.GetStatus().GetCode()) != tc.status || denied.GetBody() != tc.body || len(denied.GetHeaders()) != tc.headers {
+			t.Errorf("%s, %s %s: %v", tc.mode, tc.xff, tc.path, resp)
+		}
+		if tc.headers == 1 && (denied.GetHeaders()[0].GetHeader().GetKey() != "cache-control" || denied.GetHeaders()[0].GetHeader().GetValue() != "no-store") {
+			t.Errorf("%s, %s %s: headers %v", tc.mode, tc.xff, tc.path, denied.GetHeaders())
+		}
+		if err := h.stop(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// gate passes the events to dest, the logs of the harness, until it is shut:
+// then every write waits until it opens again.
+type gate struct {
+	dest   io.Writer
+	mu     sync.Mutex
+	shut   bool
+	opened chan struct{}
+}
+
+func (g *gate) close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.shut, g.opened = true, make(chan struct{})
+}
+
+func (g *gate) open() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.shut {
+		g.shut = false
+		close(g.opened)
+	}
+}
+
+func (g *gate) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	shut, opened := g.shut, g.opened
+	g.mu.Unlock()
+	if shut {
+		<-opened
+	}
+	return g.dest.Write(p)
+}
+
+// checkMany sends n Check calls from 16 goroutines, the i-th with the host,
+// path and X-Forwarded-For of request(i), and fails when one fails.
+func checkMany(t *testing.T, conn *grpc.ClientConn, n int, request func(i int) (host, path, xff string)) {
+	t.Helper()
+	client := authv3.NewAuthorizationClient(conn)
+	var wg sync.WaitGroup
+	var failures atomic.Int32
+	for w := range 16 {
+		wg.Go(func() {
+			for i := w; i < n; i += 16 {
+				host, path, xff := request(i)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, err := client.Check(ctx, &authv3.CheckRequest{Attributes: &authv3.AttributeContext{
+					Request: &authv3.AttributeContext_Request{Http: &authv3.AttributeContext_HttpRequest{
+						Method: "GET", Host: host, Path: path, Headers: map[string]string{"x-forwarded-for": xff},
+					}},
+				}})
+				cancel()
+				if err != nil {
+					failures.Add(1)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if f := failures.Load(); f != 0 {
+		t.Fatalf("%d calls of %d failed", f, n)
+	}
+}
+
+const rulesConfig = `
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 0
+log:
+  decisions: all
+policy:
+  default_action: deny
+  rules:
+    - name: blocked
+      action: deny
+      when: client.ip.inCidr("198.51.100.0/24")
+    - name: watch
+      action: deny
+      mode: audit
+      when: request.path.contains("/admin")
+    - name: office
+      action: allow
+      when: client.ip.inCidr("192.0.2.0/24")
+`
+
+func scrapeSeries(t *testing.T, adminAddress string) []string {
+	t.Helper()
+	code, body := get(t, "http://"+adminAddress+"/metrics")
+	if code != 200 {
+		t.Fatalf("/metrics: %d", code)
+	}
+	var out []string
+	for line := range strings.Lines(body) {
+		if strings.HasPrefix(line, "tessera_") {
+			out = append(out, line[:strings.LastIndexByte(line, ' ')])
+		}
+	}
+	return out
+}
+
+// A thousand different hosts, paths and client addresses create no series.
+func TestRequestsCreateNoSeries(t *testing.T) {
+	h := launch(t, "server:\n  listen: "+grpcPlaceholder+"\n  drain_delay: 0s\nadmin:\n  listen: "+adminPlaceholder+"\n"+rulesConfig, Options{})
+	grpcAddress, adminAddress := h.addresses()
+	before := scrapeSeries(t, adminAddress)
+	checkMany(t, dialGRPC(t, grpcAddress), 1000, func(i int) (string, string, string) {
+		return fmt.Sprintf("host-%d.example.com", i), fmt.Sprintf("/admin/%d", i), []string{"198.51.100.", "192.0.2.", "203.0.113."}[i%3] + strconv.Itoa(i%250+1)
+	})
+	after := scrapeSeries(t, adminAddress)
+	if !slices.Equal(before, after) {
+		t.Fatalf("series before:\n%s\nafter:\n%s", strings.Join(before, "\n"), strings.Join(after, "\n"))
+	}
+	_, body := get(t, "http://"+adminAddress+"/metrics")
+	for _, line := range []string{
+		`tessera_decisions_total{action="deny",enforced="true",reason="rule",rule="blocked"} 334`,
+		`tessera_decisions_total{action="allow",enforced="true",reason="rule",rule="office"} 333`,
+		`tessera_decisions_total{action="deny",enforced="true",reason="default",rule="default"} 333`,
+		`tessera_audit_matches_total{rule="watch"} 666`,
+		`tessera_decision_duration_seconds_count{action="deny"} 667`,
+		`tessera_policy_audit_mode 0`,
+	} {
+		if !strings.Contains(body, "\n"+line+"\n") {
+			t.Errorf("/metrics has no line %s", line)
+		}
+	}
+	if err := h.stop(); err != nil {
+		t.Fatal(err)
+	}
+	// Every decision has its event, written before the shutdown completes.
+	events := h.events()
+	if n := strings.Count(strings.Join(events, "\n"), " msg=decision "); n != 1000 {
+		t.Fatalf("%d decision events, want 1000", n)
+	}
+	if last := events[len(events)-1]; last != "level=info msg=shutdown_complete outcome=drained" {
+		t.Fatalf("last event %q", last)
+	}
+}
+
+// A standard output that blocks never blocks a decision: the decision events
+// that do not fit the queue are dropped and counted.
+func TestBlockedOutputDoesNotBlockChecks(t *testing.T) {
+	g := &gate{}
+	h := launch(t, "server:\n  listen: "+grpcPlaceholder+"\n  drain_delay: 0s\nadmin:\n  listen: "+adminPlaceholder+"\n"+rulesConfig, Options{Logs: g})
+	grpcAddress, adminAddress := h.addresses()
+	g.close()
+	start := time.Now()
+	checkMany(t, dialGRPC(t, grpcAddress), 5000, func(i int) (string, string, string) {
+		return "www.example.com", "/", "192.0.2.10"
+	})
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("5000 calls took %v with the output blocked", elapsed)
+	}
+	_, body := get(t, "http://"+adminAddress+"/metrics")
+	m := regexp.MustCompile(`\ntessera_decision_logs_dropped_total (\d+)\n`).FindStringSubmatch(body)
+	if m == nil || m[1] == "0" {
+		t.Fatalf("no drops counted: %v", m)
+	}
+	g.open()
+	if err := h.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(h.logs.String(), " msg=decision_logs_dropped dropped=") {
+		t.Fatal("no decision_logs_dropped event")
+	}
+}
+
+// An indeterminate condition is reported by evaluation_error.
+func TestEvaluationErrorEvent(t *testing.T) {
+	h := launch(t, "server:\n  listen: "+grpcPlaceholder+"\n  drain_delay: 0s\nadmin:\n  listen: "+adminPlaceholder+"\n"+strings.Replace(rulesConfig, "trusted_hops: 0", "trusted_hops: 1", 1), Options{})
+	grpcAddress, adminAddress := h.addresses()
+	checkMany(t, dialGRPC(t, grpcAddress), 3, func(int) (string, string, string) { return "www.example.com", "/", "192.0.2.10" })
+	h.waitFor("evaluation_error")
+	if _, body := get(t, "http://"+adminAddress+"/metrics"); !strings.Contains(body, "\n"+`tessera_rule_evaluation_errors_total{cause="client_ip_missing",rule="blocked"} 3`+"\n") {
+		t.Error("tessera_rule_evaluation_errors_total does not count the 3 conditions")
+	}
+	if err := h.stop(); err != nil {
+		t.Fatal(err)
+	}
+	logs := h.logs.String()
+	if want := " level=warn msg=decision request_id=\"\" host=www.example.com method=GET path=/ client_ip=\"\" action=deny enforced=true rule=blocked reason=error error=client_ip_missing duration_ms="; strings.Count(logs, want) != 3 {
+		t.Errorf("not 3 events %q in:\n%s", want, logs)
+	}
+	// The first condition is reported at once, the others with the next
+	// report, at the latest when the output closes.
+	total := 0
+	for _, m := range regexp.MustCompile(` level=warn msg=evaluation_error rule=blocked cause=client_ip_missing count=(\d+)\n`).FindAllStringSubmatch(logs, -1) {
+		n, _ := strconv.Atoi(m[1])
+		total += n
+	}
+	if total != 3 {
+		t.Errorf("evaluation_error events count %d conditions, want 3:\n%s", total, logs)
+	}
+}
+
+// flushConfig logs every decision, and drains for a second, during which the
+// tests queue decision events.
+func flushConfig(shutdownTimeout string) string {
+	return "server:\n  listen: " + grpcPlaceholder + "\n  drain_delay: 1s\n  shutdown_timeout: " + shutdownTimeout + "\nadmin:\n  listen: " + adminPlaceholder + "\n" + rulesConfig
+}
+
+// queueBehindABlockedOutput starts a shutdown, shuts the gate once it is
+// draining, and queues decision events behind the blocked output.
+func queueBehindABlockedOutput(t *testing.T, h *harness, g *gate) int {
+	t.Helper()
+	grpcAddress, _ := h.addresses()
+	conn := dialGRPC(t, grpcAddress)
+	h.signals <- syscall.SIGTERM
+	h.waitFor("not_ready")
+	g.close()
+	const n = 200
+	checkMany(t, conn, n, func(int) (string, string, string) { return "www.example.com", "/", "192.0.2.10" })
+	return n
+}
+
+// lastEvents checks that shutdown_complete is the last event, with want, and
+// that it follows fewer decision events than were decided.
+func lastEvents(t *testing.T, h *harness, decided int, want string) {
+	t.Helper()
+	events := h.events()
+	if last := events[len(events)-1]; last != want {
+		t.Fatalf("last event %q, want %q", last, want)
+	}
+	if n := strings.Count(strings.Join(events, "\n"), " msg=decision "); n >= decided {
+		t.Fatalf("%d decision events written of %d: none was dropped", n, decided)
+	}
+}
+
+// Another signal while the queued decision events are written forces the
+// shutdown: the events left are dropped, and shutdown_complete stays the last
+// event.
+func TestSignalDuringTheFlush(t *testing.T) {
+	g := &gate{}
+	signals := make(chan chan os.Signal, 1)
+	h := launch(t, flushConfig("20s"), Options{Logs: g, flushing: func() {
+		s := <-signals
+		s <- syscall.SIGTERM
+		time.AfterFunc(300*time.Millisecond, g.open)
+	}})
+	signals <- h.signals
+	decided := queueBehindABlockedOutput(t, h, g)
+	if err := h.result(); err == nil || !strings.Contains(err.Error(), "forced by signal") {
+		t.Fatalf("Run: %v", err)
+	}
+	lastEvents(t, h, decided, "level=warn msg=shutdown_complete outcome=forced forced_by=signal")
+}
+
+// A flush that outlasts server.shutdown_timeout forces the shutdown too.
+func TestFlushTimeout(t *testing.T) {
+	g := &gate{}
+	h := launch(t, flushConfig("300ms"), Options{Logs: g, flushing: func() {
+		time.AfterFunc(time.Second, g.open)
+	}})
+	decided := queueBehindABlockedOutput(t, h, g)
+	start := time.Now()
+	if err := h.result(); err == nil || !strings.Contains(err.Error(), "forced by timeout") {
+		t.Fatalf("Run: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the shutdown took %v", elapsed)
+	}
+	lastEvents(t, h, decided, "level=warn msg=shutdown_complete outcome=forced forced_by=timeout")
+}
+
+// failing panics when it decides.
+type failing struct{}
+
+func (failing) Decide(*request.Request) engine.Decision {
+	var headers map[string]string
+	headers["x"] = "y"
+	return engine.Decision{}
+}
+
+// A failure while serve handles a call fails the call, which Envoy treats as
+// a failed call, and serve reports it and goes on.
+func TestPanicOutsideAConditionFailsTheCall(t *testing.T) {
+	h := launch(t, baseConfig("allow", "  drain_delay: 0s\n"), Options{decider: failing{}})
+	grpcAddress, adminAddress := h.addresses()
+	if _, err := check(dialGRPC(t, grpcAddress)); status.Code(err) != codes.Internal {
+		t.Fatalf("Check: %v, want INTERNAL", err)
+	}
+	h.waitFor("panic_recovered")
+	if _, body := get(t, "http://"+adminAddress+"/metrics"); !strings.Contains(body, "\n"+`tessera_decisions_total{action="allow",enforced="true",reason="default",rule="default"} 0`+"\n") {
+		t.Error("a failed call is counted as a decision")
+	}
+	if err := h.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(` level=error msg=panic_recovered rule="" count=1 error="assignment to entry in nil map" stack="goroutine `).MatchString(h.logs.String()) {
+		t.Fatalf("logs:\n%s", h.logs.String())
 	}
 }

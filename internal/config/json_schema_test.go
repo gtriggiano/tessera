@@ -44,16 +44,30 @@ const (
 	jsonSchemaDurationPattern = `^[+-]?(([0-9]+(\.[0-9]*)?|\.[0-9]+)(ns|us|µs|μs|ms|s|m|h))+$`
 	jsonSchemaPortPattern     = `^.*:[1-9][0-9]{0,4}$`
 	jsonSchemaListenPattern   = `^(unix:.+|.*:[1-9][0-9]{0,4})$`
+	jsonSchemaHeaderPattern   = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+	jsonSchemaRuleNamePattern = "^[a-z0-9-]{1,63}$"
 )
 
 // jsonSchemaNote is what the types and defaults do not say about a key.
 type jsonSchemaNote struct {
 	doc      string
 	required bool // in its mapping
-	enum     []string
-	min, max int // of an integer; 0 leaves the bound out
-	pattern  string
+	// requiredWhen is the value of another key that makes this key
+	// required. The schema states neither this rule, which involves two
+	// keys, nor a default.
+	requiredWhen condition
+	enum         []string
+	min, max     int  // of an integer; 0 leaves the bound out
+	nonNegative  bool // of an integer: a minimum of 0, which min cannot state
+	maxItems     int  // of a list; 0 leaves the bound out
+	pattern      string
+	// inherited is the key whose value this key takes when the file does not
+	// write it. The schema states no default for it.
+	inherited string
 }
+
+// condition is a key that has a value.
+type condition struct{ path, value string }
 
 var jsonSchemaNotes = map[string]jsonSchemaNote{
 	"server":                        {doc: "The gRPC listener for Envoy."},
@@ -67,12 +81,33 @@ var jsonSchemaNotes = map[string]jsonSchemaNote{
 	"admin":        {doc: "The listener of the health checks and the metrics."},
 	"admin.listen": {doc: "The address of the admin listener, as host:port. It must not share its address and port with server.listen.", pattern: jsonSchemaPortPattern},
 
-	"log":        {doc: "The log events, written to standard output."},
-	"log.level":  {doc: "The lowest level of the events that are written.", enum: []string{LevelDebug, LevelInfo, LevelWarn, LevelError}},
-	"log.format": {doc: "The format of the events: one line of key=value pairs, or one JSON object per line.", enum: []string{FormatLogfmt, FormatJSON}},
+	"log":           {doc: "The log events, written to standard output."},
+	"log.level":     {doc: "The lowest level of the events that are written.", enum: []string{LevelDebug, LevelInfo, LevelWarn, LevelError}},
+	"log.format":    {doc: "The format of the events: one line of key=value pairs, or one JSON object per line.", enum: []string{FormatLogfmt, FormatJSON}},
+	"log.decisions": {doc: "The decisions that a decision event reports: none; deny, the denials, and the allows in which an audit rule with action deny matched; or all.", enum: []string{DecisionsNone, DecisionsDeny, DecisionsAll}},
 
-	"policy":                {doc: "How tessera decides.", required: true},
-	"policy.default_action": {doc: "The decision for a request. It has no default, so that every configuration states whether requests are allowed or denied.", required: true, enum: []string{ActionAllow, ActionDeny}},
+	"client_ip":              {doc: "Where tessera reads the client address of a request: from one source, without falling back on another."},
+	"client_ip.from":         {doc: "The source of the client address: peer, the address of the connection to Envoy; header, a header that holds one address; x_forwarded_for, the X-Forwarded-For header, read from the right.", enum: []string{ClientIPPeer, ClientIPHeader, ClientIPXForwardedFor}},
+	"client_ip.header":       {doc: "The header that holds the client address, in any case. Required, and allowed only, when from is header.", requiredWhen: condition{"client_ip.from", ClientIPHeader}, pattern: jsonSchemaHeaderPattern},
+	"client_ip.trusted_hops": {doc: "The number of entries at the right end of X-Forwarded-For that trusted proxies wrote after the client address. Required, and allowed only, when from is x_forwarded_for.", requiredWhen: condition{"client_ip.from", ClientIPXForwardedFor}, nonNegative: true},
+
+	"policy":                          {doc: "How tessera decides.", required: true},
+	"policy.mode":                     {doc: "enforce applies the decisions; audit allows every request, and reports the denials it did not enforce with enforced=false, in the decision event and in tessera_decisions_total.", enum: []string{ModeEnforce, ModeAudit}},
+	"policy.default_action":           {doc: "The decision for a request that no rule decides. It has no default, so that every configuration states whether such requests are allowed or denied.", required: true, enum: []string{ActionAllow, ActionDeny}},
+	"policy.deny_response":            {doc: "What Envoy answers the client when a request is denied, unless the rule that denies it states otherwise."},
+	"policy.deny_response.status":     {doc: "The HTTP status of a denial.", min: 400, max: 599},
+	"policy.deny_response.body":       {doc: "The body of a denial, at most 8 KiB. Envoy adds content-type: text/plain to a body when the headers have no content-type."},
+	"policy.deny_response.headers":    {doc: "The headers of a denial, by name. A header that Envoy sets itself or that describes the connection, such as content-length, is not allowed."},
+	"policy.rules":                    {doc: "The rules, evaluated in order: the first whose condition is true decides. At most 1000.", maxItems: MaxRules},
+	"policy.rules[].name":             {doc: "The name of the rule: lowercase letters, digits and hyphens, at most 63 characters, unique. default is reserved.", required: true, pattern: jsonSchemaRuleNamePattern},
+	"policy.rules[].description":      {doc: "A description of the rule, at most 1024 bytes."},
+	"policy.rules[].when":             {doc: "The condition of the rule, a CEL expression whose result is a bool. Without it, the rule matches every request."},
+	"policy.rules[].action":           {doc: "What the rule does with the requests it matches.", required: true, enum: []string{ActionAllow, ActionDeny}},
+	"policy.rules[].mode":             {doc: "enforce lets the rule decide; audit never lets it decide: a true condition shows in audit_rules of the decision event and in tessera_audit_matches_total, and tessera goes on to the next rule.", enum: []string{ModeEnforce, ModeAudit}},
+	"policy.rules[].response":         {doc: "The response of a deny rule: each key it does not write comes from policy.deny_response. Not allowed on an allow rule."},
+	"policy.rules[].response.status":  {doc: "The HTTP status of the denial. By default, policy.deny_response.status.", min: 400, max: 599, inherited: "policy.deny_response.status"},
+	"policy.rules[].response.body":    {doc: "The body of the denial, at most 8 KiB. By default, policy.deny_response.body.", inherited: "policy.deny_response.body"},
+	"policy.rules[].response.headers": {doc: "The headers of the denial, which replace policy.deny_response.headers as a whole. By default, policy.deny_response.headers.", inherited: "policy.deny_response.headers"},
 }
 
 // jsonObject is a JSON object that keeps the order of its members.
@@ -199,6 +234,15 @@ func (b *jsonSchemaBuilder) mapping(t reflect.Type, prefix string, v reflect.Val
 	return append(out, jsonMember{"properties", properties})
 }
 
+// listItem returns a new item of a list of t, with its defaults.
+func listItem(t reflect.Type) reflect.Value {
+	item := reflect.New(t)
+	if d, ok := item.Interface().(defaulter); ok {
+		d.setDefaults()
+	}
+	return item.Elem()
+}
+
 // field returns the schema of one key, whose default is v.
 func (b *jsonSchemaBuilder) field(t reflect.Type, path string, note jsonSchemaNote, v reflect.Value) jsonObject {
 	out := jsonObject{{"description", note.doc}}
@@ -207,11 +251,21 @@ func (b *jsonSchemaBuilder) field(t reflect.Type, path string, note jsonSchemaNo
 		out = append(out, jsonMember{"$ref", "#/$defs/duration"})
 	case t.Kind() == reflect.Struct:
 		return append(out, b.mapping(t, path, v)...)
+	case t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Struct:
+		out = append(out, jsonMember{"type", "array"})
+		if note.maxItems > 0 {
+			out = append(out, jsonMember{"maxItems", note.maxItems})
+		}
+		out = append(out, jsonMember{"items", b.mapping(t.Elem(), path+"[]", listItem(t.Elem()))})
+	case t.Kind() == reflect.Map && t.Elem().Kind() == reflect.String:
+		out = append(out, jsonMember{"type", "object"}, jsonMember{"additionalProperties", jsonObject{{"type", "string"}}})
 	case t.Kind() == reflect.String:
 		out = append(out, jsonSchemaString(note.enum, note.pattern)...)
 	case t.Kind() == reflect.Int:
 		out = append(out, jsonMember{"type", "integer"})
-		if note.min != 0 {
+		if note.nonNegative {
+			out = append(out, jsonMember{"minimum", 0})
+		} else if note.min != 0 {
 			out = append(out, jsonMember{"minimum", note.min})
 		}
 		if note.max != 0 {
@@ -220,7 +274,7 @@ func (b *jsonSchemaBuilder) field(t reflect.Type, path string, note jsonSchemaNo
 	default:
 		b.t.Fatalf("%s: no JSON Schema for the Go type %s", path, t)
 	}
-	if note.required {
+	if note.required || note.requiredWhen != (condition{}) || note.inherited != "" {
 		return out
 	}
 	return append(out, jsonMember{"default", jsonSchemaLiteral(b.t, path, v)})
@@ -262,6 +316,18 @@ func jsonSchemaLiteral(t *testing.T, path string, v reflect.Value) any {
 		return x.String()
 	case string, int:
 		return x
+	case Expression:
+		return string(x)
+	}
+	switch v.Kind() {
+	case reflect.Slice:
+		if v.Len() == 0 {
+			return []any{}
+		}
+	case reflect.Map:
+		if v.Len() == 0 {
+			return jsonObject{}
+		}
 	}
 	t.Fatalf("%s: no JSON literal for a default of type %s", path, v.Type())
 	return nil
@@ -366,6 +432,8 @@ func jsonSchemaProblems(t *testing.T, root, schema map[string]any, value any, pa
 				_, ok = value.(string)
 			case "integer":
 				_, ok = value.(int)
+			case "array":
+				_, ok = value.([]any)
 			default:
 				t.Fatalf("the test validator does not know the type %v", rule)
 			}
@@ -413,15 +481,32 @@ func jsonSchemaProblems(t *testing.T, root, schema map[string]any, value any, pa
 				}
 			}
 		case "additionalProperties":
-			if rule != false {
-				t.Fatalf("the test validator knows only additionalProperties: false")
-			}
 			if m, ok := value.(map[string]any); ok {
 				known, _ := schema["properties"].(map[string]any)
-				for name := range m {
-					if _, declared := known[name]; !declared {
-						report("unknown key %s", name)
+				for name, item := range m {
+					if _, declared := known[name]; declared {
+						continue
 					}
+					switch rule := rule.(type) {
+					case bool:
+						if !rule {
+							report("unknown key %s", name)
+						}
+					case map[string]any:
+						problems = append(problems, jsonSchemaProblems(t, root, rule, item, childPath(path, name))...)
+					default:
+						t.Fatalf("the test validator does not know additionalProperties: %v", rule)
+					}
+				}
+			}
+		case "maxItems":
+			if items, ok := value.([]any); ok && float64(len(items)) > rule.(float64) {
+				report("more than %v items", rule)
+			}
+		case "items":
+			if items, ok := value.([]any); ok {
+				for i, item := range items {
+					problems = append(problems, jsonSchemaProblems(t, root, rule.(map[string]any), item, itemPath(path, i))...)
 				}
 			}
 		default:
@@ -465,7 +550,7 @@ func TestJSONSchemaAcceptsValidConfigurations(t *testing.T) {
 			t.Errorf("%s: tessera accepts it, the schema does not: %s", where, problem)
 		}
 	}
-	environment := map[string]string{"LISTEN": ":9101", "ADMIN": "127.0.0.1:9102", "AGE": "30m", "LEVEL": "warn", "ACTION": "allow"}
+	environment := map[string]string{"LISTEN": ":9101", "ADMIN": "127.0.0.1:9102", "AGE": "30m", "LEVEL": "warn", "ACTION": "allow", "SOURCE": "header", "HEADER": "x-client-address"}
 	for name, text := range map[string]string{
 		"required keys only": "policy:\n  default_action: deny\n",
 		"every key": `
@@ -480,8 +565,37 @@ admin:
 log:
   level: debug
   format: json
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 0
 policy:
+  mode: audit
   default_action: allow
+  deny_response:
+    status: 451
+    body: Not available.
+    headers:
+      Content-Type: text/plain; charset=utf-8
+  rules:
+    - name: admin
+      description: The admin pages, from the office only.
+      action: deny
+      mode: enforce
+      when: request.path.startsWith("/admin") && !client.ip.inCidr("192.0.2.0/24")
+      response:
+        status: 404
+        body: ""
+        headers: {}
+    - name: everyone
+      action: allow
+      mode: audit
+`,
+		"client address from a header": `
+client_ip:
+  from: header
+  header: X-Envoy-External-Address
+policy:
+  default_action: deny
 `,
 		"values from the environment": `
 server:
@@ -493,6 +607,9 @@ admin:
 log:
   level: ${LEVEL}
   format: ${FORMAT:-json}
+client_ip:
+  from: ${SOURCE}
+  header: ${HEADER}
 policy:
   default_action: ${ACTION}
 `,
@@ -525,21 +642,34 @@ policy:
 func TestJSONSchemaRejectsInvalidConfigurations(t *testing.T) {
 	schema := loadJSONSchema(t)
 	for name, text := range map[string]string{
-		"missing policy":         "log:\n  level: info\n",
-		"missing default action": "policy: {}\n",
-		"unknown top-level key":  "policy: {default_action: deny}\nsets: {}\n",
-		"unknown key":            "policy: {default_action: deny}\nserver:\n  lisen: :9001\n",
-		"unknown value":          "policy: {default_action: maybe}\n",
-		"unknown log level":      "policy: {default_action: deny}\nlog: {level: trace}\n",
-		"number for a duration":  "policy: {default_action: deny}\nserver: {drain_delay: 5}\n",
-		"duration without unit":  "policy: {default_action: deny}\nserver: {drain_delay: \"5\"}\n",
-		"duration in days":       "policy: {default_action: deny}\nserver: {drain_delay: 1d}\n",
-		"string for an integer":  "policy: {default_action: deny}\nserver: {max_concurrent_streams: \"16\"}\n",
-		"integer below bound":    "policy: {default_action: deny}\nserver: {max_concurrent_streams: 0}\n",
-		"integer above bound":    "policy: {default_action: deny}\nserver: {max_concurrent_streams: 4294967296}\n",
-		"listen without port":    "policy: {default_action: deny}\nserver: {listen: localhost}\n",
-		"admin on a socket":      "policy: {default_action: deny}\nadmin: {listen: \"unix:/run/admin.sock\"}\n",
-		"scalar for a mapping":   "policy: deny\n",
+		"missing policy":            "log:\n  level: info\n",
+		"missing default action":    "policy: {}\n",
+		"unknown top-level key":     "policy: {default_action: deny}\nsets: {}\n",
+		"unknown key":               "policy: {default_action: deny}\nserver:\n  lisen: :9001\n",
+		"unknown value":             "policy: {default_action: maybe}\n",
+		"unknown log level":         "policy: {default_action: deny}\nlog: {level: trace}\n",
+		"number for a duration":     "policy: {default_action: deny}\nserver: {drain_delay: 5}\n",
+		"duration without unit":     "policy: {default_action: deny}\nserver: {drain_delay: \"5\"}\n",
+		"duration in days":          "policy: {default_action: deny}\nserver: {drain_delay: 1d}\n",
+		"string for an integer":     "policy: {default_action: deny}\nserver: {max_concurrent_streams: \"16\"}\n",
+		"integer below bound":       "policy: {default_action: deny}\nserver: {max_concurrent_streams: 0}\n",
+		"integer above bound":       "policy: {default_action: deny}\nserver: {max_concurrent_streams: 4294967296}\n",
+		"listen without port":       "policy: {default_action: deny}\nserver: {listen: localhost}\n",
+		"admin on a socket":         "policy: {default_action: deny}\nadmin: {listen: \"unix:/run/admin.sock\"}\n",
+		"scalar for a mapping":      "policy: deny\n",
+		"unknown source":            "policy: {default_action: deny}\nclient_ip: {from: forwarded}\n",
+		"header name with space":    "policy: {default_action: deny}\nclient_ip: {from: header, header: \"x client\"}\n",
+		"negative trusted hops":     "policy: {default_action: deny}\nclient_ip: {from: x_forwarded_for, trusted_hops: -1}\n",
+		"unknown policy mode":       "policy: {default_action: deny, mode: observe}\n",
+		"status out of range":       "policy: {default_action: deny, deny_response: {status: 302}}\n",
+		"header value not a string": "policy: {default_action: deny, deny_response: {headers: {x-a: 1}}}\n",
+		"rules not a list":          "policy: {default_action: deny, rules: {}}\n",
+		"rule without a name":       "policy: {default_action: deny, rules: [{action: deny}]}\n",
+		"rule name":                 "policy: {default_action: deny, rules: [{name: Office, action: deny}]}\n",
+		"unknown rule key":          "policy: {default_action: deny, rules: [{name: r, action: deny, then: x}]}\n",
+		"rule action":               "policy: {default_action: deny, rules: [{name: r, action: block}]}\n",
+		"rule status":               "policy: {default_action: deny, rules: [{name: r, action: deny, response: {status: 200}}]}\n",
+		"too many rules":            "policy: {default_action: deny, rules: [" + strings.Repeat("{name: r, action: deny, when: \"false\"},", MaxRules+1) + "]}\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			data := []byte(text)

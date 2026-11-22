@@ -4,8 +4,8 @@
 //
 // # Startup
 //
-// Run logs starting, then builds the engine, the metrics, the gRPC server
-// and the admin server before it opens any socket. It opens the gRPC
+// Run builds the engine, logs starting, then builds the metrics, the gRPC
+// server and the admin server before it opens any socket. It opens the gRPC
 // listener, then the admin listener, resolving their host names within
 // listenTimeout; if one cannot open, the other is closed, startup_failed is
 // logged and Run fails. A signal received while a listener opens cancels it.
@@ -24,19 +24,31 @@
 //     client to close its connection and waits for the calls in progress,
 //     until server.shutdown_timeout has passed since the end of step 2.
 //  4. The admin server stops, within the same deadline.
-//  5. A listener that failed during the shutdown is logged as
+//  5. The decision events still queued are written, within the same
+//     deadline.
+//  6. A listener that failed during the shutdown is logged as
 //     listener_failed, then shutdown_complete is logged.
 //
-// A second signal, at any step, or the deadline of steps 3 and 4, closes
-// every remaining connection at once, cancelling the calls in progress:
-// shutdown_complete then reports outcome=forced.
+// A second signal, at any step, or the deadline of steps 3 to 5, closes
+// every remaining connection at once, cancelling the calls in progress, and
+// drops the decision events still queued: shutdown_complete then reports
+// outcome=forced, and stays the last event.
+//
+// # Decisions
+//
+// Each decision is recorded after it is made, and the recording cannot change
+// it: the metrics, then the decision event, which waits in a bounded queue
+// that a goroutine of the recorder writes, so that a slow output never slows a
+// decision. The same goroutine writes the rate-limited evaluation_error and
+// panic_recovered events.
 //
 // # Result
 //
 // Run returns nil after a shutdown that a signal started and in which every
 // call finished. It returns an error when a listener could not open or
-// failed, and after a forced shutdown. It logs every error before returning
-// it.
+// failed, and after a forced shutdown. It logs every such error before
+// returning it. It also fails, before it builds anything else, when the
+// policy does not compile, which a valid configuration rules out.
 package app
 
 import (
@@ -55,8 +67,10 @@ import (
 	"github.com/gtriggiano/tessera/internal/admin"
 	"github.com/gtriggiano/tessera/internal/config"
 	"github.com/gtriggiano/tessera/internal/engine"
+	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/extauthz"
 	"github.com/gtriggiano/tessera/internal/metrics"
+	"github.com/gtriggiano/tessera/internal/request"
 	"github.com/gtriggiano/tessera/internal/telemetry"
 )
 
@@ -93,11 +107,12 @@ type Options struct {
 	Listen func(ctx context.Context, network, address string) (net.Listener, error)
 
 	// The hooks of the tests. decider replaces the engine; afterDrain runs at
-	// the end of server.drain_delay, before the gRPC server stops; served
-	// runs when the server of a listener returns; listenTimeout replaces the
-	// constant.
+	// the end of server.drain_delay, before the gRPC server stops; flushing
+	// runs before the queued decision events are written; served runs when
+	// the server of a listener returns; listenTimeout replaces the constant.
 	decider       extauthz.Decider
 	afterDrain    func()
+	flushing      func()
 	served        func(listener string, err error)
 	listenTimeout time.Duration
 }
@@ -109,24 +124,47 @@ func Run(cfg *config.Config, opts Options) error {
 	if logs == nil {
 		logs = io.Discard
 	}
+	// The events written here and those of the recorder share the
+	// destination.
+	shared := telemetry.NewShared(logs)
+	logs = shared
+	policy := EnginePolicy(cfg.Policy)
+	m := metrics.New(opts.Build, opts.ConfigHash, policy)
+	rules := make([]string, len(policy.Rules))
+	for i, r := range policy.Rules {
+		rules[i] = r.Name
+	}
+	recorder := telemetry.NewRecorder(shared, telemetry.RecorderOptions{Log: cfg.Log, Rules: rules, Dropped: m.DecisionLogDropped})
+	var decider extauthz.Decider = opts.decider
+	if decider == nil {
+		e, err := engine.New(policy, engine.Options{OnPanic: recorder.Panic})
+		if err != nil {
+			_ = recorder.Close(context.Background())
+			return err
+		}
+		decider = e
+	}
+	decider = observed{decider: decider, metrics: m, recorder: recorder}
 	logger := telemetry.NewLogger(logs, cfg.Log)
 	logger.Info("starting", "version", opts.Build.Version, "revision", opts.Build.Revision, "config_path", opts.ConfigPath)
 
-	decider := opts.decider
-	if decider == nil {
-		decider = engine.New(cfg.Policy.DefaultAction)
-	}
-	m := metrics.New(opts.Build, opts.ConfigHash)
 	grpcServer := extauthz.NewServer(decider, extauthz.Options{
 		MaxConnections:       cfg.Server.MaxConnections,
 		Refused:              m.ConnectionRefused,
 		MaxConcurrentStreams: uint32(cfg.Server.MaxConcurrentStreams),
 		MaxConnectionAge:     cfg.Server.MaxConnectionAge,
+		ClientIP: request.ClientIPSource{
+			From:        request.Source(cfg.ClientIP.From),
+			Header:      cfg.ClientIP.Header,
+			TrustedHops: cfg.ClientIP.TrustedHops,
+		},
+		OnPanic: recorder.Panic,
 	})
 	adminServer := admin.NewServer(m.Handler())
 
 	grpcListener, adminListener, signalled, err := open(cfg, opts, logger)
 	if err != nil {
+		_ = recorder.Close(context.Background())
 		return err
 	}
 	logger.Info("listening", "listener", listenerGRPC, "address", addressOf(grpcListener))
@@ -170,7 +208,7 @@ func Run(cfg *config.Config, opts Options) error {
 			logger.Info("shutdown_started", "reason", "listener_failed")
 		}
 	}
-	forcedBy := shutdown(cfg.Server, opts, logger, grpcServer, adminServer)
+	forcedBy := shutdown(cfg.Server, opts, logger, grpcServer, adminServer, recorder)
 	serving.Wait()
 	for len(failed) > 0 {
 		listenerFailed(<-failed)
@@ -247,9 +285,13 @@ func open(cfg *config.Config, opts Options, logger *slog.Logger) (grpcListener, 
 	return grpcListener, adminListener, false, nil
 }
 
-// shutdown runs steps 1 to 4 of the shutdown, and returns what forced it:
-// "signal", "timeout", or "" when every call and request finished.
-func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *extauthz.Server, adminServer *admin.Server) string {
+// shutdown runs steps 1 to 5 of the shutdown, and returns what forced it:
+// "signal", "timeout", or "" when every call and request finished and every
+// queued decision event was written. A forced shutdown discards the decision
+// events still queued, so that shutdown_complete is the last event.
+func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *extauthz.Server, adminServer *admin.Server, recorder *telemetry.Recorder) string {
+	expired, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
 	adminServer.SetNotReady(admin.ReasonShuttingDown)
 	grpcServer.SetServing(false)
 	logger.Info("not_ready")
@@ -280,6 +322,7 @@ func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *
 	case <-force.Done():
 		grpcServer.Stop()
 		_ = adminServer.Close()
+		_ = recorder.Close(expired)
 		return forcedBy()
 	}
 	if opts.afterDrain != nil {
@@ -308,9 +351,19 @@ func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *
 	}
 	if forced {
 		_ = adminServer.Close()
+		_ = recorder.Close(expired)
 		return forcedBy()
 	}
 	if err := adminServer.Shutdown(ctx); err != nil {
+		_ = recorder.Close(expired)
+		return forcedBy()
+	}
+	if opts.flushing != nil {
+		opts.flushing()
+	}
+	// A flush that the deadline or another signal cuts short forces the
+	// shutdown: the events left are dropped and counted.
+	if err := recorder.Close(ctx); err != nil {
 		return forcedBy()
 	}
 	return ""
@@ -337,4 +390,56 @@ func addressOf(l net.Listener) string {
 		return config.UnixPrefix + a.Name
 	}
 	return l.Addr().String()
+}
+
+// observed decides with decider, then records the decision in the metrics and
+// in the log events. The recording cannot change the decision, and never
+// waits for the output of the events.
+type observed struct {
+	decider  extauthz.Decider
+	metrics  *metrics.Metrics
+	recorder *telemetry.Recorder
+}
+
+func (o observed) Decide(r *request.Request) engine.Decision {
+	d := o.decider.Decide(r)
+	o.metrics.Decided(d)
+	for _, e := range d.Errors {
+		o.recorder.EvaluationError(e.Rule, e.Cause)
+	}
+	o.recorder.Decision(d, r)
+	return d
+}
+
+// NewEngine builds the engine of a valid policy. onPanic, when set, receives
+// the panics recovered while a condition is evaluated.
+func NewEngine(p config.Policy, onPanic func(*expr.Panic)) (*engine.Engine, error) {
+	return engine.New(EnginePolicy(p), engine.Options{OnPanic: onPanic})
+}
+
+// EnginePolicy translates a valid policy for the engine.
+func EnginePolicy(p config.Policy) engine.Policy {
+	ep := engine.Policy{
+		Audit:         p.Mode == config.ModeAudit,
+		DefaultAction: engine.Action(p.DefaultAction),
+		DenyResponse:  response(p.DenyResponse),
+	}
+	for _, r := range p.Rules {
+		ep.Rules = append(ep.Rules, engine.Rule{
+			Name:     r.Name,
+			When:     string(r.When),
+			Action:   engine.Action(r.Action),
+			Audit:    r.Mode == config.ModeAudit,
+			Response: response(r.Response),
+		})
+	}
+	return ep
+}
+
+func response(r config.Response) engine.Response {
+	out := engine.Response{Status: r.Status, Body: r.Body}
+	for name, value := range r.Headers {
+		out.Headers = append(out.Headers, engine.Header{Name: name, Value: value})
+	}
+	return out
 }

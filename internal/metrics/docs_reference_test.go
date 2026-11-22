@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -17,10 +18,12 @@ import (
 // the registry.
 var metricsReference = filepath.Join("..", "..", "docs", "reference", "metrics.md")
 
-// family is the type and the sorted label names of one tessera_ family.
+// family is the type, the sorted label names and, for a histogram, the
+// upper bounds of the buckets of one tessera_ family.
 type family struct {
-	typ    string
-	labels []string
+	typ     string
+	labels  []string
+	buckets string
 }
 
 // exportedFamilies returns the tessera_ families of the registry that serve
@@ -29,7 +32,7 @@ type family struct {
 // see, so that no family escapes the comparison.
 func exportedFamilies(t *testing.T) map[string]family {
 	t.Helper()
-	m := New(testBuild, testHash)
+	m := New(testBuild, testHash, testPolicy)
 	got := map[string]family{}
 	for name, f := range gather(t, m) {
 		if !strings.HasPrefix(name, namespace+"_") {
@@ -37,7 +40,11 @@ func exportedFamilies(t *testing.T) map[string]family {
 		}
 		e := family{typ: strings.ToLower(f.GetType().String())}
 		if f.GetType() == dto.MetricType_HISTOGRAM {
-			t.Errorf("%s is a histogram: teach this test to compare its buckets with a **Buckets:** line", name)
+			var bounds []string
+			for _, b := range f.GetMetric()[0].GetHistogram().GetBucket() {
+				bounds = append(bounds, "`"+strconv.FormatFloat(b.GetUpperBound(), 'f', -1, 64)+"`")
+			}
+			e.buckets = strings.Join(bounds, ", ")
 		}
 		for _, l := range f.GetMetric()[0].GetLabel() {
 			e.labels = append(e.labels, l.GetName())
@@ -90,9 +97,10 @@ func labelList(t *testing.T, line int, name, text string) []string {
 
 // documentedFamilies reads the metrics reference. Each family has a heading
 // "### `tessera_<name>`" followed by the lines "**Type:** <type>" and
-// "**Labels:** none" or "**Labels:** `a`, `b`". The table at the top of the
-// page has a row "| [`tessera_<name>`](#anchor) | <type> | <labels> |" per
-// family; it is returned apart.
+// "**Labels:** none" or "**Labels:** `a`, `b`", and, for a histogram, the
+// line "**Buckets:** `0.1`, `1`" with the upper bounds in seconds. The table
+// at the top of the page has a row "| [`tessera_<name>`](#anchor) | <type> |
+// <labels> |" per family; it is returned apart.
 func documentedFamilies(t *testing.T) (sections, summary map[string]family) {
 	t.Helper()
 	f, err := os.Open(metricsReference)
@@ -149,6 +157,8 @@ func documentedFamilies(t *testing.T) (sections, summary map[string]family) {
 		case strings.HasPrefix(value, "**Labels:** "):
 			doc.labels = labelList(t, line, current, strings.TrimPrefix(value, "**Labels:** "))
 			seenLabels[current] = true
+		case strings.HasPrefix(value, "**Buckets:** "):
+			doc.buckets = strings.TrimPrefix(value, "**Buckets:** ")
 		}
 		sections[current] = doc
 	}
@@ -187,6 +197,9 @@ func TestMetricsReference(t *testing.T) {
 		}
 		if !slices.Equal(d.labels, e.labels) {
 			t.Errorf("%s: documented labels %v, exported %v", name, d.labels, e.labels)
+		}
+		if d.buckets != e.buckets {
+			t.Errorf("%s: documented buckets %q, exported %q", name, d.buckets, e.buckets)
 		}
 	}
 	for name, d := range documented {

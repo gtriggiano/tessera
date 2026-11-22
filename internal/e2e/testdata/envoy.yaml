@@ -11,6 +11,17 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: front
+                # As the documentation recommends: Envoy appends the address
+                # of its peer to X-Forwarded-For, and normalizes the path
+                # before tessera sees it.
+                use_remote_address: true
+                xff_num_trusted_hops: 1
+                normalize_path: true
+                merge_slashes: true
+                path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT
+                # The test compares the x-request-id that Envoy used with
+                # the request_id of the decision event.
+                always_set_request_id_in_response: true
                 route_config:
                   virtual_hosts:
                     - name: all

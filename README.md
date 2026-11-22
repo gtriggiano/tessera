@@ -12,11 +12,11 @@
 
 ## Status
 
-tessera is in development and has no release yet. `tessera serve` answers Envoy's external authorization requests, every one with the decision that the configuration sets in `policy.default_action`, and serves health checks and Prometheus metrics on a separate admin listener. Rules that look at the request are not available yet.
+tessera is in development and has no release yet. `tessera serve` answers Envoy's external authorization requests with ordered rules, written in the Common Expression Language (CEL), on the host, method, path and headers of each request and on the client address; it logs the decisions, and serves health checks and Prometheus metrics on a separate admin listener. `tessera eval` shows how the rules decide a request. Lists, location data and the client software are not available yet.
 
 ## Development
 
-You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`. `make ci` adds the vulnerability scan, the workflow lint, and the build and checks of the documentation, as CI does. `make test-e2e` needs Docker: it runs tessera with Envoy and a test upstream.
+You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`. `make ci` adds the vulnerability scan, the workflow lint, and the build and checks of the documentation, as CI does. `make test-e2e` needs Docker: it runs tessera with Envoy and a test upstream. `make bench` measures a decision.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the requirements, the checks, the documentation rules and the format of pull request titles, and [RELEASING.md](RELEASING.md) for the release process.
 

@@ -22,8 +22,9 @@ GORELEASER := $(TOOLS_DIR)/goreleaser-$(GORELEASER_VERSION)/goreleaser
 SYFT_DIR := $(TOOLS_DIR)/syft-$(SYFT_VERSION)
 SNAPSHOT_FLAGS ?=
 FUZZ_TIME ?= 10s
+BENCH_TIME ?= 2s
 
-.PHONY: help build fmt fmt-check vet test test-e2e fuzz mod-check check ci vuln workflows-check workflows-audit release-check release-snapshot docs-install docs-audit docs-dev docs-build docs-check docs-preview
+.PHONY: help build fmt fmt-check vet test test-e2e fuzz bench mod-check check ci vuln workflows-check workflows-audit release-check release-snapshot docs-install docs-audit docs-dev docs-build docs-check docs-preview
 
 help:
 	@echo "make check           Check Go formatting, modules, vet, tests and build"
@@ -31,7 +32,8 @@ help:
 	@echo "make build           Build tessera in bin/"
 	@echo "make fmt             Format Go sources"
 	@echo "make test-e2e        Run tessera in Docker with Envoy and a test upstream (needs Docker)"
-	@echo "make fuzz            Run each fuzz target for $(FUZZ_TIME) (none yet)"
+	@echo "make fuzz            Run each fuzz target for $(FUZZ_TIME)"
+	@echo "make bench           Run the benchmarks of a decision for $(BENCH_TIME) each"
 	@echo "make vuln            Scan Go code using pinned govulncheck"
 	@echo "make workflows-check Validate GitHub Actions workflows"
 	@echo "make workflows-audit Audit workflows and Dependabot configuration using pinned zizmor (needs uv)"
@@ -71,7 +73,13 @@ test-e2e:
 # Each fuzz target gets one line, as in:
 #	$(GO) test ./internal/<package> -run='^$$' -fuzz=Fuzz<Name> -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
 fuzz:
-	@echo "make fuzz: no fuzz targets yet"
+	$(GO) test ./internal/request -run='^$$' -fuzz=FuzzNormalize -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
+	$(GO) test ./internal/request -run='^$$' -fuzz=FuzzClientIP -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
+
+# The benchmarks of one decision over ten typical rules: time, memory and
+# allocations per decision, and the percentiles of the time of each.
+bench:
+	$(GO) test ./internal/engine -run='^$$' -bench=. -benchmem -benchtime=$(BENCH_TIME) -count=1
 
 mod-check:
 	$(GO) mod tidy -diff

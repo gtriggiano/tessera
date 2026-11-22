@@ -46,10 +46,15 @@ func (e *Error) Error() string {
 // not in the file, of its nearest parent that is.
 func (c *Config) err(path, problem string) error {
 	l, p := c.nodes[path], path
-	for l.line == 0 && strings.Contains(p, ".") {
-		p = p[:strings.LastIndex(p, ".")]
+	for l.line == 0 && strings.ContainsAny(p, ".[") {
+		p = p[:strings.LastIndexAny(p, ".[")]
 		l = c.nodes[p]
 	}
+	return c.errAt(path, l, problem)
+}
+
+// errAt returns an Error for path at the position l.
+func (c *Config) errAt(path string, l location, problem string) error {
 	if path == "" {
 		path = "configuration"
 	}
@@ -134,6 +139,7 @@ func Parse(data []byte, lookup LookupEnv) (*Config, error) {
 		return nil, errors.New("configuration: the root is not a mapping")
 	}
 	c := defaults()
+	c.lines = strings.Split(string(data), "\n")
 	if err := c.decode(doc.Content[0], reflect.ValueOf(c).Elem(), "", lookup); err != nil {
 		return nil, err
 	}
@@ -156,9 +162,10 @@ func syntaxError(err error) error {
 }
 
 var (
-	durationType = reflect.TypeFor[time.Duration]()
-	integerRE    = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
-	envNameRE    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	durationType   = reflect.TypeFor[time.Duration]()
+	expressionType = reflect.TypeFor[Expression]()
+	integerRE      = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
+	envNameRE      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	// keyRE matches the keys that an error can name: a key that does not
 	// match is arbitrary text, and could be a misplaced value.
 	keyRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -170,6 +177,13 @@ func childPath(path, key string) string {
 	}
 	return path + "." + key
 }
+
+func itemPath(path string, i int) string {
+	return path + "[" + strconv.Itoa(i) + "]"
+}
+
+// defaulter is a list item whose keys have defaults.
+type defaulter interface{ setDefaults() }
 
 // decode stores the YAML node n, at the key path, into v.
 func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup LookupEnv) error {
@@ -234,6 +248,56 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 				return err
 			}
 		}
+	case reflect.Slice:
+		if n.Kind != yaml.SequenceNode || n.Tag != "!!seq" {
+			return c.err(path, "expected a list")
+		}
+		items := reflect.MakeSlice(v.Type(), len(n.Content), len(n.Content))
+		for i, item := range n.Content {
+			elem := items.Index(i)
+			if d, ok := elem.Addr().Interface().(defaulter); ok {
+				d.setDefaults()
+			}
+			if err := c.decode(item, elem, itemPath(path, i), lookup); err != nil {
+				return err
+			}
+		}
+		v.Set(items)
+	case reflect.Map:
+		if v.Type().Key().Kind() != reflect.String || v.Type().Elem().Kind() != reflect.String {
+			return c.err(path, "unsupported configuration type")
+		}
+		if n.Kind != yaml.MappingNode || n.Tag != "!!map" {
+			return c.err(path, "expected a mapping")
+		}
+		// The keys are values, not names: an error about one names the
+		// mapping, at the position of the key.
+		m := reflect.MakeMapWithSize(v.Type(), len(n.Content)/2)
+		seen := map[string]bool{}
+		for i := 0; i < len(n.Content); i += 2 {
+			k, value := n.Content[i], n.Content[i+1]
+			at, valueAt := location{k.Line, k.Column}, location{value.Line, value.Column}
+			switch {
+			case k.Kind != yaml.ScalarNode || k.Tag != "!!str" || k.Value == "<<":
+				return c.errAt(path, at, "keys must be plain strings; merge keys are not allowed")
+			case seen[k.Value]:
+				return c.errAt(path, at, "duplicate key")
+			case value.Kind == yaml.AliasNode:
+				return c.errAt(path, valueAt, "YAML aliases are not allowed")
+			case value.Tag == "!!null":
+				return c.errAt(path, valueAt, "null is not allowed")
+			case value.Kind != yaml.ScalarNode || value.Tag != "!!str":
+				return c.errAt(path, valueAt, "expected a string")
+			}
+			seen[k.Value] = true
+			s, err := c.expandAt(value.Value, path, valueAt, childPath(path, k.Value), lookup)
+			if err != nil {
+				return err
+			}
+			c.keys[path] = append(c.keys[path], mapKey{name: k.Value, at: at})
+			m.SetMapIndex(reflect.ValueOf(k.Value), reflect.ValueOf(s))
+		}
+		v.Set(m)
 	case reflect.String:
 		if n.Kind != yaml.ScalarNode || n.Tag != "!!str" {
 			return c.err(path, "expected a string")
@@ -241,6 +305,9 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 		s, err := c.expand(n.Value, path, lookup)
 		if err != nil {
 			return err
+		}
+		if v.Type() == expressionType {
+			c.styles[path] = n.Style
 		}
 		v.SetString(s)
 	case reflect.Int:
@@ -261,6 +328,12 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 // expand replaces each ${NAME} and ${NAME:-default} in s, the value at path,
 // and $${ with a literal ${. Any other $ is kept.
 func (c *Config) expand(s, path string, lookup LookupEnv) (string, error) {
+	return c.expandAt(s, path, c.nodes[path], path, lookup)
+}
+
+// expandAt is expand for a value whose errors are reported at path and at,
+// and whose substitutions mark taint as tainted.
+func (c *Config) expandAt(s, path string, at location, taint string, lookup LookupEnv) (string, error) {
 	var out strings.Builder
 	for i := 0; i < len(s); {
 		switch {
@@ -270,20 +343,20 @@ func (c *Config) expand(s, path string, lookup LookupEnv) (string, error) {
 		case strings.HasPrefix(s[i:], "${"):
 			end := strings.IndexByte(s[i+2:], '}')
 			if end < 0 {
-				return "", c.err(path, "unterminated ${ substitution")
+				return "", c.errAt(path, at, "unterminated ${ substitution")
 			}
 			name, fallback, hasFallback := strings.Cut(s[i+2:i+2+end], ":-")
 			if !envNameRE.MatchString(name) {
-				return "", c.err(path, "invalid environment variable name in a ${ substitution")
+				return "", c.errAt(path, at, "invalid environment variable name in a ${ substitution")
 			}
 			value, ok := lookup(name)
 			if hasFallback && value == "" {
 				value, ok = fallback, true
 			}
 			if !ok {
-				return "", c.err(path, "environment variable "+name+" is not set")
+				return "", c.errAt(path, at, "environment variable "+name+" is not set")
 			}
-			c.tainted[path] = true
+			c.tainted[taint] = true
 			out.WriteString(value)
 			i += end + 3
 		default:
@@ -317,9 +390,14 @@ func (c *Config) Redacted() ([]byte, error) {
 		if n.Kind == yaml.ScalarNode && n.Tag == "!!str" {
 			n.Value = strings.ReplaceAll(n.Value, "${", "$${")
 		}
-		if n.Kind == yaml.MappingNode {
+		switch n.Kind {
+		case yaml.MappingNode:
 			for i := 0; i < len(n.Content); i += 2 {
 				redact(n.Content[i+1], childPath(path, n.Content[i].Value))
+			}
+		case yaml.SequenceNode:
+			for i, item := range n.Content {
+				redact(item, itemPath(path, i))
 			}
 		}
 	}

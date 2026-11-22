@@ -22,16 +22,27 @@ description: "The gRPC listener of tessera serve: Envoy's external authorization
 
 ### Authorization service
 
-`envoy.service.auth.v3.Authorization/Check` decides an HTTP request that Envoy describes. Every request gets the decision of [`policy.default_action`](./configuration.md#policy-default-action), whatever the request.
+`envoy.service.auth.v3.Authorization/Check` decides an HTTP request that Envoy describes, with the rules of [`policy`](./configuration.md#policy) (see [Write rules](../guide/write-rules.md)).
 
 The call succeeds, with gRPC status `OK`, for both decisions: the decision is in the `status` field of the `CheckResponse`.
 
 | Decision | `CheckResponse` | What Envoy does |
 | --- | --- | --- |
 | Allow | `status.code` is `OK` (0). `ok_response` is empty: no header to add, set or remove. | Sends the request on, unchanged. |
-| Deny | `status.code` is `PERMISSION_DENIED` (7). `denied_response` has the HTTP status `403` and no body and no header. | Answers the client with 403 Forbidden and an empty body. |
+| Deny | `status.code` is `PERMISSION_DENIED` (7). `denied_response` has the status, the body and the headers of the response of the rule that denied the request, or of [`policy.deny_response`](./configuration.md#policy-deny-response): `403`, without a body and without headers, by default. | Answers the client with that status, body and headers. |
+| Deny, with [`policy.mode: audit`](./configuration.md#policy-mode) | As for Allow. | Sends the request on, unchanged. |
 
-The response carries nothing else: no message in the status, no dynamic metadata.
+The response carries nothing else: no message in the status, no dynamic metadata. tessera sends each header of a denial with the action `OVERWRITE_IF_EXISTS_OR_ADD`, so that it replaces a header of the same name instead of adding a second one.
+
+When tessera fails while it handles a call, which it recovers (see [Failure modes](./failure-modes.md)), the call ends with the gRPC status `INTERNAL` and the message `internal error`, without a decision: Envoy handles it as it handles any call that fails (see [What Envoy needs](#what-envoy-needs)).
+
+Envoy adds to a denial:
+
+- `content-type: text/plain` when the body is not empty and the headers have no `content-type`, and the `content-length` of the body;
+- its own `date` header, and by default its own `server` header;
+- for a status that its list of statuses does not name, such as `451`, the status as it is, with the reason phrase `Unknown` in HTTP/1.1.
+
+tessera sends the header names in lowercase.
 
 ### Health service
 
@@ -104,3 +115,22 @@ With `failure_mode_allow: true`, Envoy allows every request that it cannot get a
 
 - tessera does not read the request body: leave `with_request_body` unset, so that a large body cannot exceed the message size limit.
 - For gRPC health checks from Envoy or from an orchestrator, use the empty service name or `envoy.service.auth.v3.Authorization`.
+- tessera reads the client address of a request from the address of the connection to Envoy, unless [`client_ip`](./configuration.md#client-ip) declares another source. [Set the client address](../guide/client-address.md) describes the Envoy settings for each source.
+
+### Request paths
+
+tessera receives the path of a request as Envoy sends it, and does not decode or normalize it. Let Envoy normalize the path in the HTTP connection manager, as its [edge proxy best practices](https://www.envoyproxy.io/docs/envoy/latest/configuration/best_practices/edge) recommend, so that the path that tessera receives is the path that Envoy routes and sends to the upstream:
+
+```yaml [envoy.yaml]
+- name: envoy.filters.network.http_connection_manager
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+    stat_prefix: ingress
+    normalize_path: true
+    merge_slashes: true
+    path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT
+```
+
+- `normalize_path` normalizes the path as RFC 3986 describes, and resolves its `.` and `..` segments: `/admin/../public` reaches tessera as `/public`.
+- `merge_slashes` merges adjacent slashes: `//admin` reaches tessera as `/admin`.
+- `path_with_escaped_slashes_action` acts on the encoded slashes `%2F` and `%5C`, in either case. `UNESCAPE_AND_REDIRECT` redirects the client to the path with them decoded; `REJECT_REQUEST` answers 400 instead, which suits gRPC clients and other clients whose paths never contain them.

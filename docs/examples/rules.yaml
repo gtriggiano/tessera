@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../public/config.schema.json
+# Envoy runs behind one load balancer that appends to X-Forwarded-For.
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 1
+
+policy:
+  default_action: deny
+  deny_response:
+    status: 403
+    body: Forbidden.
+  rules:
+    - name: health-checks
+      description: The load balancer checks Envoy without X-Forwarded-For.
+      action: allow
+      when: '!has(client.ip) && request.path == "/healthz"'
+
+    - name: blocked-networks
+      description: Networks blocked during an incident.
+      action: deny
+      when: client.ip.inCidr("198.51.100.0/24") || client.ip.inCidr("2001:db8:bad::/48")
+
+    - name: scanners
+      action: deny
+      mode: audit
+      when: '"user-agent" in request.headers && request.headers["user-agent"].matches("(?i)(sqlmap|nikto)")'
+
+    - name: admin-from-office
+      action: allow
+      when: request.path.startsWith("/admin") && client.ip.inCidr("203.0.113.0/24")
+
+    - name: admin
+      action: deny
+      when: request.path.startsWith("/admin")
+      response:
+        status: 404
+        body: Not found.
+
+    - name: public-site
+      action: allow
+      when: request.host == "www.example.com" && request.method in ["GET", "HEAD"]
+
+    - name: api
+      action: allow
+      when: |
+        request.host == "api.example.com"
+          && "authorization" in request.headers

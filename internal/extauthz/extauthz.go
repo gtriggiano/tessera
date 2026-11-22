@@ -1,8 +1,8 @@
 // Package extauthz is the adapter between Envoy and tessera: the gRPC server
 // of Envoy's external authorization protocol, version 3, and of the gRPC
-// health service. It translates a CheckRequest into a request.Request, and a
-// decision into a CheckResponse. It is the only package that imports Envoy's
-// types.
+// health service. It translates a CheckRequest into a request.Request, with
+// its client address, and a decision into a CheckResponse. It is the only
+// package that imports Envoy's types.
 package extauthz
 
 import (
@@ -10,10 +10,13 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
@@ -23,8 +26,10 @@ import (
 	"google.golang.org/grpc/health"
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	"github.com/gtriggiano/tessera/internal/engine"
+	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/request"
 )
 
@@ -69,6 +74,11 @@ type Options struct {
 	// MaxConnectionAge is the age at which a connection is closed gracefully,
 	// with a random variation of up to 10%. Zero sets no limit.
 	MaxConnectionAge time.Duration
+	// ClientIP is the source of the client address of each request.
+	ClientIP request.ClientIPSource
+	// OnPanic, when set, receives a panic that a call recovered: the call
+	// then fails with the gRPC status INTERNAL.
+	OnPanic func(*expr.Panic)
 }
 
 // Server serves the authorization and health services on one listener.
@@ -105,7 +115,7 @@ func NewServer(d Decider, o Options) *Server {
 		grpc.MaxRecvMsgSize(MaxMessageBytes),
 		grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionAge: o.MaxConnectionAge}),
 	)
-	authv3.RegisterAuthorizationServer(s.grpc, authorization{decider: d})
+	authv3.RegisterAuthorizationServer(s.grpc, authorization{decider: d, clientIP: o.ClientIP, onPanic: o.OnPanic})
 	healthgrpc.RegisterHealthServer(s.grpc, healthService{Server: s.health, stopping: s.stopping})
 	s.SetServing(false)
 	return s
@@ -238,32 +248,103 @@ func (s *Server) endWatches() {
 
 type authorization struct {
 	authv3.UnimplementedAuthorizationServer
-	decider Decider
+	decider  Decider
+	clientIP request.ClientIPSource
+	onPanic  func(*expr.Panic)
 }
 
-func (a authorization) Check(_ context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
-	return checkResponse(a.decider.Decide(newRequest(req))), nil
+// errInternal ends a call that failed before a decision: Envoy then applies
+// its own handling of a failed call, which failure_mode_allow: false makes a
+// denial.
+var errInternal = status.Error(codes.Internal, "internal error")
+
+// Check decides the request that Envoy describes. A panic, which grpc-go
+// does not recover, would end the process: Check recovers it, reports it,
+// and fails the call, so that no request is allowed without a decision.
+func (a authorization) Check(_ context.Context, req *authv3.CheckRequest) (resp *authv3.CheckResponse, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			if a.onPanic != nil {
+				a.onPanic(&expr.Panic{Value: v, Stack: debug.Stack()})
+			}
+			resp, err = nil, errInternal
+		}
+	}()
+	received := time.Now()
+	r := request.Normalize(rawRequest(req))
+	r.ClientIP = a.clientIP.Resolve(r)
+	r.Received = received
+	return checkResponse(a.decider.Decide(r)), nil
 }
 
-// newRequest translates the HTTP request that Envoy describes.
-func newRequest(req *authv3.CheckRequest) *request.Request {
+// rawRequest reads the HTTP request that Envoy describes, and the address of
+// the connection that Envoy received it on.
+//
+// Envoy sends the headers in one of two forms. By default, in headers, a map
+// whose values join those of a repeated header with a comma. With
+// encode_raw_headers, in header_map, one entry per header, whose value can be
+// in raw_value, as bytes. rawRequest joins the entries of header_map as Envoy
+// joins those of headers, after them if both are set, so that both forms give
+// the same request.
+func rawRequest(req *authv3.CheckRequest) request.Raw {
 	h := req.GetAttributes().GetRequest().GetHttp()
-	return &request.Request{Method: h.GetMethod(), Host: h.GetHost(), Path: h.GetPath()}
+	headers := h.GetHeaders()
+	if entries := h.GetHeaderMap().GetHeaders(); len(entries) > 0 {
+		values := make(map[string][]string, len(headers)+len(entries))
+		for name, value := range headers {
+			values[name] = []string{value}
+		}
+		for _, e := range entries {
+			value := e.GetValue()
+			if raw := e.GetRawValue(); len(raw) > 0 {
+				value = string(raw)
+			}
+			values[e.GetKey()] = append(values[e.GetKey()], value)
+		}
+		headers = make(map[string]string, len(values))
+		for name, v := range values {
+			headers[name] = strings.Join(v, ",")
+		}
+	}
+	return request.Raw{
+		Method:  h.GetMethod(),
+		Host:    h.GetHost(),
+		Path:    h.GetPath(),
+		Scheme:  h.GetScheme(),
+		Headers: headers,
+		Peer:    req.GetAttributes().GetSource().GetAddress().GetSocketAddress().GetAddress(),
+	}
 }
 
-// checkResponse translates a decision. Any action other than allow denies.
+// checkResponse translates a decision. It allows an allow, and a deny that
+// is not enforced; anything else denies, with the response of the decision,
+// or 403 without a body when it has none.
 func checkResponse(d engine.Decision) *authv3.CheckResponse {
-	if d.Action == engine.Allow {
+	if d.Action == engine.Allow || d.Action == engine.Deny && !d.Enforced {
 		return &authv3.CheckResponse{
 			Status:       &rpcstatus.Status{Code: int32(codes.OK)},
 			HttpResponse: &authv3.CheckResponse_OkResponse{OkResponse: &authv3.OkHttpResponse{}},
 		}
 	}
+	denied := &authv3.DeniedHttpResponse{Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden}}
+	if r := d.Response; r != nil {
+		// Envoy sends any status, also one that its enumeration does not
+		// name, such as 451.
+		denied.Status.Code = typev3.StatusCode(r.Status)
+		denied.Body = r.Body
+		// Each header replaces the one of the same name that Envoy would
+		// set: the action is explicit, as the defaults of the append fields
+		// differ in this message.
+		for _, h := range r.Headers {
+			denied.Headers = append(denied.Headers, &corev3.HeaderValueOption{
+				Header:       &corev3.HeaderValue{Key: h.Name, Value: h.Value},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			})
+		}
+	}
 	return &authv3.CheckResponse{
-		Status: &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
-		HttpResponse: &authv3.CheckResponse_DeniedResponse{DeniedResponse: &authv3.DeniedHttpResponse{
-			Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
-		}},
+		Status:       &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{DeniedResponse: denied},
 	}
 }
 

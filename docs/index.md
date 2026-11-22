@@ -18,6 +18,6 @@ hero:
 
 ## Status
 
-**tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/), in development. [`tessera serve`](./reference/cli.md#tessera-serve) answers Envoy's authorization requests, every one with the decision of [`policy.default_action`](./reference/configuration.md#policy-default-action), and serves [health checks](./reference/admin-endpoints.md) and [metrics](./reference/metrics.md) on a separate admin listener. Rules that look at the request are not available yet. Each feature gets its page in this documentation when it lands.
+**tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/), in development. [`tessera serve`](./reference/cli.md#tessera-serve) answers Envoy's authorization requests with [ordered rules](./guide/write-rules.md) on the host, method, path and headers of each request and on the client address, and serves [health checks](./reference/admin-endpoints.md) and [metrics](./reference/metrics.md) on a separate admin listener. Lists, location data and the client software are not available yet. Each feature gets its page in this documentation when it lands.
 
 [What is tessera?](./guide/what-is-tessera.md) describes the problem it addresses and what it leaves to other tools.

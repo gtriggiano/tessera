@@ -1,0 +1,44 @@
+# The policy of TestEnvoyRules: rules on hosts, paths and networks, a rule in
+# audit mode, and responses of their own. Envoy, the only proxy in front of
+# tessera, appends the address of its peer to X-Forwarded-For; the test
+# writes the client address before it, as a load balancer would.
+server:
+  drain_delay: 1s
+log:
+  format: json
+  decisions: all
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 1
+policy:
+  mode: enforce
+  default_action: deny
+  deny_response:
+    body: "Forbidden.\n"
+    headers:
+      Cache-Control: no-store
+  rules:
+    - name: blocked-networks
+      action: deny
+      when: client.ip.inCidr("198.51.100.0/24")
+      response:
+        status: 451
+        body: '{"error": "unavailable"}'
+        headers:
+          content-type: application/json
+    - name: watch-scanners
+      action: deny
+      mode: audit
+      when: '"user-agent" in request.headers && request.headers["user-agent"].startsWith("scanner/")'
+    - name: admin-from-office
+      action: allow
+      when: request.path.startsWith("/admin/") && client.ip.inCidr("203.0.113.0/24")
+    - name: admin
+      action: deny
+      when: request.path.startsWith("/admin/")
+      response:
+        status: 404
+        body: ""
+    - name: public-site
+      action: allow
+      when: request.host == "www.example.com" && request.method in ["GET", "HEAD"]
