@@ -11,6 +11,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/expr"
 )
 
@@ -46,29 +47,126 @@ func (c *Config) validatePolicy() error {
 	if len(p.Rules) > MaxRules {
 		return c.err("policy.rules", "more than "+strconv.Itoa(MaxRules)+" rules")
 	}
-	env, err := expr.NewEnv(expr.Options{Sets: c.SetDeclarations()})
+	env, err := expr.NewEnv(expr.Options{Sets: c.SetDeclarations(), Databases: c.DatabaseKinds(), SecretHeaders: c.SecretHeaderNames()})
 	if err != nil {
 		return errors.New("configuration: cannot prepare the expressions")
 	}
 	names := map[string]int{}
-	used := map[string]bool{}
+	u := uses{sets: map[string]bool{}, databases: map[enrichment.Kind]bool{}}
 	for i := range p.Rules {
-		if err := c.validateRule(env, i, names, used); err != nil {
+		if err := c.validateRule(env, i, names, u); err != nil {
 			return err
 		}
 	}
-	// A set that no rule reads is still loaded and checked.
+	if err := c.validateUpstream(env, u); err != nil {
+		return err
+	}
+	if err := c.validateDecisionFields(env, u); err != nil {
+		return err
+	}
+	// A set or a database that nothing reads is still loaded and checked.
 	for _, k := range c.keys["sets"] {
-		if !used[k.name] {
-			c.warnings = append(c.warnings, Warning{Path: childPath("sets", k.name), Line: k.at.line, Column: k.at.column, Problem: "the set is not used by any rule"})
+		if !u.sets[k.name] {
+			c.warnings = append(c.warnings, Warning{Path: childPath("sets", k.name), Line: k.at.line, Column: k.at.column, Problem: "the set is not used by any rule, upstream header or decision field"})
 		}
+	}
+	for _, k := range c.DatabaseKinds() {
+		if !u.databases[k] {
+			p := "enrichment." + string(k)
+			at := c.nodes[p]
+			c.warnings = append(c.warnings, Warning{Path: p, Line: at.line, Column: at.column, Problem: "the database is not used by any rule, upstream header or decision field"})
+		}
+	}
+	slices.SortStableFunc(c.warnings, func(a, b Warning) int {
+		if a.Line != b.Line {
+			return a.Line - b.Line
+		}
+		return a.Column - b.Column
+	})
+	return nil
+}
+
+// uses are the sets and the databases that the expressions read.
+type uses struct {
+	sets      map[string]bool
+	databases map[enrichment.Kind]bool
+}
+
+// add records what e, a compiled expression, reads.
+func (u uses) add(e interface {
+	Sets() []string
+	Databases() []enrichment.Kind
+}) {
+	for _, name := range e.Sets() {
+		u.sets[name] = true
+	}
+	for _, k := range e.Databases() {
+		u.databases[k] = true
+	}
+}
+
+// forbiddenUpstreamHeaders are the headers that change the meaning of the
+// request, or that hold its credentials, which upstream.headers cannot set;
+// nor can it set a header whose name starts with x-envoy-, which belong to
+// Envoy.
+var forbiddenUpstreamHeaders = []string{"host", "content-length", "transfer-encoding", "connection", "authorization", "proxy-authorization", "cookie", "keep-alive", "proxy-connection", "te", "trailer", "upgrade"}
+
+// validateUpstream checks upstream.headers: their number, their names, in the
+// order of the file, and their expressions, whose reads it adds to used.
+func (c *Config) validateUpstream(env *expr.Env, used uses) error {
+	const path = "upstream.headers"
+	if len(c.Upstream.Headers) > MaxUpstreamHeaders {
+		return c.err(path, "more than "+strconv.Itoa(MaxUpstreamHeaders)+" headers")
+	}
+	seen := map[string]bool{}
+	for _, k := range c.keys[path] {
+		name := strings.ToLower(k.name)
+		switch {
+		case !headerName(k.name):
+			return c.errAt(path, k.at, "expected a header name")
+		case slices.Contains(forbiddenUpstreamHeaders, name) || strings.HasPrefix(name, "x-envoy-"):
+			return c.errAt(path, k.at, "this header is not allowed: it changes the meaning of the request, holds its credentials, or belongs to Envoy")
+		case seen[name]:
+			return c.errAt(path, k.at, "the same header twice, in different cases")
+		}
+		seen[name] = true
+		value, err := env.CompileString(string(c.Upstream.Headers[k.name]))
+		if err != nil {
+			return c.compileError(path, childPath(path, k.name), string(c.Upstream.Headers[k.name]), err)
+		}
+		used.add(value)
 	}
 	return nil
 }
 
-// validateRule checks the rule i, and adds the sets that its condition reads
-// to used.
-func (c *Config) validateRule(env *expr.Env, i int, names map[string]int, used map[string]bool) error {
+// validateDecisionFields checks the expressions of log.decision_fields, in
+// the order of the file, and adds their reads to used.
+func (c *Config) validateDecisionFields(env *expr.Env, used uses) error {
+	const path = "log.decision_fields"
+	for _, k := range c.keys[path] {
+		text := string(c.Log.DecisionFields[k.name])
+		value, err := env.CompileDecisionField(text)
+		if err != nil {
+			return c.compileError(path, childPath(path, k.name), text, err)
+		}
+		used.add(value)
+	}
+	return nil
+}
+
+// compileError returns the error of err, the error of compiling text, the
+// expression at path, as an error at report.
+func (c *Config) compileError(report, path, text string, err error) error {
+	var ce *expr.CompileError
+	if !errors.As(err, &ce) || len(ce.Issues) == 0 {
+		return c.err(report, "invalid expression")
+	}
+	return c.expressionErrorAt(report, path, text, ce.Issues[0])
+}
+
+// validateRule checks the rule i, and adds the sets and the databases that
+// its condition reads to used.
+func (c *Config) validateRule(env *expr.Env, i int, names map[string]int, used uses) error {
 	r := &c.Policy.Rules[i]
 	path := itemPath("policy.rules", i)
 	switch {
@@ -101,15 +199,9 @@ func (c *Config) validateRule(env *expr.Env, i int, names map[string]int, used m
 	}
 	cond, err := env.Compile(string(r.When))
 	if err != nil {
-		var ce *expr.CompileError
-		if !errors.As(err, &ce) || len(ce.Issues) == 0 {
-			return c.err(path+".when", "invalid expression")
-		}
-		return c.expressionError(path+".when", string(r.When), ce.Issues[0])
+		return c.compileError(path+".when", path+".when", string(r.When), err)
 	}
-	for _, name := range cond.Sets() {
-		used[name] = true
-	}
+	used.add(cond)
 	r.written.response = c.present(path + ".response")
 	r.written.status = c.present(path + ".response.status")
 	r.written.body = c.present(path + ".response.body")
@@ -180,16 +272,18 @@ func headerValue(s string) bool {
 	return utf8.ValidString(s) && !strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 && r != '\t' || r == 0x7f })
 }
 
-// expressionError returns the error of an issue of the expression at path.
-// Its position is where the issue is in the file when the file holds the text
-// of the expression as it is, in one line or in a literal block, and the
+// expressionErrorAt returns the error of an issue of the expression at path,
+// as an error at report: path itself, or, for an expression of a mapping,
+// such as upstream.headers, the mapping, whose keys are not named. Its
+// position is where the issue is in the file when the file holds the text of
+// the expression as it is, in one line or in a literal block, and the
 // position of the value otherwise, with the position in the expression in
 // the message. A message about an expression with a substitution names
 // nothing from it.
-func (c *Config) expressionError(path, text string, is expr.Issue) error {
+func (c *Config) expressionErrorAt(report, path, text string, is expr.Issue) error {
 	at := c.nodes[path]
 	if c.tainted[path] {
-		return c.errAt(path, at, "invalid expression")
+		return c.errAt(report, at, "invalid expression")
 	}
 	lines := strings.Split(text, "\n")
 	if is.Line >= 1 && is.Line <= len(lines) {
@@ -214,10 +308,10 @@ func (c *Config) expressionError(path, text string, is expr.Issue) error {
 			}
 		}
 		if column >= 0 {
-			return c.errAt(path, location{line, column + is.Column}, is.Message)
+			return c.errAt(report, location{line, column + is.Column}, is.Message)
 		}
 	}
-	return c.errAt(path, at, fmt.Sprintf("%s (line %d, column %d of the expression)", is.Message, is.Line, is.Column))
+	return c.errAt(report, at, fmt.Sprintf("%s (line %d, column %d of the expression)", is.Message, is.Line, is.Column))
 }
 
 // line returns the line n of the file, from 1, as characters.

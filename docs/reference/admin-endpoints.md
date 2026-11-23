@@ -49,7 +49,7 @@ ok
 not ready: shutting down
 ```
 
-tessera is ready once both listeners are open, and stops being ready when a shutdown starts. It loads every [set](./configuration.md#sets) before it opens its listeners, and does not start when one cannot be loaded: once it reports ready, every set is loaded. A set that becomes unavailable later does not change readiness: [`tessera_set_available`](./metrics.md#tessera-set-available) reports it. The only condition that `/readyz` can report is therefore:
+tessera is ready once both listeners are open, and stops being ready when a shutdown starts. It loads every [set](./configuration.md#sets) and every [database](./configuration.md#enrichment) before it opens its listeners, and does not start when one cannot be loaded: once it reports ready, every set and every database is loaded. A set that becomes unavailable later does not change readiness: [`tessera_set_available`](./metrics.md#tessera-set-available) reports it. A database is never unavailable: a file that tessera cannot read later leaves the copy in use. The only condition that `/readyz` can report is therefore:
 
 | Line | When |
 | --- | --- |
@@ -84,7 +84,7 @@ The admin listener has its own limits, which you cannot configure, so that probe
 | Request header size | 8 KiB, request line included, plus an allowance of 4 KiB; larger headers get 431 Request Header Fields Too Large |
 | Open connections | 16; further clients wait in the operating system's backlog |
 
-Probes and scrapes read memory only, and requests to the admin listener write no log event.
+The probes, `/livez` and `/readyz`, read memory only; a scrape of `/metrics` also reads the statistics of the process, as [Go and process metrics](./metrics.md#go-and-process-metrics) describes. Requests to the admin listener write no log event, and nothing that the admin listener does is on the path of a decision.
 
 ## During a shutdown
 

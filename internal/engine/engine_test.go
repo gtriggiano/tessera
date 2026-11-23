@@ -53,9 +53,11 @@ func req(clientIP string) *request.Request {
 	return r
 }
 
-// summary is what the tests compare of a decision.
+// summary is what the tests compare of a decision: neither its duration
+// nor its activation.
 func summary(d Decision) Decision {
 	d.Duration = 0
+	d.input = nil
 	return d
 }
 

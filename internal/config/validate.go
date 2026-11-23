@@ -4,9 +4,13 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
+	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
@@ -61,13 +65,79 @@ func (c *Config) validate() error {
 	default:
 		return c.err("log.decisions", "expected none, deny or all")
 	}
+	if err := c.validateDecisionFieldNames(); err != nil {
+		return err
+	}
 	if err := c.validateClientIP(); err != nil {
+		return err
+	}
+	if err := c.validateSecretHeaders(); err != nil {
+		return err
+	}
+	if err := c.validateEnrichment(); err != nil {
 		return err
 	}
 	if err := c.validateSets(); err != nil {
 		return err
 	}
 	return c.validatePolicy()
+}
+
+// decisionFieldNameRE is the form of the name of a decision field.
+var decisionFieldNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// decisionEventFields are the fields that every decision event has, or that
+// every event has: no decision field can take their names.
+var decisionEventFields = []string{"ts", "level", "msg", "request_id", "host", "method", "path", "client_ip", "action", "enforced", "rule", "reason", "audit_rules", "indeterminate_rules", "error", "duration_ms"}
+
+// validateDecisionFieldNames checks the number and the names of the
+// decision fields; validateExpressions checks their expressions.
+func (c *Config) validateDecisionFieldNames() error {
+	const path = "log.decision_fields"
+	if len(c.Log.DecisionFields) > MaxDecisionFields {
+		return c.err(path, "more than "+strconv.Itoa(MaxDecisionFields)+" fields")
+	}
+	for _, k := range c.keys[path] {
+		switch {
+		case len(k.name) > MaxDecisionFieldNameLength || !decisionFieldNameRE.MatchString(k.name):
+			return c.errAt(path, k.at, "expected a name of lowercase letters, digits and underscores that starts with a letter, at most "+strconv.Itoa(MaxDecisionFieldNameLength)+" characters")
+		case slices.Contains(decisionEventFields, k.name):
+			return c.errAt(path, k.at, "the decision event already has a field of this name")
+		}
+	}
+	return nil
+}
+
+// validateEnrichment checks each database that the file writes. The files
+// of the databases are not read here: their loader reports their errors
+// with ErrorAt.
+func (c *Config) validateEnrichment() error {
+	for _, k := range c.DatabaseKinds() {
+		db, p := c.Enrichment.Database(k), "enrichment."+string(k)
+		switch {
+		case !c.present(p + ".database"):
+			return c.err(p+".database", "required")
+		case db.Database == "":
+			return c.err(p+".database", "must not be empty")
+		case !printable(db.Database):
+			return c.err(p+".database", "expected a path")
+		case db.Refresh < MinDatabaseRefresh:
+			return c.err(p+".refresh", "must be at least 1s")
+		}
+	}
+	return nil
+}
+
+// DatabaseKinds returns the kinds of the databases that the configuration
+// has, in the order of the configuration reference: geo, then asn.
+func (c *Config) DatabaseKinds() []enrichment.Kind {
+	var out []enrichment.Kind
+	for _, k := range enrichment.Kinds {
+		if c.Enrichment.Database(k) != nil {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // validateSets checks each set, in the order of the file. The files of the
@@ -183,6 +253,41 @@ func (c *Config) validateClientIP() error {
 		return c.err("client_ip.trusted_hops", "allowed only when client_ip.from is x_forwarded_for")
 	}
 	return nil
+}
+
+// validateSecretHeaders checks each item of secret_headers, in order: a
+// header name, not one that is always secret, not listed twice in any case,
+// and at most MaxSecretHeaders of them.
+func (c *Config) validateSecretHeaders() error {
+	seen := map[string]bool{}
+	for i, h := range c.SecretHeaders {
+		item, name := itemPath("secret_headers", i), strings.ToLower(h)
+		switch {
+		case i >= MaxSecretHeaders:
+			return c.err(item, "more than "+strconv.Itoa(MaxSecretHeaders)+" headers")
+		case !headerName(h):
+			return c.err(item, "expected a header name")
+		case slices.Contains(expr.AlwaysSecretHeaders, name):
+			return c.err(item, "this header is always secret")
+		case slices.Contains(c.SecretHeaders[:i], h):
+			return c.err(item, "the same header twice")
+		case seen[name]:
+			return c.err(item, "the same header twice, in different cases")
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+// SecretHeaderNames returns the names of secret_headers, in lowercase, in
+// the order of the file: the headers that the configuration makes secret, in
+// addition to expr.AlwaysSecretHeaders.
+func (c *Config) SecretHeaderNames() []string {
+	out := make([]string, len(c.SecretHeaders))
+	for i, h := range c.SecretHeaders {
+		out[i] = strings.ToLower(h)
+	}
+	return out
 }
 
 // headerName reports whether s is a field name of HTTP: a token of RFC 9110.

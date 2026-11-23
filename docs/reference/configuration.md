@@ -36,7 +36,9 @@ The schema does not check the rules between two keys, nor values that contain `$
 | expression | A string that holds an expression of the [expression language](./expressions.md). Write it in a literal block (`\|`), which YAML never reads otherwise, or in quotes, when YAML would read it as something else: when it starts with a character that YAML reserves (`!`, `&`, `*`, `\|`, `>`, `'`, `"`, `%`, `@`, a backtick, `#`, `,`, `[`, `]`, `{`, `}`, or `-`, `?` or `:` followed by a space), when it contains `: ` or ` #`, or when it is `true` or `false`. | `true` (a boolean), `!has(client.ip)` (a tag) |
 | list | A YAML sequence of mappings. | A mapping, a string |
 | list of values | A YAML sequence of strings; in an `asn` set, of strings and integers. | A mapping, a string |
+| list of strings | A YAML sequence of strings. | A mapping, a string, an item that is not a string |
 | mapping of strings | A YAML mapping from strings to strings. | A list, a value that is not a string |
+| mapping of expressions | A YAML mapping from names to expressions, each written as an expression. | A list, a value that is not a string |
 | mapping of mappings | A YAML mapping from names to mappings. | A list, a value that is not a mapping |
 
 No key accepts a negative duration.
@@ -59,7 +61,7 @@ log:
 
 ### Relative paths
 
-A relative path is relative to the directory of the configuration file, not to the working directory. The paths are the socket in [`server.listen`](#server-listen) and the files of the sets, [`sets.<name>.file`](#sets-name-file).
+A relative path is relative to the directory of the configuration file, not to the working directory. The paths are the socket in [`server.listen`](#server-listen), the files of the databases, [`enrichment.geo.database`](#enrichment-geo-database) and [`enrichment.asn.database`](#enrichment-asn-database), and the files of the sets, [`sets.<name>.file`](#sets-name-file).
 
 ### Error messages
 
@@ -73,8 +75,9 @@ tessera: server.drain_delay (line 3, column 16): expected a duration with units,
 - A required key that is missing has the position of the nearest block that is in the file, or no position: `policy.default_action: required`.
 - A YAML syntax error reports the line where the parser stopped, which can be before the mistake, with column 1: `configuration (line 2, column 1): invalid YAML syntax`. Some syntax errors, such as invalid UTF-8, have no line: `configuration: invalid YAML syntax`.
 - An unknown key is reported by its path, unless it is not a lowercase name of letters, digits and underscores: then it is reported as `<unknown>`.
-- The path of an item of a list has its index, from 0: `policy.rules[2].name`. An error about a key of a mapping of strings, such as a header name, names the mapping and has the position of the key.
+- The path of an item of a list has its index, from 0: `policy.rules[2].name`. An error about a key of a mapping of strings or of expressions, such as a header name, names the mapping and has the position of the key. An error in an expression of a mapping of expressions names the mapping too, such as `upstream.headers`, and has the position of the error in the expression.
 - The path of a key of a set has the name of the set: `sets.partners.file`. An invalid set name is reported as `sets`, at the position of the name.
+- A required key of a block that the file writes, such as `enrichment.geo.database`, has the position of the key of the block when it is missing.
 - Messages never repeat a configured value. They name keys, and the variable of a failed substitution. The one exception is an error in an expression, which can name an identifier or a type of the expression, such as `undefined field 'hots'`, but never a literal of it: a syntax error has only its position (see [`policy.rules[].when`](#policy-rules-when)).
 
 ## `server`
@@ -172,13 +175,14 @@ The address of the admin listener, in the `host:port` form of [`server.listen`](
 **Type:** mapping\
 **Default:** `{}`
 
-The log events, written to standard output. The [log reference](./logs.md) lists every event.
+The log events, written to standard output. The [log reference](./logs.md) lists every event, and [Log the decisions](../guide/responses-and-logs.md#log-the-decisions) shows how to choose the `decision` events and their fields.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
 | [`log.level`](#log-level) | string | `info` | `debug`, `info`, `warn`, `error` |
 | [`log.format`](#log-format) | string | `logfmt` | `logfmt`, `json` |
 | [`log.decisions`](#log-decisions) | string | `deny` | `none`, `deny`, `all` |
+| [`log.decision_fields`](#log-decision-fields) | mapping of expressions | `{}` | at most 32 fields; names of lowercase letters, digits and underscores |
 
 ### `log.level`
 
@@ -211,6 +215,33 @@ The decisions that tessera reports with a [`decision`](./logs.md#decision) event
 | `all` | Every decision. |
 
 [`log.level`](#log-level) applies too: a `decision` event has the level `info` when its action is `allow`, and `warn` when it is `deny`, so `log.level: warn` leaves out the allows.
+
+### `log.decision_fields`
+
+**Type:** mapping of expressions\
+**Default:** `{}`\
+**Allowed:** at most 32 fields; names of lowercase letters, digits and underscores
+
+Fields that every [`decision`](./logs.md#decision) event adds, from the name of each field to an [expression](./expressions.md#decision-fields) whose result is a string, its value:
+
+```yaml [config.yaml]
+enrichment:
+  geo:
+    database: geo.mmdb
+log:
+  decisions: all
+  decision_fields:
+    agent: request.headers["user-agent"]
+    country: geo.country.code
+```
+
+The fields follow `duration_ms`, in the order of their names (see [`decision`](./logs.md#decision)).
+
+- A name starts with a lowercase letter, followed by lowercase letters, digits and underscores, at most 63 characters, and is not a field that every `decision` event has: `ts`, `level`, `msg`, `request_id`, `host`, `method`, `path`, `client_ip`, `action`, `enforced`, `rule`, `reason`, `audit_rules`, `indeterminate_rules`, `error` and `duration_ms`.
+- tessera compiles each expression when it reads the configuration, as it compiles a condition (see [`policy.rules[].when`](#policy-rules-when)): its result is a string, such as `string(asn.number)` for a number. An error in it names `log.decision_fields`, at its position in the expression.
+- An expression cannot read the query of the request, a [secret header](#secret-headers), nor the map of the headers otherwise than by a literal name, which tessera never logs: see [Decision fields](./expressions.md#decision-fields).
+- tessera computes the fields only for the events that it writes, those that [`log.decisions`](#log-decisions) and [`log.level`](#log-level) select, after the decision and with what it read: the same sets and databases, and the record of the client address that a rule looked up.
+- A field whose expression fails, such as one that reads a missing header, is empty, and nothing counts or reports the failure. A value longer than 1024 bytes is cut at a character boundary.
 
 ## `client_ip`
 
@@ -273,6 +304,139 @@ With `trusted_hops: 1`, the header `192.0.2.66, 203.0.113.10, 198.51.100.5` give
 
 A header that is missing, or that has no more than `trusted_hops` entries, gives no client address, and so does an entry in that position that is not an address in a form that [`client_ip.from`](#client-ip-from) lists: tessera does not look for another entry. A request with several `X-Forwarded-For` headers has one list, since Envoy joins their values with commas.
 
+## `secret_headers`
+
+**Type:** list of strings\
+**Default:** `[]`\
+**Allowed:** at most 64 headers; header names, not `authorization`, `proxy-authorization` or `cookie`
+
+The headers of a request whose values are secret, such as an API key, in addition to `authorization`, `proxy-authorization` and `cookie`, which are always secret:
+
+```yaml [config.yaml]
+secret_headers:
+  - x-api-key
+  - x-session-token
+```
+
+tessera reads a secret header as any other: conditions and [upstream headers](#upstream-headers) read its value. Its value is kept out of what tessera writes:
+
+- a [decision field](#log-decision-fields) cannot read it, so a [`decision`](./logs.md#decision) event never holds it, and no other event does either (see [What is never logged](./logs.md#what-is-never-logged));
+- [`tessera eval`](./cli.md#the-output) shows its value as `[REDACTED]`, and the value of an upstream header whose expression reads it too.
+
+A name is an HTTP field name, in any case: letters, digits and the characters ``!#$%&'*+-.^_`|~``. Each problem is an error at the position of the item, which never repeats the name: `expected a header name`; `this header is always secret` for `authorization`, `proxy-authorization` and `cookie`; `the same header twice`, and `the same header twice, in different cases` for two names that differ only in case; `more than 64 headers`.
+
+## `enrichment`
+
+**Type:** mapping\
+**Default:** `{}`
+
+The databases that the attributes [`geo`](./expressions.md#geo) and [`asn`](./expressions.md#asn) read, which describe the client address: files in the MaxMind DB format (MMDB). [`enrichment.geo`](#enrichment-geo) is a database with the schema of GeoIP2 or GeoLite2 City or Country, and [`enrichment.asn`](#enrichment-asn) a database with the schema of GeoLite2 ASN, from MaxMind or from another provider that writes the same schema. [Enrich requests](../guide/enrichments.md) shows how to get the files, keep them up to date and use them.
+
+```yaml [config.yaml]
+enrichment:
+  geo:
+    database: geo.mmdb
+  asn:
+    database: asn.mmdb
+policy:
+  default_action: deny
+  rules:
+    - name: hosting-networks
+      action: deny
+      when: asn.number in [64500, 64501]
+    - name: european-union
+      action: allow
+      when: geo.country.in_eu
+```
+
+Each block is absent by default. Without it, its attribute does not exist, and a condition that reads it is a configuration error, at the position of the attribute. Without `enrichment.geo`, the file above stops with:
+
+```text
+tessera: policy.rules[1].when (line 12, column 13): geo is not available: the configuration has no enrichment.geo
+```
+
+tessera reads each database whole into memory when `tessera serve` starts, before it opens a socket, and so do `tessera config validate` and `tessera eval`. A file that does not exist or cannot be read, a file larger than 512 MiB and a file that is not a valid database are configuration errors, which name the key and its position, never the path of the file:
+
+```text
+tessera: enrichment.geo.database (line 3, column 15): the file is not a valid MMDB database
+```
+
+These checks are light: tessera checks the metadata of the database and decodes the records of its first networks, not every record. At least one of these records must have a key of the schema of the database, such as `country` or `location` for `geo` and `autonomous_system_number` for `asn`: a database of the other kind, such as an ASN file configured as `enrichment.geo`, is rejected, instead of answering that it has no address. A record that tessera cannot decode when a condition reads it makes the condition indeterminate, with the cause `database_error` (see [Indeterminate conditions](./expressions.md#indeterminate-conditions)).
+
+A database that no rule, [upstream header](#upstream-headers) or [decision field](#log-decision-fields) reads is read and checked all the same, and `tessera config validate` warns about it (see [`tessera config validate`](./cli.md#tessera-config-validate)). While it runs, `tessera serve` checks the file of each database every [`enrichment.geo.refresh`](#enrichment-geo-refresh) or [`enrichment.asn.refresh`](#enrichment-asn-refresh), and replaces the copy in use when the file has new valid content.
+
+| Key | Type | Default | Allowed |
+| --- | --- | --- | --- |
+| [`enrichment.geo`](#enrichment-geo) | mapping | none |  |
+| [`enrichment.geo.database`](#enrichment-geo-database) | string | required | nonempty; a path |
+| [`enrichment.geo.refresh`](#enrichment-geo-refresh) | duration | `1m` | positive; at least `1s` |
+| [`enrichment.asn`](#enrichment-asn) | mapping | none |  |
+| [`enrichment.asn.database`](#enrichment-asn-database) | string | required | nonempty; a path |
+| [`enrichment.asn.refresh`](#enrichment-asn-refresh) | duration | `1m` | positive; at least `1s` |
+
+### `enrichment.geo`
+
+**Type:** mapping\
+**Default:** none
+
+The database that [`geo`](./expressions.md#geo) reads: a database with the schema of GeoIP2 or GeoLite2 City or Country. From the record of the client address, tessera reads the country, whether it is in the European Union, the continent, the subdivisions, the city, the postal code, the time zone and the location. A Country database has no subdivisions, city, postal code, time zone or location. tessera does not check the type of the database that its metadata names: any database with this schema works.
+
+### `enrichment.geo.database`
+
+**Type:** string\
+**Default:** required\
+**Allowed:** nonempty; a path
+
+The path of the file of the database, relative to the directory of the configuration file when it is not absolute. The file is a regular file, or a symbolic link to one, of at most 512 MiB, in the MaxMind DB format: binary format 2, a tree of IPv4 addresses or of IPv6 addresses, and records of 24, 28 or 32 bits. tessera reads it whole into memory, so a database takes about the memory of its file. While tessera reads a new version of the file, the copy in use and the new one are both in memory.
+
+A file that tessera cannot use gives one of these problems, at startup in the configuration error and later in [`database_load_failed`](./logs.md#database-load-failed):
+
+| Problem | The file |
+| --- | --- |
+| `the file does not exist`, `not a regular file`, `the file cannot be opened: permission denied`, `the file cannot be opened`, `the file cannot be read` | Cannot be read. |
+| `the file is larger than 512 MiB` | Is larger than the ceiling. |
+| `the file is not a valid MMDB database` | Is not a database, or has a search tree or a record that tessera cannot read. |
+| `the MMDB database has an unsupported format: tessera reads binary format 2, IP version 4 or 6, and records of 24, 28 or 32 bits` | Is a database of another format. |
+| `a record of the database does not have the schema of a GeoIP2 City or Country database` | Has a record whose fields have other types than in this schema, or none of the records that tessera checks has a key of this schema (`continent`, `country`, `registered_country`, `represented_country`, `city`, `location`, `subdivisions` or `postal`), as in a database of the other kind. |
+
+### `enrichment.geo.refresh`
+
+**Type:** duration\
+**Default:** `1m`\
+**Allowed:** positive; at least `1s`
+
+How often tessera checks the file of the database, counted from the end of the previous check. tessera starts the checks once it is ready, and the first comes `refresh` later. A check works as for the file of a set, which [`sets.<name>.refresh`](#sets-name-refresh) describes: a file that is unchanged is not read again, and a file with new content is read whole and checked as at startup.
+
+- Valid content that differs from that of the copy in use replaces the copy, atomically: the decisions in progress finish with the copy they had, and the next decisions read the new one, without a restart.
+- Content equal to that of the copy in use changes nothing.
+- Invalid content, a database of the other kind, and a file larger than 512 MiB, reject the file, and the copy in use stays; tessera does not read that version of the file again until it changes.
+- A file that does not exist, cannot be opened or read, or is not a regular file fails the check, and the copy in use stays.
+
+A database has no limit of age and is never unavailable: once loaded at startup, the last valid copy stays in use until a new one replaces it. [`tessera_enrichment_database_refreshes_total`](./metrics.md#tessera-enrichment-database-refreshes-total) counts every check by its result, and the events [`database_loaded`](./logs.md#database-loaded) and [`database_load_failed`](./logs.md#database-load-failed) report a new copy and a new failure. Replace the file by renaming a new file over it, in the same directory. A file written in place can be read while it is half written: it is usually rejected, but a file whose end, with the metadata, is already written can be accepted while the records it points to are not complete yet, and conditions then fail with `database_error` or read old records, until a later check reads the complete file. A change of the size or of the modification time of the file makes tessera read it again, and so does a version modified less than 2 seconds before tessera read it (see [`sets.<name>.refresh`](#sets-name-refresh)).
+
+### `enrichment.asn`
+
+**Type:** mapping\
+**Default:** none
+
+The database that [`asn`](./expressions.md#asn) reads: a database with the schema of GeoLite2 ASN. From the record of the client address, tessera reads the autonomous system number and the name of its organization. tessera does not check the type of the database that its metadata names.
+
+### `enrichment.asn.database`
+
+**Type:** string\
+**Default:** required\
+**Allowed:** nonempty; a path
+
+The path of the file of the database, with the rules of [`enrichment.geo.database`](#enrichment-geo-database). A record whose fields have other types than in the schema of GeoLite2 ASN, or records that tessera checks without any key of this schema (`autonomous_system_number` or `autonomous_system_organization`), as in a database of the other kind, give the problem `a record of the database does not have the schema of a GeoLite2 ASN database`.
+
+### `enrichment.asn.refresh`
+
+**Type:** duration\
+**Default:** `1m`\
+**Allowed:** positive; at least `1s`
+
+How often tessera checks the file of the database, as [`enrichment.geo.refresh`](#enrichment-geo-refresh) describes.
+
 ## `sets`
 
 **Type:** mapping of mappings\
@@ -306,7 +470,7 @@ tessera reads every set when `tessera serve` starts, before it opens a socket, a
 tessera: sets.partners.file (line 9, column 11): line 12 of the file: the value has a control character
 ```
 
-A set that no rule reads is read and checked all the same, and `tessera config validate` warns about it (see [`tessera config validate`](./cli.md#tessera-config-validate)). While it runs, `tessera serve` checks the file of each set every [`sets.<name>.refresh`](#sets-name-refresh), and replaces the copy of the set when the file has new valid content. [Use sets](../guide/sets.md) shows how to declare, use and update sets.
+A set that no rule, [upstream header](#upstream-headers) or [decision field](#log-decision-fields) reads is read and checked all the same, and `tessera config validate` warns about it (see [`tessera config validate`](./cli.md#tessera-config-validate)). While it runs, `tessera serve` checks the file of each set every [`sets.<name>.refresh`](#sets-name-refresh), and replaces the copy of the set when the file has new valid content. [Use sets](../guide/sets.md) shows how to declare, use and update sets.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
@@ -424,7 +588,7 @@ The largest number of entries of the set. An entry is a value of the source: an 
 **Type:** mapping\
 **Default:** required
 
-How tessera decides. tessera evaluates the rules in the order of [`policy.rules`](#policy-rules): the first whose condition is true decides, and a request that no rule decides gets [`policy.default_action`](#policy-default-action). [Write rules](../guide/write-rules.md) explains how to build a policy, and the [expression language reference](./expressions.md) describes the conditions.
+How tessera decides. tessera evaluates the rules in the order of [`policy.rules`](#policy-rules): the first whose condition is true decides, and a request that no rule decides gets [`policy.default_action`](#policy-default-action). [Write policy rules](../guide/policy-rules.md) explains how to build a policy, and the [expression language reference](./expressions.md) describes the conditions.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
@@ -451,7 +615,7 @@ How tessera decides. tessera evaluates the rules in the order of [`policy.rules`
 **Default:** `enforce`\
 **Allowed:** `enforce`, `audit`
 
-`enforce` applies the decisions. `audit` allows every request, while tessera decides each one as it would in `enforce` mode and reports a denial that it did not enforce with `enforced=false`, in the [`decision`](./logs.md#decision) event and in [`tessera_decisions_total`](./metrics.md#tessera-decisions-total). Try a policy on real traffic this way before you enforce it: see [Audit a policy](../guide/write-rules.md#audit-a-policy). [`tessera_policy_audit_mode`](./metrics.md#tessera-policy-audit-mode) is `1` in `audit` mode.
+`enforce` applies the decisions. `audit` allows every request, while tessera decides each one as it would in `enforce` mode and reports a denial that it did not enforce with `enforced=false`, in the [`decision`](./logs.md#decision) event and in [`tessera_decisions_total`](./metrics.md#tessera-decisions-total). Try a policy on real traffic this way before you enforce it: see [Audit a policy](../guide/policy-rules.md#audit-a-policy). [`tessera_policy_audit_mode`](./metrics.md#tessera-policy-audit-mode) is `1` in `audit` mode.
 
 ### `policy.default_action`
 
@@ -466,7 +630,7 @@ The decision for a request that no rule decides: `allow` lets Envoy send the req
 **Type:** mapping\
 **Default:** `{}`
 
-What Envoy answers the client when tessera denies a request, unless the rule that denies it has a [`response`](#policy-rules-response) of its own. The [gRPC API reference](./grpc-api.md#authorization-service) describes how tessera sends it to Envoy.
+What Envoy answers the client when tessera denies a request, unless the rule that denies it has a [`response`](#policy-rules-response) of its own. The [gRPC API reference](./grpc-api.md#authorization-service) describes how tessera sends it to Envoy, and [Choose what Envoy answers](../guide/responses-and-logs.md#choose-what-envoy-answers) shows an example.
 
 ### `policy.deny_response.status`
 
@@ -504,7 +668,7 @@ policy:
 ```
 
 - A name is an HTTP field name, in any case: letters, digits and the characters ``!#$%&'*+-.^_`|~``. tessera sends it in lowercase. Two names that differ only in case are an error.
-- A value has no control character other than the horizontal tab.
+- A value has no ASCII control character other than the horizontal tab: no character below `0x20` but the tab, and no `0x7f`.
 - These headers are not allowed, because Envoy sets them itself or they describe the connection rather than the response: `connection`, `content-length`, `keep-alive`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`.
 
 Envoy adds headers of its own to a denial, such as `date`, and by default replaces `server` with its own.
@@ -562,7 +726,7 @@ What the rule does with a request whose condition is true. A condition that cann
 **Default:** `enforce`\
 **Allowed:** `enforce`, `audit`
 
-`enforce` lets the rule decide. A rule in `audit` mode never decides: when its condition is true, tessera reports the match, in `audit_rules` of the [`decision`](./logs.md#decision) event and in [`tessera_audit_matches_total`](./metrics.md#tessera-audit-matches-total), and goes on to the next rule; when its condition cannot be evaluated, tessera counts it in [`tessera_rule_evaluation_errors_total`](./metrics.md#tessera-rule-evaluation-errors-total) and goes on too. See [Audit a rule](../guide/write-rules.md#audit-a-rule).
+`enforce` lets the rule decide. A rule in `audit` mode never decides: when its condition is true, tessera reports the match, in `audit_rules` of the [`decision`](./logs.md#decision) event and in [`tessera_audit_matches_total`](./metrics.md#tessera-audit-matches-total), and goes on to the next rule; when its condition cannot be evaluated, tessera counts it in [`tessera_rule_evaluation_errors_total`](./metrics.md#tessera-rule-evaluation-errors-total) and goes on too. See [Audit a rule](../guide/policy-rules.md#audit-a-rule).
 
 ### `policy.rules[].when`
 
@@ -620,3 +784,44 @@ The body of a denial by this rule, as in [`policy.deny_response.body`](#policy-d
 **Allowed:** header names and values
 
 The headers of a denial by this rule, with the rules of [`policy.deny_response.headers`](#policy-deny-response-headers). They replace `policy.deny_response.headers` as a whole, and are not merged with them: write every header that the denial needs, or `headers: {}` for none.
+
+## `upstream`
+
+**Type:** mapping\
+**Default:** `{}`
+
+What tessera adds to the requests that Envoy sends on to the upstream, the service behind Envoy. [Send headers to the upstream](../guide/responses-and-logs.md#send-headers-to-the-upstream) shows how to use it.
+
+| Key | Type | Default | Allowed |
+| --- | --- | --- | --- |
+| [`upstream.headers`](#upstream-headers) | mapping of expressions | `{}` | at most 64 headers; header names |
+
+### `upstream.headers`
+
+**Type:** mapping of expressions\
+**Default:** `{}`\
+**Allowed:** at most 64 headers; header names
+
+The headers that tessera sets on the requests that Envoy sends on, from the name of each header to an [expression](./expressions.md#upstream-headers) whose result is a string, its value:
+
+```yaml [config.yaml]
+enrichment:
+  geo:
+    database: geo.mmdb
+  asn:
+    database: asn.mmdb
+upstream:
+  headers:
+    x-client-country: geo.country.code
+    x-client-asn: 'asn.found ? string(asn.number) : ""'
+```
+
+- tessera computes the headers for every request that Envoy sends on: an allowed request, and a denied request that [`policy.mode: audit`](#policy-mode) lets through. A denial has none. It computes them after the decision, with what the rules read: the same sets and databases, and the record of the client address that a rule looked up.
+- A header declared here belongs to tessera: its value replaces the one that the client sent, and when tessera has no value for it, tessera asks Envoy to remove the header that the client sent. Either way, the value of the client does not reach the upstream.
+- tessera removes the header when its expression gives an empty string, fails, or gives a value that cannot be sent: longer than 4096 bytes, with an ASCII control character other than the horizontal tab, or not valid UTF-8. The decision does not change. [`tessera_upstream_header_errors_total`](./metrics.md#tessera-upstream-header-errors-total) counts the failures and the invalid values, but not an empty string, which removes the header on purpose: `asn.found ? string(asn.number) : ""` sends no header for an address that the database does not have.
+- A name is an HTTP field name, in any case: letters, digits and the characters ``!#$%&'*+-.^_`|~``. tessera sends it in lowercase. Two names that differ only in case are an error.
+- These headers are not allowed, because they change the meaning of the request, hold its credentials, or belong to Envoy: `host`, `content-length`, `transfer-encoding`, `connection`, `authorization`, `proxy-authorization`, `cookie`, `keep-alive`, `proxy-connection`, `te`, `trailer`, `upgrade`, and every name that starts with `x-envoy-`.
+- tessera compiles each expression when it reads the configuration, as it compiles a condition (see [`policy.rules[].when`](#policy-rules-when)): its result is a string. An error in it names `upstream.headers`, at its position in the expression. An expression can read every attribute, the query and the [secret headers](#secret-headers) included.
+- Set Envoy to reject or drop the headers whose names have underscores, so that a client cannot send a header whose name differs from an upstream header only by underscores: see [Header names with underscores](./grpc-api.md#header-names-with-underscores).
+
+The [gRPC API reference](./grpc-api.md#authorization-service) describes how tessera sends the headers to Envoy, and [`tessera eval`](./cli.md#upstream-headers) shows them for a request.

@@ -6,6 +6,8 @@ description: "How to declare the sets of tessera, use them in rules, update thei
 
 A set is a named list of networks, autonomous system numbers or strings that the rules of **tessera** read, kept apart from the rules. This page shows how to declare a set, use it in a rule, update its file while tessera runs, read it from a Kubernetes ConfigMap, choose what a set that tessera cannot keep up to date answers, and try a change before you make it. The [configuration reference](../reference/configuration.md#sets) describes every key.
 
+Sets come after the [enrichments](./enrichments.md) in the [path of a request](./how-tessera-works.md#sets): the [policy rules](./policy-rules.md) look values up in them, such as the client address or its autonomous system.
+
 ## Declare a set
 
 Each key of [`sets`](../reference/configuration.md#sets) is the name of a set, with its [type](../reference/configuration.md#sets-name-type) and one source:
@@ -36,7 +38,7 @@ A relative path is relative to the directory of the configuration file. tessera 
 
 ## Use a set in a rule
 
-A condition reads the set `blocked` as `sets.blocked`, and looks a value up with [`contains`](../reference/expressions.md#sets). The argument has the type of the set: an address, such as `client.ip`, for a `cidr` set, an `int` for an `asn` set, and a `string`, such as `request.host`, for a `string` set.
+A condition reads the set `blocked` as `sets.blocked`, and looks a value up with [`contains`](../reference/expressions.md#sets). The argument has the type of the set: an address, such as `client.ip`, for a `cidr` set, an `int`, such as [`asn.number`](../reference/expressions.md#asn), for an `asn` set, and a `string`, such as `request.host`, for a `string` set.
 
 ```yaml [config.yaml]
 sets:

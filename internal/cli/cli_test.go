@@ -254,7 +254,8 @@ func TestConfigValidateExpressions(t *testing.T) {
 		err        string
 	}{
 		{"valid", "      when: client.ip.inCidr(\"192.0.2.0/24\") && request.path.startsWith(\"/admin\")\n", 0, ""},
-		{"unknown attribute", "      when: geo.country == \"IT\"\n", 2, "tessera: policy.rules[0].when (line 6, column 13): undeclared reference to 'geo'\n"},
+		{"unknown attribute", "      when: georgia == \"IT\"\n", 2, "tessera: policy.rules[0].when (line 6, column 13): undeclared reference to 'georgia'\n"},
+		{"geo without enrichment.geo", "      when: geo.country.code == \"IT\"\n", 2, "tessera: policy.rules[0].when (line 6, column 13): geo is not available: the configuration has no enrichment.geo\n"},
 		{"unknown field", "      when: |\n        has(client.ip) &&\n          request.hots == \"www.example.com\"\n", 2, "tessera: policy.rules[0].when (line 8, column 18): undefined field 'hots'\n"},
 		{"wrong type", "      when: request.host == 443\n", 2, "tessera: policy.rules[0].when (line 6, column 26): found no matching overload for '_==_' applied to '(string, int)'\n"},
 		{"not a bool", "      when: request.path\n", 2, "tessera: policy.rules[0].when (line 6, column 13): the condition must be a bool, not string\n"},

@@ -47,6 +47,10 @@ type RecorderOptions struct {
 	Rules []string
 	// Dropped, when set, is called for each decision event dropped.
 	Dropped func()
+	// Fields, when set, computes the decision fields of a decision, as
+	// engine.Engine.DecisionFields does: it is called only for a decision
+	// event that is written, on the goroutine of the decision.
+	Fields func(engine.Decision) []engine.Field
 
 	// The bounds, which tests lower: zero values select the constants.
 	maxEvents int
@@ -63,6 +67,7 @@ type RecorderOptions struct {
 // neither floods the destination nor slows the requests.
 type Recorder struct {
 	decisions string
+	fields    func(engine.Decision) []engine.Field
 	logger    *slog.Logger // into the queue
 	reports   *slog.Logger // into the destination, from the writer goroutine
 	dest      *Shared
@@ -133,6 +138,7 @@ func NewRecorder(dest *Shared, o RecorderOptions) *Recorder {
 	}
 	r := &Recorder{
 		decisions: o.Log.Decisions,
+		fields:    o.Fields,
 
 		dest:     dest,
 		dropped:  o.Dropped,
@@ -154,7 +160,7 @@ func NewRecorder(dest *Shared, o RecorderOptions) *Recorder {
 		if _, ok := r.panics[rule]; ok {
 			continue
 		}
-		for _, cause := range []expr.Cause{expr.CauseClientIPMissing, expr.CauseExpression, expr.CausePanic, expr.CauseSetUnavailable} {
+		for _, cause := range expr.Causes {
 			r.errors[errorKey{rule, cause}] = &slot{rule: rule, cause: cause}
 		}
 		r.panics[rule] = &slot{rule: rule}
@@ -166,7 +172,8 @@ func NewRecorder(dest *Shared, o RecorderOptions) *Recorder {
 }
 
 // Decision writes the decision event of d, the decision for req, when
-// log.decisions and log.level select it.
+// log.decisions and log.level select it, with its decision fields, which it
+// computes only then.
 func (r *Recorder) Decision(d engine.Decision, req *request.Request) {
 	if !r.logs(d) {
 		return
@@ -209,6 +216,12 @@ func (r *Recorder) Decision(d engine.Decision, req *request.Request) {
 		attrs = append(attrs, slog.String("error", string(d.Cause)))
 	}
 	attrs = append(attrs, slog.Float64("duration_ms", Milliseconds(d.Duration)))
+	if r.fields != nil {
+		// In the order of their names, cut as the values of the request.
+		for _, f := range r.fields(d) {
+			attrs = append(attrs, slog.String(f.Name, bounded(f.Value)))
+		}
+	}
 	r.logger.LogAttrs(ctx, level, "decision", attrs...)
 }
 

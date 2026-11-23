@@ -6,6 +6,8 @@ description: "How to choose where tessera reads the client address of a request,
 
 **tessera** reads the address of the client that sent each request from one source, which you declare in [`client_ip`](../reference/configuration.md#client-ip). This page helps you choose the source for the way clients reach Envoy, and shows what to configure in Envoy for it.
 
+The client address comes right after Envoy's check in the [path of a request](./how-tessera-works.md#client-address): the [enrichments](./enrichments.md) describe it, and the [policy rules](./policy-rules.md) read it as `client.ip`.
+
 ## Choose a source
 
 | Clients reach Envoy | Source | In Envoy |

@@ -52,7 +52,7 @@ func TestConfigValidateSets(t *testing.T) {
 	path := writeSets(t, "# partners\napi.example.com\n")
 	// A set that no rule reads is a warning: the configuration stays valid.
 	code, out, errOut := execute([]string{"config", "validate", "--config", path})
-	if code != 0 || out != "configuration valid\n" || errOut != "tessera: warning: sets.unused (line 8, column 3): the set is not used by any rule\n" {
+	if code != 0 || out != "configuration valid\n" || errOut != "tessera: warning: sets.unused (line 8, column 3): the set is not used by any rule, upstream header or decision field\n" {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
 	}
 

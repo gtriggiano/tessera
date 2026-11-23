@@ -66,11 +66,11 @@ func TestSets(t *testing.T) {
 	}
 	// blocked is the one set that no rule reads; a rule in audit mode
 	// reads partners.
-	wantWarnings := []Warning{{Path: "sets.blocked", Line: 19, Column: 3, Problem: "the set is not used by any rule"}}
+	wantWarnings := []Warning{{Path: "sets.blocked", Line: 19, Column: 3, Problem: "the set is not used by any rule, upstream header or decision field"}}
 	if got := c.Warnings(); !reflect.DeepEqual(got, wantWarnings) {
 		t.Errorf("warnings %+v", got)
 	}
-	if got := wantWarnings[0].String(); got != "sets.blocked (line 19, column 3): the set is not used by any rule" {
+	if got := wantWarnings[0].String(); got != "sets.blocked (line 19, column 3): the set is not used by any rule, upstream header or decision field" {
 		t.Errorf("warning %q", got)
 	}
 	if err := c.ErrorAt("sets.partners.file", "line 7 of the file: the value is empty"); err == nil || err.Error() != "sets.partners.file (line 14, column 11): line 7 of the file: the value is empty" {

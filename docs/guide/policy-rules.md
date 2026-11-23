@@ -1,10 +1,12 @@
 ---
-description: "How to write the rules of a tessera policy: their order, the default action, conditions that cannot be evaluated, a missing client address, audit mode, and the responses of denials."
+description: "How tessera decides with the policy rules, and how to order them, write conditions on the client address, the enrichments and the sets, handle conditions that cannot be evaluated and a missing client address, audit a rule or a policy, and try and check the rules."
 ---
 
-# Write rules
+# Write policy rules
 
-**tessera** decides each request with the rules of [`policy.rules`](../reference/configuration.md#policy-rules), whose conditions are written in the [expression language](../reference/expressions.md). This page explains how tessera applies the rules, how to order them, how to handle data that is missing, how to try rules before you enforce them, and how to choose what Envoy answers a denied client.
+**tessera** decides each request with the rules of [`policy.rules`](../reference/configuration.md#policy-rules), whose conditions are written in the [expression language](../reference/expressions.md). This page explains how tessera applies the rules, how to order them, what their conditions can read, how to handle data that is missing, and how to try rules before you enforce them.
+
+The rules are the step of the [path of a request](./how-tessera-works.md#policy-rules) that decides. Their conditions read the request, the [client address](./client-address.md), the [enrichments](./enrichments.md) and the [sets](./sets.md), and [Shape responses and logs](./responses-and-logs.md) shows what tessera answers and records once they decide.
 
 ## How tessera decides
 
@@ -63,6 +65,36 @@ policy:
 
 A rule without `when` matches every request, so it can only be the last rule: tessera rejects a configuration with rules after it, which would never be evaluated. [`docs/examples/rules.yaml`](#a-complete-example) is a complete configuration with more rules.
 
+## Read the client, its enrichments and the sets
+
+A condition can read more than the request:
+
+- the client address, `client.ip`, with the [functions on addresses](../reference/expressions.md#functions), such as `client.ip.inCidr("203.0.113.0/24")`: [Set the client address](./client-address.md) shows where tessera reads it;
+- the enrichments of the client address: its country, region, city and location with [`geo`](../reference/expressions.md#geo), and its autonomous system with [`asn`](../reference/expressions.md#asn), such as `geo.country.code in ["IT", "FR"]`, once [Enrich requests](./enrichments.md) has set them up;
+- the sets, lists kept apart from the rules, with [`sets.<name>.contains(value)`](../reference/expressions.md#sets): [Use sets](./sets.md) shows how to declare and update them.
+
+```yaml [config.yaml]
+enrichment:
+  asn:
+    database: /var/lib/geoip/GeoLite2-ASN.mmdb
+sets:
+  blocked:
+    type: cidr
+    file: blocked.txt
+policy:
+  default_action: deny
+  rules:
+    - name: blocked-networks
+      action: deny
+      when: sets.blocked.contains(client.ip)
+    - name: hosting-networks
+      action: deny
+      when: asn.number in [64500, 64501]
+    - name: office
+      action: allow
+      when: client.ip.inCidr("203.0.113.0/24")
+```
+
 ## Conditions that cannot be evaluated
 
 A condition is indeterminate when its evaluation fails and its result depends on the failure: for example, it reads `client.ip` and the request has no client address, or it reads `request.headers["x-api-key"]` and the request has no such header. [Indeterminate conditions](../reference/expressions.md#indeterminate-conditions) lists the causes.
@@ -78,7 +110,7 @@ To keep a condition from depending on data that can be missing, test it first: `
 
 ## Handle a missing client address
 
-A request has no client address when the source that [`client_ip`](../reference/configuration.md#client-ip) declares gives none. Every rule that reads `client.ip` then counts against allowing. To decide such requests yourself, put a rule that tests `has(client.ip)` before the rules that read the address.
+A request has no client address when the source that [`client_ip`](../reference/configuration.md#client-ip) declares gives none. Every rule that reads `client.ip`, `geo` or `asn` then counts against allowing. To decide such requests yourself, put a rule that tests `has(client.ip)` before the rules that read the address.
 
 To answer them with a response of their own:
 
@@ -146,28 +178,6 @@ policy:
       action: allow
       when: client.ip.inCidr("203.0.113.0/24")
 ```
-
-## Choose what Envoy answers
-
-A denied client gets the status, body and headers of [`policy.deny_response`](../reference/configuration.md#policy-deny-response), `403` without a body by default. A `deny` rule can have a [`response`](../reference/configuration.md#policy-rules-response) of its own, whose keys replace those of `policy.deny_response`:
-
-```yaml [config.yaml]
-policy:
-  default_action: deny
-  deny_response:
-    body: '{"error": "forbidden"}'
-    headers:
-      content-type: application/json
-  rules:
-    - name: admin
-      action: deny
-      when: request.path.startsWith("/admin") && !client.ip.inCidr("203.0.113.0/24")
-      response:
-        status: 404
-        body: '{"error": "not found"}'
-```
-
-A request denied by `admin` gets `404`, the body `{"error": "not found"}` and the header `content-type: application/json`; any other denied request gets `403` and the body `{"error": "forbidden"}`.
 
 ## Try a request
 

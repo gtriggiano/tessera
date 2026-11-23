@@ -8,6 +8,7 @@ package metrics
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/gtriggiano/tessera/internal/engine"
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
@@ -24,11 +26,9 @@ import (
 var DurationBuckets = []float64{0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1}
 
 // RefreshBuckets are the upper bounds, in seconds, of the buckets of
-// tessera_set_refresh_duration_seconds.
+// tessera_set_refresh_duration_seconds and
+// tessera_enrichment_database_refresh_duration_seconds.
 var RefreshBuckets = []float64{0.0001, 0.001, 0.01, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
-
-// causes are the values of the label cause.
-var causes = []expr.Cause{expr.CauseClientIPMissing, expr.CauseExpression, expr.CausePanic, expr.CauseSetUnavailable}
 
 const namespace = "tessera"
 
@@ -46,6 +46,7 @@ type Metrics struct {
 	duration    *prometheus.HistogramVec
 	auditTotal  *prometheus.CounterVec
 	errorsTotal *prometheus.CounterVec
+	headerErrs  *prometheus.CounterVec
 	dropped     prometheus.Counter
 
 	setLabels      map[string]setLabels // of each declared set
@@ -54,17 +55,24 @@ type Metrics struct {
 	setLastSuccess *prometheus.GaugeVec
 	setRefreshes   *prometheus.CounterVec
 	setDuration    *prometheus.HistogramVec
+
+	databases     map[enrichment.Kind]bool // the configured ones
+	dbBuild       *prometheus.GaugeVec
+	dbRefreshes   *prometheus.CounterVec
+	dbLastSuccess *prometheus.GaugeVec
+	dbDuration    *prometheus.HistogramVec
 }
 
 // New returns the metrics of a process built as build, whose configuration
 // has the hash configHash, the hexadecimal SHA-256 of the output of tessera
-// config print, the policy p and the sets declared. It registers the Go and
-// process collectors too.
+// config print, the policy p, the sets declared and the databases of the
+// kinds databases. It registers the Go and process collectors too.
 //
-// Every series that p and declared can produce exists from the start, at
-// zero: label values come from the configuration and fixed sets only, so the
-// number of series depends on the configuration alone.
-func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.Declaration) *Metrics {
+// Every series that p, its upstream headers included, declared and
+// databases can produce exists from the start, at zero: label values come
+// from the configuration and fixed sets only, so the number of series
+// depends on the configuration alone.
+func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.Declaration, databases []enrichment.Kind) *Metrics {
 	reg := prometheus.NewRegistry()
 	buildInfo := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   namespace,
@@ -109,6 +117,11 @@ func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.De
 			Name:      "rule_evaluation_errors_total",
 			Help:      "Conditions of rules that could not be evaluated, by rule and cause.",
 		}, []string{"rule", "cause"}),
+		headerErrs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "upstream_header_errors_total",
+			Help:      "Upstream headers removed because their expression failed or gave a value that cannot be sent, by header and cause.",
+		}, []string{"header", "cause"}),
 		dropped: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "decision_logs_dropped_total",
@@ -141,6 +154,28 @@ func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.De
 			Help:      "The time of a check of the source of a set that refreshes, the load at startup included, by set, type and source.",
 			Buckets:   RefreshBuckets,
 		}, []string{"set", "type", "source"}),
+		databases: map[enrichment.Kind]bool{},
+		dbBuild: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "enrichment_database_build_timestamp_seconds",
+			Help:      "The build time of the database in use, from its metadata, in seconds since the Unix epoch, by database.",
+		}, []string{"database"}),
+		dbRefreshes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "enrichment_database_refreshes_total",
+			Help:      "Checks of the file of a database, the load at startup included, by database and result.",
+		}, []string{"database", "result"}),
+		dbLastSuccess: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "enrichment_database_last_refresh_success_timestamp_seconds",
+			Help:      "The Unix time of the last successful check of the file of a database, unchanged or updated, by database.",
+		}, []string{"database"}),
+		dbDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "enrichment_database_refresh_duration_seconds",
+			Help:      "The time of a check of the file of a database, the load at startup included, by database.",
+			Buckets:   RefreshBuckets,
+		}, []string{"database"}),
 	}
 	auditMode := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
@@ -152,7 +187,7 @@ func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.De
 	}
 	enforced := func(a engine.Action) string { return strconv.FormatBool(!(p.Audit && a == engine.Deny)) }
 	for _, r := range p.Rules {
-		for _, c := range causes {
+		for _, c := range expr.Causes {
 			m.errorsTotal.WithLabelValues(r.Name, string(c))
 		}
 		if r.Audit {
@@ -165,6 +200,11 @@ func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.De
 		}
 	}
 	m.decisions.WithLabelValues(string(p.DefaultAction), enforced(p.DefaultAction), engine.DefaultRule, string(engine.ReasonDefault))
+	for _, h := range p.UpstreamHeaders {
+		for _, c := range expr.Causes {
+			m.headerErrs.WithLabelValues(strings.ToLower(h.Name), string(c))
+		}
+	}
 	for _, a := range []engine.Action{engine.Allow, engine.Deny} {
 		m.duration.WithLabelValues(string(a))
 	}
@@ -182,6 +222,15 @@ func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.De
 		}
 		m.setDuration.WithLabelValues(d.Name, l.typ, l.source)
 	}
+	for _, k := range databases {
+		m.databases[k] = true
+		m.dbBuild.WithLabelValues(string(k))
+		m.dbLastSuccess.WithLabelValues(string(k))
+		m.dbDuration.WithLabelValues(string(k))
+		for _, r := range sets.RefreshResults {
+			m.dbRefreshes.WithLabelValues(string(k), string(r))
+		}
+	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
@@ -193,12 +242,17 @@ func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.De
 		m.duration,
 		m.auditTotal,
 		m.errorsTotal,
+		m.headerErrs,
 		m.dropped,
 		m.setEntries,
 		m.setAvailable,
 		m.setLastSuccess,
 		m.setRefreshes,
 		m.setDuration,
+		m.dbBuild,
+		m.dbRefreshes,
+		m.dbLastSuccess,
+		m.dbDuration,
 	)
 	m.handler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	return m
@@ -213,6 +267,11 @@ func (m *Metrics) Decided(d engine.Decision) {
 	}
 	for _, e := range d.Errors {
 		m.errorsTotal.WithLabelValues(e.Rule, string(e.Cause)).Inc()
+	}
+	for _, h := range d.Upstream {
+		if h.Cause != "" {
+			m.headerErrs.WithLabelValues(h.Name, string(h.Cause)).Inc()
+		}
 	}
 }
 
@@ -261,6 +320,30 @@ func (m *Metrics) SetAvailable(name string, available bool) {
 	}
 	l := m.setLabels[name]
 	m.setAvailable.WithLabelValues(name, l.typ, l.source).Set(v)
+}
+
+// DatabaseRefreshed records a check of the file of the database of kind k,
+// or its load at startup: its result, how long it took, and when it ended,
+// which is the time of the last successful check when the result is updated
+// or unchanged. It records nothing for a database that is not configured.
+func (m *Metrics) DatabaseRefreshed(k enrichment.Kind, r sets.RefreshResult, took time.Duration, at time.Time) {
+	if !m.databases[k] {
+		return
+	}
+	m.dbRefreshes.WithLabelValues(string(k), string(r)).Inc()
+	m.dbDuration.WithLabelValues(string(k)).Observe(took.Seconds())
+	if r == sets.RefreshUpdated || r == sets.RefreshUnchanged {
+		m.dbLastSuccess.WithLabelValues(string(k)).Set(float64(at.UnixNano()) / 1e9)
+	}
+}
+
+// DatabaseBuilt records the build time of the copy in use of the database
+// of kind k.
+func (m *Metrics) DatabaseBuilt(k enrichment.Kind, built time.Time) {
+	if !m.databases[k] {
+		return
+	}
+	m.dbBuild.WithLabelValues(string(k)).Set(float64(built.Unix()))
 }
 
 // Handler serves the registry in the Prometheus exposition format.

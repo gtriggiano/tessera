@@ -1,13 +1,13 @@
 ---
-description: "The problem tessera is being built to solve, what it leaves to other tools, and how it compares with the alternatives."
+description: "The problem tessera solves, what it leaves to other tools, and how it compares with the alternatives."
 ---
 
 # What is tessera?
 
-**tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/), in development. This page describes the problem it is being built to solve, what it leaves to other tools, and how it compares with the alternatives.
+**tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/). This page describes the problem it solves, what it leaves to other tools, and how it compares with the alternatives.
 
 ::: warning In development
-tessera has no release yet. [`tessera serve`](../reference/cli.md#tessera-serve) decides Envoy's authorization requests with [ordered rules](./write-rules.md) on the host, method, path and headers of each request, on the client address, and on [sets](./sets.md) of networks, AS numbers or strings written in the configuration or read from local files, which it reloads when they change. Remote lists, the location data and the client software described on this page do not work yet. Each feature gets its own page when it lands.
+tessera has no release yet. [`tessera serve`](../reference/cli.md#tessera-serve) decides Envoy's authorization requests with [ordered rules](./policy-rules.md) on the host, method, path and headers of each request, on the client address, on the location and autonomous system that [enrichments](./enrichments.md) derive from it with MaxMind DB files, and on [sets](./sets.md) of networks, AS numbers or strings written in the configuration or read from local files. It reloads those files when they change.
 :::
 
 ## The problem
@@ -21,7 +21,7 @@ Teams that run an ingress based on Envoy often need to answer questions like the
 
 Envoy's own filters answer part of this: the RBAC filter, for example, matches addresses and headers against lists written in Envoy's configuration, so updating a list means updating that configuration. General-purpose policy engines can answer all of it, but they ask you to learn a language, to source the data and to build the rest yourself.
 
-tessera is being built to sit in between. Envoy will ask it about each HTTP request through the `ext_authz` filter, and tessera will decide from who sends the request (address, network, location, client software) and what it asks for (host, method, path), with ordered rules declared in one YAML file.
+tessera sits in between. Envoy asks it about each HTTP request through the `ext_authz` filter, and tessera decides from who sends the request (address, network, location, autonomous system) and what it asks for (host, method, path, headers), with ordered rules declared in one YAML file. [How tessera works](./how-tessera-works.md) follows a request through these steps.
 
 ## What it leaves to other tools
 
@@ -34,9 +34,9 @@ tessera is being built to sit in between. Envoy will ask it about each HTTP requ
 
 ## Compared with the alternatives
 
-| Alternative | What it offers | How tessera is meant to differ |
+| Alternative | What it offers | How tessera differs |
 | --- | --- | --- |
-| Envoy's RBAC filter | Rules on addresses and headers, in Envoy's configuration | The policy lives in one file of its own, with lists that refresh without touching Envoy's configuration, and with country and network data built in |
+| Envoy's RBAC filter | Rules on addresses and headers, in Envoy's configuration | The policy lives in one file of its own, with lists that refresh without touching Envoy's configuration, and with location and autonomous system data from MaxMind DB files |
 | OPA with its Envoy plugin | A general language and any data | No Rego to learn and no data distribution to build; in exchange, tessera does only this |
 | Application authorization services, such as Cerbos and OpenFGA | Who may do what on which resource | A different problem: tessera works earlier, on the origin of the request |
 | oauth2-proxy and similar tools | User authentication | A different problem |
@@ -56,4 +56,4 @@ The name is always written in lowercase, even at the start of a sentence.
 
 ## Releases
 
-The [versioning policy](../reference/versioning.md) lists the interfaces that releases will keep compatible, and the [changelog](../reference/changelog.md) lists the changes of each release.
+The [versioning policy](../reference/versioning.md) lists the interfaces that releases keep compatible, and the [changelog](../reference/changelog.md) lists the changes of each release.

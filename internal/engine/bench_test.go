@@ -6,9 +6,12 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
+	"github.com/gtriggiano/tessera/internal/mmdbtest"
 	"github.com/gtriggiano/tessera/internal/request"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
@@ -32,10 +35,24 @@ var benchRules = []Rule{
 }
 
 type benchScenario struct {
-	name     string
+	name string
+	// requests are as many as a power of two.
 	requests []*request.Request
 	rule     string
 	action   Action
+}
+
+// benchHeaders returns the headers of the request i of a scenario, from the
+// client address client.
+func benchHeaders(i int, client string) map[string]string {
+	return map[string]string{
+		"user-agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+		"accept":          "application/json",
+		"accept-encoding": "gzip, br",
+		"content-type":    "application/json",
+		"x-request-id":    fmt.Sprintf("req-%04d", i),
+		"x-forwarded-for": client,
+	}
 }
 
 // benchScenarios returns 64 different requests for each scenario.
@@ -43,14 +60,7 @@ func benchScenarios() []benchScenario {
 	last := benchScenario{name: "last", rule: "api", action: Allow}
 	early := benchScenario{name: "early", rule: "admin-outside", action: Deny}
 	for i := range 64 {
-		headers := map[string]string{
-			"user-agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-			"accept":          "application/json",
-			"accept-encoding": "gzip, br",
-			"content-type":    "application/json",
-			"x-request-id":    fmt.Sprintf("req-%04d", i),
-			"x-forwarded-for": fmt.Sprintf("192.0.2.%d", i+1),
-		}
+		headers := benchHeaders(i, fmt.Sprintf("192.0.2.%d", i+1))
 		last.requests = append(last.requests, &request.Request{
 			ID: fmt.Sprintf("req-%04d", i), Scheme: "https", Method: []string{"GET", "POST"}[i%2],
 			Host: "api.example.com", Path: fmt.Sprintf("/v1/orders/%d", 1000+i), Query: fmt.Sprintf("page=%d", i%7),
@@ -65,40 +75,148 @@ func benchScenarios() []benchScenario {
 	return []benchScenario{last, early}
 }
 
+// benchDatabases are the large databases of the benchmarks, as large as
+// GeoLite2 City and GeoLite2 ASN, generated once, in 240.0.0.0/4 and
+// 2001:db8::/32 (see mmdbtest.LargeCityDatabase), with the networks of the
+// example databases: 192.0.2.0/24 is in Rome, Italy, in AS 64496.
+var benchDatabases = sync.OnceValues(func() (*enrichment.Store, []netip.Addr) {
+	store, err := enrichment.NewStore(enrichment.Kinds)
+	if err != nil {
+		panic(err)
+	}
+	var addrs []netip.Addr
+	for _, c := range []struct {
+		kind  enrichment.Kind
+		large func() ([]byte, []netip.Prefix, error)
+	}{
+		{enrichment.Geo, mmdbtest.LargeCityDatabase},
+		{enrichment.ASN, mmdbtest.LargeASNDatabase},
+	} {
+		content, sample, err := c.large()
+		if err != nil {
+			panic(err)
+		}
+		db, err := enrichment.Parse(c.kind, content)
+		if err != nil {
+			panic(err)
+		}
+		if err := store.Replace(string(c.kind), db); err != nil {
+			panic(err)
+		}
+		if c.kind == enrichment.Geo {
+			var sample4 []netip.Prefix
+			for _, p := range sample {
+				if p.Addr().Is4() {
+					sample4 = append(sample4, p)
+				}
+			}
+			addrs = mmdbtest.Addresses(sample4, 1<<16, 3)
+		}
+	}
+	return store, addrs
+})
+
+// defaultScenario returns the requests of the scenario "default": those of
+// the scenario "last", from 65,536 different IPv4 addresses of the networks
+// of the large geo database, outside 192.0.2.0/24, so that no rule decides
+// and the default action denies, after the ten rules.
+func defaultScenario() benchScenario {
+	_, addrs := benchDatabases()
+	s := benchScenario{name: "default", rule: DefaultRule, action: Deny}
+	for i, a := range addrs {
+		s.requests = append(s.requests, &request.Request{
+			ID: fmt.Sprintf("req-%04d", i), Scheme: "https", Method: []string{"GET", "POST"}[i%2],
+			Host: "api.example.com", Path: fmt.Sprintf("/v1/orders/%d", 1000+i%64), Query: fmt.Sprintf("page=%d", i%7),
+			Headers: benchHeaders(i, a.String()), ClientIP: a,
+		})
+	}
+	return s
+}
+
 // setRule is the rule added before the ten in the cases with a set: a deny
 // rule on a cidr set, which the requests of the scenario "last" do not match.
 var setRule = Rule{Name: "blocked-set", When: `sets.blocked.contains(client.ip)`, Action: Deny}
 
-// benchCase is a scenario decided by the ten rules, after setRule on a set of
-// networks networks when networks is not 0.
+// databaseRules are the rules added before the ten in the case
+// default-databases: a deny rule on the country, which reads geo, and one on
+// the autonomous system, which reads asn. No request of the scenario
+// default matches them.
+var databaseRules = []Rule{
+	{Name: "blocked-countries", When: `geo.country.code in ["KP", "IR", "SY"] && !geo.country.in_eu`, Action: Deny},
+	{Name: "hosting", When: `asn.number in [64510, 64511] || asn.organization.endsWith(" Hosting")`, Action: Deny},
+}
+
+// benchUpstream is what the policy of the case last-upstream adds to the ten
+// rules: three upstream headers and two decision fields, which read geo and
+// asn in the large databases.
+var benchUpstream = Policy{
+	UpstreamHeaders: []NamedExpression{
+		{"x-client-asn", `asn.found ? string(asn.number) : ""`},
+		{"x-client-city", "geo.city"},
+		{"x-client-country", "geo.country.code"},
+	},
+	DecisionFields: []NamedExpression{
+		{"agent", `request.headers["user-agent"]`},
+		{"country", "geo.country.code"},
+	},
+}
+
+// benchCase is a scenario decided by the ten rules: after setRule on a set
+// of networks networks when networks is not 0; after databaseRules with the
+// large databases when databases; with benchUpstream when upstream, whose
+// decision fields each decision computes too, as for a decision event.
 type benchCase struct {
-	name     string
-	scenario benchScenario
-	networks int
+	name                string
+	scenario            benchScenario
+	networks            int
+	databases, upstream bool
 }
 
 func benchCases() []benchCase {
 	scenarios := benchScenarios()
 	last, early := scenarios[0], scenarios[1]
+	byDefault := defaultScenario()
 	return []benchCase{
-		{"last", last, 0},
-		{"early", early, 0},
-		{"last-set-100000", last, 100_000},
-		{"last-set-1000000", last, 1_000_000},
+		{name: "last", scenario: last},
+		{name: "early", scenario: early},
+		{name: "last-set-100000", scenario: last, networks: 100_000},
+		{name: "last-set-1000000", scenario: last, networks: 1_000_000},
+		{name: "default", scenario: byDefault},
+		{name: "default-databases", scenario: byDefault, databases: true},
+		{name: "last-upstream", scenario: last, upstream: true},
 	}
 }
 
-func benchEngine(b *testing.B, networks int) *Engine {
+func benchEngine(b *testing.B, c benchCase) *Engine {
 	b.Helper()
-	rules, opts := benchRules, Options{}
-	if networks > 0 {
-		rules, opts.Sets = append([]Rule{setRule}, benchRules...), benchSet(b, networks)
+	p, opts := Policy{DefaultAction: Deny, DenyResponse: Response{Status: 403}, Rules: benchRules}, Options{}
+	if c.networks > 0 {
+		p.Rules, opts.Sets = append([]Rule{setRule}, benchRules...), benchSet(b, c.networks)
 	}
-	e, err := New(Policy{DefaultAction: Deny, DenyResponse: Response{Status: 403}, Rules: rules}, opts)
+	if c.databases || c.upstream {
+		opts.Databases, _ = benchDatabases()
+	}
+	if c.databases {
+		p.Rules = append(slices.Clone(databaseRules), benchRules...)
+	}
+	if c.upstream {
+		p.UpstreamHeaders, p.DecisionFields = benchUpstream.UpstreamHeaders, benchUpstream.DecisionFields
+	}
+	e, err := New(p, opts)
 	if err != nil {
 		b.Fatal(err)
 	}
 	return e
+}
+
+// decide decides r with e, and computes the decision fields when the case
+// has them, as the decision event does.
+func (c benchCase) decide(e *Engine, r *request.Request) Decision {
+	d := e.Decide(r)
+	if c.upstream {
+		e.DecisionFields(d)
+	}
+	return d
 }
 
 // benchSet returns a store with the cidr set blocked of n distinct networks,
@@ -166,11 +284,19 @@ func benchSet(b *testing.B, n int) *sets.Store {
 	return store
 }
 
-func checkScenario(b *testing.B, e *Engine, s benchScenario) {
+func checkScenario(b *testing.B, e *Engine, c benchCase) {
 	b.Helper()
+	s := c.scenario
 	for i, r := range s.requests {
-		if d := e.Decide(r); d.Action != s.action || d.Rule != s.rule || len(d.Errors) != 0 {
+		if d := c.decide(e, r); d.Action != s.action || d.Rule != s.rule || len(d.Errors) != 0 {
 			b.Fatalf("%s request %d: %+v, want %s by %s", s.name, i, d, s.action, s.rule)
+		}
+	}
+	if c.upstream {
+		d := e.Decide(s.requests[0])
+		fields := e.DecisionFields(d)
+		if len(d.Upstream) != 3 || d.Upstream[0].Value != "64496" || d.Upstream[2].Value != "IT" || len(fields) != 2 || fields[1].Value != "IT" {
+			b.Fatalf("upstream headers %+v, decision fields %+v", d.Upstream, fields)
 		}
 	}
 }
@@ -179,13 +305,14 @@ func checkScenario(b *testing.B, e *Engine, s benchScenario) {
 // normalized request to the decision, the cost limit included.
 func BenchmarkDecision(b *testing.B) {
 	for _, c := range benchCases() {
-		e, s := benchEngine(b, c.networks), c.scenario
-		checkScenario(b, e, s)
+		e, s := benchEngine(b, c), c.scenario
+		checkScenario(b, e, c)
+		mask := len(s.requests) - 1
 		b.Run(c.name, func(b *testing.B) {
 			b.ReportAllocs()
 			i := 0
 			for b.Loop() {
-				e.Decide(s.requests[i&63])
+				c.decide(e, s.requests[i&mask])
 				i++
 			}
 		})
@@ -197,8 +324,9 @@ func BenchmarkDecision(b *testing.B) {
 // of the clock itself in each.
 func BenchmarkDecisionLatency(b *testing.B) {
 	for _, c := range benchCases() {
-		e, s := benchEngine(b, c.networks), c.scenario
-		checkScenario(b, e, s)
+		e, s := benchEngine(b, c), c.scenario
+		checkScenario(b, e, c)
+		mask := len(s.requests) - 1
 		b.Run(c.name, func(b *testing.B) {
 			// The times of the last million decisions at most. b.Loop runs
 			// this function once, so b.N is not known here.
@@ -206,7 +334,7 @@ func BenchmarkDecisionLatency(b *testing.B) {
 			i := 0
 			for b.Loop() {
 				start := time.Now()
-				e.Decide(s.requests[i&63])
+				c.decide(e, s.requests[i&mask])
 				elapsed := time.Since(start)
 				if len(times) < cap(times) {
 					times = append(times, elapsed)

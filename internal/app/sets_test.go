@@ -196,7 +196,7 @@ func TestServeWithSets(t *testing.T) {
 		t.Fatalf("events:\n%s", strings.Join(events, "\n"))
 	}
 	wantEvents(t, events[1:5], []string{
-		`level=warn msg=config_warning key=sets.unused warning="the set is not used by any rule"`,
+		`level=warn msg=config_warning key=sets.unused warning="the set is not used by any rule, upstream header or decision field"`,
 		`level=info msg=set_loaded set=blocked set_type=cidr set_source=values entries=1`,
 		`level=info msg=set_loaded set=partners set_type=string set_source=file entries=1`,
 		`level=info msg=set_loaded set=unused set_type=asn set_source=values entries=1`,

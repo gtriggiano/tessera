@@ -12,6 +12,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/gtriggiano/tessera/internal/engine"
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
@@ -20,12 +21,19 @@ var testBuild = BuildInfo{Version: "1.2.3", Revision: "abc123", GoVersion: "go1.
 
 const testHash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 
-// testPolicy has a rule of each kind: allow, deny, and audit.
+// testPolicy has a rule of each kind: allow, deny, and audit, and two
+// upstream headers.
 var testPolicy = engine.Policy{DefaultAction: engine.Deny, Rules: []engine.Rule{
 	{Name: "blocked", Action: engine.Deny},
 	{Name: "watch", Action: engine.Deny, Audit: true},
 	{Name: "office", Action: engine.Allow},
+}, UpstreamHeaders: []engine.NamedExpression{
+	{Name: "X-Client-Country", Expression: "geo.country.code"},
+	{Name: "x-client-asn", Expression: "string(asn.number)"},
 }}
+
+// testDatabases configures the geo database only.
+var testDatabases = []enrichment.Kind{enrichment.Geo}
 
 // testSets has a set of each type, read from a file or of values.
 var testSets = []sets.Declaration{
@@ -56,7 +64,7 @@ func labels(m *dto.Metric) map[string]string {
 }
 
 func TestInfoGauges(t *testing.T) {
-	families := gather(t, New(testBuild, testHash, testPolicy, testSets))
+	families := gather(t, New(testBuild, testHash, testPolicy, testSets, testDatabases))
 	for _, tc := range []struct {
 		name   string
 		labels map[string]string
@@ -91,7 +99,7 @@ func TestInfoGauges(t *testing.T) {
 }
 
 func TestConnectionRefused(t *testing.T) {
-	m := New(testBuild, testHash, testPolicy, testSets)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
 	value := func() float64 {
 		f := gather(t, m)["tessera_grpc_connections_refused_total"]
 		if f.GetType() != dto.MetricType_COUNTER || len(f.GetMetric()) != 1 || len(f.GetMetric()[0].GetLabel()) != 0 {
@@ -111,7 +119,7 @@ func TestConnectionRefused(t *testing.T) {
 
 func TestHandlerServesTheTextFormat(t *testing.T) {
 	rec := httptest.NewRecorder()
-	New(testBuild, testHash, testPolicy, testSets).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	New(testBuild, testHash, testPolicy, testSets, testDatabases).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
 		t.Fatalf("status %d, content type %q", rec.Code, rec.Header().Get("Content-Type"))
@@ -146,7 +154,7 @@ func TestDecisionSeries(t *testing.T) {
 	for _, audit := range []bool{false, true} {
 		p := testPolicy
 		p.Audit = audit
-		m := New(testBuild, testHash, p, testSets)
+		m := New(testBuild, testHash, p, testSets, testDatabases)
 		before := series(t, m)
 		enforced := "true"
 		if audit {
@@ -162,6 +170,8 @@ func TestDecisionSeries(t *testing.T) {
 			`tessera_rule_evaluation_errors_total{cause="panic",rule="watch"}`,
 			`tessera_rule_evaluation_errors_total{cause="set_unavailable",rule="office"}`,
 			`tessera_rule_evaluation_errors_total{cause="set_unavailable",rule="watch"}`,
+			`tessera_rule_evaluation_errors_total{cause="database_error",rule="blocked"}`,
+			`tessera_rule_evaluation_errors_total{cause="database_error",rule="watch"}`,
 			`tessera_decision_duration_seconds_bucket{action="allow",le="2.5e-05"}`,
 			`tessera_decision_duration_seconds_count{action="deny"}`,
 			`tessera_decision_logs_dropped_total`,
@@ -180,6 +190,7 @@ func TestDecisionSeries(t *testing.T) {
 			{Action: engine.Deny, Enforced: enforced == "true", Rule: "blocked", Reason: engine.ReasonError, Cause: expr.CauseClientIPMissing, Errors: []engine.RuleError{{Rule: "blocked", Cause: expr.CauseClientIPMissing}}},
 			{Action: engine.Allow, Enforced: true, Rule: "office", Reason: engine.ReasonRule, AuditRules: []engine.AuditMatch{{Rule: "watch", Action: engine.Deny}}, Errors: []engine.RuleError{{Rule: "watch", Cause: expr.CauseExpression}}},
 			{Action: engine.Deny, Enforced: enforced == "true", Rule: "default", Reason: engine.ReasonDefault, IndeterminateRules: []string{"office"}, Errors: []engine.RuleError{{Rule: "office", Cause: expr.CausePanic}}},
+			{Action: engine.Deny, Enforced: enforced == "true", Rule: "blocked", Reason: engine.ReasonError, Cause: expr.CauseDatabaseError, Errors: []engine.RuleError{{Rule: "blocked", Cause: expr.CauseDatabaseError}}},
 		} {
 			m.Decided(d)
 		}
@@ -209,14 +220,15 @@ func TestDecisionSeries(t *testing.T) {
 			labels map[string]string
 			want   float64
 		}{
-			{"tessera_decisions_total", map[string]string{"action": "deny", "enforced": enforced, "rule": "blocked", "reason": "error"}, 1},
+			{"tessera_decisions_total", map[string]string{"action": "deny", "enforced": enforced, "rule": "blocked", "reason": "error"}, 2},
 			{"tessera_decisions_total", map[string]string{"action": "allow", "enforced": "true", "rule": "office", "reason": "rule"}, 1},
 			{"tessera_decisions_total", map[string]string{"action": "deny", "enforced": enforced, "rule": "default", "reason": "default"}, 1},
-			{"tessera_decision_duration_seconds", map[string]string{"action": "deny"}, 2},
+			{"tessera_decision_duration_seconds", map[string]string{"action": "deny"}, 3},
 			{"tessera_audit_matches_total", map[string]string{"rule": "watch"}, 1},
 			{"tessera_rule_evaluation_errors_total", map[string]string{"rule": "blocked", "cause": "client_ip_missing"}, 1},
 			{"tessera_rule_evaluation_errors_total", map[string]string{"rule": "watch", "cause": "expression"}, 1},
 			{"tessera_rule_evaluation_errors_total", map[string]string{"rule": "office", "cause": "panic"}, 1},
+			{"tessera_rule_evaluation_errors_total", map[string]string{"rule": "blocked", "cause": "database_error"}, 1},
 			{"tessera_decision_logs_dropped_total", map[string]string{}, 1},
 			{"tessera_policy_audit_mode", map[string]string{}, map[bool]float64{false: 0, true: 1}[audit]},
 		} {
@@ -254,7 +266,7 @@ func value(t *testing.T, m *Metrics, name string, labels map[string]string) floa
 // of refreshes, with every result of tessera_set_refreshes_total, and a set
 // of values has none. Recording a check adds no series.
 func TestSetSeries(t *testing.T) {
-	m := New(testBuild, testHash, testPolicy, testSets)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
 	before := series(t, m)
 	for _, d := range testSets {
 		labels := `set="` + d.Name + `",source="` + string(d.Source) + `",type="` + string(d.Type) + `"`
@@ -331,5 +343,130 @@ func TestSetSeries(t *testing.T) {
 				t.Errorf("first bucket %v", b)
 			}
 		}
+	}
+}
+
+// Every configured database has its series from the start, with every result
+// of tessera_enrichment_database_refreshes_total; a database that is not
+// configured has none. Recording a check adds no series.
+func TestDatabaseSeries(t *testing.T) {
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
+	before := series(t, m)
+	for _, line := range []string{
+		`tessera_enrichment_database_build_timestamp_seconds{database="geo"}`,
+		`tessera_enrichment_database_last_refresh_success_timestamp_seconds{database="geo"}`,
+		`tessera_enrichment_database_refreshes_total{database="geo",result="updated"}`,
+		`tessera_enrichment_database_refreshes_total{database="geo",result="unchanged"}`,
+		`tessera_enrichment_database_refreshes_total{database="geo",result="rejected"}`,
+		`tessera_enrichment_database_refreshes_total{database="geo",result="error"}`,
+		`tessera_enrichment_database_refresh_duration_seconds_bucket{database="geo",le="0.0001"}`,
+		`tessera_enrichment_database_refresh_duration_seconds_count{database="geo"}`,
+	} {
+		if !slices.Contains(before, line) {
+			t.Errorf("no series %s at startup", line)
+		}
+	}
+	if slices.ContainsFunc(before, func(s string) bool { return strings.Contains(s, `database="asn"`) }) {
+		t.Error("a series of a database that is not configured")
+	}
+
+	at := time.Date(2026, 11, 22, 10, 15, 0, 500_000_000, time.UTC)
+	built := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
+	m.DatabaseRefreshed(enrichment.Geo, sets.RefreshUpdated, 50*time.Millisecond, at)
+	m.DatabaseBuilt(enrichment.Geo, built)
+	m.DatabaseRefreshed(enrichment.Geo, sets.RefreshUnchanged, 50*time.Microsecond, at.Add(time.Minute))
+	// A failed check does not move the time of the last success.
+	m.DatabaseRefreshed(enrichment.Geo, sets.RefreshRejected, time.Millisecond, at.Add(2*time.Minute))
+	m.DatabaseRefreshed(enrichment.Geo, sets.RefreshError, time.Millisecond, at.Add(3*time.Minute))
+	// A database that is not configured records nothing.
+	m.DatabaseRefreshed(enrichment.ASN, sets.RefreshUpdated, time.Millisecond, at)
+	m.DatabaseBuilt(enrichment.ASN, built)
+	if after := series(t, m); !slices.Equal(before, after) {
+		t.Errorf("recording changed the series:\n%s\nwant:\n%s", strings.Join(after, "\n"), strings.Join(before, "\n"))
+	}
+	geo := map[string]string{"database": "geo"}
+	result := func(r string) map[string]string { return map[string]string{"database": "geo", "result": r} }
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   float64
+	}{
+		{"tessera_enrichment_database_build_timestamp_seconds", geo, float64(built.Unix())},
+		{"tessera_enrichment_database_last_refresh_success_timestamp_seconds", geo, float64(at.Add(time.Minute).UnixNano()) / 1e9},
+		{"tessera_enrichment_database_refreshes_total", result("updated"), 1},
+		{"tessera_enrichment_database_refreshes_total", result("unchanged"), 1},
+		{"tessera_enrichment_database_refreshes_total", result("rejected"), 1},
+		{"tessera_enrichment_database_refreshes_total", result("error"), 1},
+		{"tessera_enrichment_database_refresh_duration_seconds", geo, 4},
+	} {
+		if got := value(t, m, tc.name, tc.labels); got != tc.want {
+			t.Errorf("%s %v = %v, want %v", tc.name, tc.labels, got, tc.want)
+		}
+	}
+}
+
+// Every upstream header has a series for each cause from the start; a
+// header removed because its expression failed or gave an invalid value
+// counts, and one removed by an empty value does not.
+func TestUpstreamHeaderSeries(t *testing.T) {
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
+	before := series(t, m)
+	var headerSeries []string
+	for _, line := range before {
+		if strings.HasPrefix(line, "tessera_upstream_header_errors_total") {
+			headerSeries = append(headerSeries, line)
+		}
+	}
+	var want []string
+	for _, header := range []string{"x-client-asn", "x-client-country"} {
+		for _, cause := range expr.Causes {
+			want = append(want, `tessera_upstream_header_errors_total{cause="`+string(cause)+`",header="`+header+`"}`)
+		}
+	}
+	slices.Sort(headerSeries)
+	slices.Sort(want)
+	if !slices.Equal(headerSeries, want) {
+		t.Errorf("series at startup:\n%s\nwant:\n%s", strings.Join(headerSeries, "\n"), strings.Join(want, "\n"))
+	}
+	for _, d := range []engine.Decision{
+		{Action: engine.Allow, Enforced: true, Rule: "office", Reason: engine.ReasonRule, Upstream: []engine.UpstreamHeader{
+			{Name: "x-client-asn", Value: "64496"},
+			{Name: "x-client-country", Cause: expr.CauseDatabaseError},
+		}},
+		{Action: engine.Allow, Enforced: true, Rule: "office", Reason: engine.ReasonRule, Upstream: []engine.UpstreamHeader{
+			{Name: "x-client-asn", Cause: expr.CauseExpression},
+			{Name: "x-client-country", Cause: expr.CauseDatabaseError},
+		}},
+		{Action: engine.Allow, Enforced: true, Rule: "office", Reason: engine.ReasonRule, Upstream: []engine.UpstreamHeader{
+			{Name: "x-client-asn"},
+			{Name: "x-client-country", Cause: expr.CauseClientIPMissing},
+		}},
+	} {
+		m.Decided(d)
+	}
+	if after := series(t, m); !slices.Equal(before, after) {
+		t.Errorf("decisions changed the series")
+	}
+	for _, tc := range []struct {
+		header, cause string
+		want          float64
+	}{
+		{"x-client-country", "database_error", 2},
+		{"x-client-country", "client_ip_missing", 1},
+		{"x-client-asn", "expression", 1},
+		{"x-client-asn", "client_ip_missing", 0},
+		{"x-client-asn", "panic", 0},
+	} {
+		if got := value(t, m, "tessera_upstream_header_errors_total", map[string]string{"header": tc.header, "cause": tc.cause}); got != tc.want {
+			t.Errorf("%s %s = %v, want %v", tc.header, tc.cause, got, tc.want)
+		}
+	}
+	// A policy without upstream headers has no series.
+	plain := testPolicy
+	plain.UpstreamHeaders = nil
+	if slices.ContainsFunc(series(t, New(testBuild, testHash, plain, testSets, testDatabases)), func(s string) bool {
+		return strings.HasPrefix(s, "tessera_upstream_header_errors_total")
+	}) {
+		t.Error("series without upstream headers")
 	}
 }

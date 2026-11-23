@@ -4,18 +4,19 @@
 //
 // # Startup
 //
-// The sets are loaded before Run, by LoadSets: an invalid one is a
-// configuration error. Run builds the engine on them and the metrics, logs
-// starting, a config_warning for each warning of the configuration and a
-// set_loaded for each set, then builds the gRPC server and the admin server
-// before it opens any socket. It opens the gRPC listener, then the admin
-// listener, resolving their host names within listenTimeout; if one cannot
-// open, the other is closed, startup_failed is logged and Run fails. A signal
-// received while a listener opens cancels it. Once both are open, Run logs
-// listening for each, makes both report ready (/readyz 200, gRPC health
-// SERVING), logs ready, starts the refreshers of the sets read from files,
-// and starts answering. A signal received before then starts the shutdown at
-// once.
+// The sets and the databases are loaded before Run, by LoadSets and
+// LoadDatabases: an invalid one is a configuration error. Run builds the
+// engine on them and the metrics, logs starting, a config_warning for each
+// warning of the configuration, a set_loaded for each set and a
+// database_loaded for each database, then builds the gRPC server and the
+// admin server before it opens any socket. It opens the gRPC listener, then
+// the admin listener, resolving their host names within listenTimeout; if
+// one cannot open, the other is closed, startup_failed is logged and Run
+// fails. A signal received while a listener opens cancels it. Once both are
+// open, Run logs listening for each, makes both report ready (/readyz 200,
+// gRPC health SERVING), logs ready, starts the refreshers of the sets read
+// from files and of the databases, and starts answering. A signal received
+// before then starts the shutdown at once.
 //
 // # Sets
 //
@@ -28,6 +29,16 @@
 // set_unavailable and set_available events, from their own goroutines: a
 // decision only reads the store of the sets.
 //
+// # Databases
+//
+// Each database has a refresher too, the same as for the file of a set,
+// which checks the file every enrichment.<kind>.refresh and replaces the
+// copy of the database when the file has a new valid database. A database
+// has no max_staleness: the copy loaded at startup, or the last one, stays in
+// use. The refreshers record what they do in the tessera_enrichment_database_*
+// metrics and in the database_loaded and database_load_failed events: a
+// decision only reads the store of the databases.
+//
 // # Shutdown
 //
 // The first signal, or a listener that fails, starts the shutdown:
@@ -38,8 +49,8 @@
 //  3. The gRPC server stops gracefully: it closes its listener, asks every
 //     client to close its connection and waits for the calls in progress,
 //     until server.shutdown_timeout has passed since the end of step 2.
-//  4. The refreshers of the sets stop, within the same deadline: a check in
-//     progress is cut short, and records nothing.
+//  4. The refreshers of the sets and of the databases stop, within the same
+//     deadline: a check in progress is cut short, and records nothing.
 //  5. The admin server stops, within the same deadline.
 //  6. The decision events still queued are written, within the same
 //     deadline.
@@ -55,10 +66,11 @@
 // # Decisions
 //
 // Each decision is recorded after it is made, and the recording cannot change
-// it: the metrics, then the decision event, which waits in a bounded queue
-// that a goroutine of the recorder writes, so that a slow output never slows a
-// decision. The same goroutine writes the rate-limited evaluation_error and
-// panic_recovered events.
+// it: the metrics, the upstream header errors included, then the decision
+// event, with the decision fields that the engine computes for it, which
+// waits in a bounded queue that a goroutine of the recorder writes, so that a
+// slow output never slows a decision. The same goroutine writes the
+// rate-limited evaluation_error and panic_recovered events.
 //
 // # Result
 //
@@ -67,7 +79,8 @@
 // failed, and after a forced shutdown. It logs every such error before
 // returning it. It also fails, before it builds anything else, when the
 // policy does not compile, which a valid configuration rules out, and when
-// Options.Sets is nil and the sets cannot be loaded.
+// Options.Sets or Options.Databases is nil and the sets or the databases
+// cannot be loaded.
 package app
 
 import (
@@ -75,8 +88,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -86,6 +101,7 @@ import (
 	"github.com/gtriggiano/tessera/internal/admin"
 	"github.com/gtriggiano/tessera/internal/config"
 	"github.com/gtriggiano/tessera/internal/engine"
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/extauthz"
 	"github.com/gtriggiano/tessera/internal/metrics"
@@ -125,6 +141,9 @@ type Options struct {
 	// Sets are the sets of the configuration, as LoadSets loaded them. Nil
 	// makes Run load them.
 	Sets *Sets
+	// Databases are the databases of the configuration, as LoadDatabases
+	// loaded them. Nil makes Run load them.
+	Databases *Databases
 	// Listen opens a listener: the gRPC listener, then the admin listener.
 	// ctx ends when a signal arrives or when the opening takes too long. Nil
 	// uses net.ListenConfig.
@@ -134,8 +153,9 @@ type Options struct {
 	// the end of server.drain_delay, before the gRPC server stops; flushing
 	// runs before the queued decision events are written; served runs when
 	// the server of a listener returns; listenTimeout replaces the constant;
-	// setTime changes the refresh and the max_staleness of every set, so that
-	// a test can use less than the minimum of the configuration.
+	// setTime changes the refresh and the max_staleness of every set and the
+	// refresh of every database, so that a test can use less than the
+	// minimum of the configuration.
 	decider       extauthz.Decider
 	afterDrain    func()
 	flushing      func()
@@ -162,22 +182,39 @@ func Run(cfg *config.Config, opts Options) error {
 			return err
 		}
 	}
-	policy := EnginePolicy(cfg.Policy)
+	databases := opts.Databases
+	if databases == nil {
+		var err error
+		if databases, err = LoadDatabases(cfg); err != nil {
+			return err
+		}
+	}
+	policy := EnginePolicy(cfg)
 	declared := loaded.Store.Declarations()
-	m := metrics.New(opts.Build, opts.ConfigHash, policy, declared)
+	m := metrics.New(opts.Build, opts.ConfigHash, policy, declared, databases.Store.Kinds())
 	rules := make([]string, len(policy.Rules))
 	for i, r := range policy.Rules {
 		rules[i] = r.Name
 	}
-	recorder := telemetry.NewRecorder(shared, telemetry.RecorderOptions{Log: cfg.Log, Rules: rules, Dropped: m.DecisionLogDropped})
+	// The recorder writes the decision fields that the engine computes, and
+	// the engine reports its panics to the recorder: the recorder comes
+	// first, and reads the fields through a function set once the engine is
+	// built, before any decision.
+	var fields func(engine.Decision) []engine.Field
+	recorder := telemetry.NewRecorder(shared, telemetry.RecorderOptions{Log: cfg.Log, Rules: rules, Dropped: m.DecisionLogDropped, Fields: func(d engine.Decision) []engine.Field {
+		if fields == nil {
+			return nil
+		}
+		return fields(d)
+	}})
 	var decider extauthz.Decider = opts.decider
 	if decider == nil {
-		e, err := engine.New(policy, engine.Options{OnPanic: recorder.Panic, Sets: loaded.Store})
+		e, err := engine.New(policy, engine.Options{OnPanic: recorder.Panic, Sets: loaded.Store, Databases: databases.Store})
 		if err != nil {
 			_ = recorder.Close(context.Background())
 			return err
 		}
-		decider = e
+		decider, fields = e, e.DecisionFields
 	}
 	decider = observed{decider: decider, metrics: m, recorder: recorder}
 	logger := telemetry.NewLogger(logs, cfg.Log)
@@ -194,7 +231,17 @@ func Run(cfg *config.Config, opts Options) error {
 		m.SetRefreshed(d.Name, source.Updated, load.Duration, load.At)
 		m.SetAvailable(d.Name, e.Available)
 		if e.Set != nil {
-			reports.Loaded(d.Name, e.Set.Entries(), load.Duration)
+			reports.Loaded(d.Name, e.Set, load.Duration)
+		}
+	}
+	// The load at startup of each database is its first refresh.
+	dbReports := databaseReports{metrics: m, logger: logger}
+	dbSnapshot := databases.Store.Snapshot()
+	for _, k := range databases.Store.Kinds() {
+		load := databases.Loads[k]
+		m.DatabaseRefreshed(k, source.Updated, load.Duration, load.At)
+		if db := dbSnapshot.Database(k); db != nil {
+			dbReports.Loaded(string(k), db, load.Duration)
 		}
 	}
 
@@ -223,7 +270,10 @@ func Run(cfg *config.Config, opts Options) error {
 	adminServer.SetReady()
 	grpcServer.SetServing(true)
 	logger.Info("ready")
-	refreshers := source.Start(fileSets(cfg, loaded, opts.setTime), loaded.Store, reports)
+	refreshers := refresherGroups{
+		source.Start(fileSets(cfg, loaded, opts.setTime), loaded.Store, reports),
+		source.Start(databaseFiles(cfg, databases, opts.setTime), databaseStore{databases.Store}, dbReports),
+	}
 
 	var serving sync.WaitGroup
 	failed := make(chan string, 2)
@@ -341,7 +391,7 @@ func open(cfg *config.Config, opts Options, logger *slog.Logger) (grpcListener, 
 // refresher stopped and every queued decision event was written. A forced
 // shutdown discards the decision events still queued, so that
 // shutdown_complete is the last event.
-func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *extauthz.Server, refreshers *source.Refreshers, adminServer *admin.Server, recorder *telemetry.Recorder) string {
+func shutdown(cfg config.Server, opts Options, logger *slog.Logger, grpcServer *extauthz.Server, refreshers refresherGroups, adminServer *admin.Server, recorder *telemetry.Recorder) string {
 	expired, cancelExpired := context.WithCancel(context.Background())
 	cancelExpired()
 	adminServer.SetNotReady(admin.ReasonShuttingDown)
@@ -470,11 +520,28 @@ func (o observed) Decide(r *request.Request) engine.Decision {
 	return d
 }
 
-// NewEngine builds the engine of a valid policy, whose conditions read the
-// sets of store. onPanic, when set, receives the panics recovered while a
-// condition is evaluated.
-func NewEngine(p config.Policy, store *sets.Store, onPanic func(*expr.Panic)) (*engine.Engine, error) {
-	return engine.New(EnginePolicy(p), engine.Options{OnPanic: onPanic, Sets: store})
+// NewEngine builds the engine of a valid configuration, whose expressions
+// read the sets of store and the databases of dbs. onPanic, when set,
+// receives the panics recovered while an expression is evaluated.
+func NewEngine(cfg *config.Config, store *sets.Store, dbs *enrichment.Store, onPanic func(*expr.Panic)) (*engine.Engine, error) {
+	return engine.New(EnginePolicy(cfg), engine.Options{OnPanic: onPanic, Sets: store, Databases: dbs})
+}
+
+// refresherGroups are the refreshers of the sets and of the databases.
+type refresherGroups []*source.Refreshers
+
+// Stop stops every group, as source.Refreshers.Stop does: it asks every
+// group to stop first, then waits for all of them, until ctx ends.
+func (g refresherGroups) Stop(ctx context.Context) error {
+	for _, rs := range g {
+		rs.Cancel()
+	}
+	for _, rs := range g {
+		if err := rs.Stop(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Sets is the first copy of every set of a configuration.
@@ -543,21 +610,20 @@ func LoadSets(cfg *config.Config, replace map[string]*sets.Set) (*Sets, error) {
 // fileSets returns the sets of cfg read from files, as their refreshers need
 // them, with the identity of the copy in loaded and the start of its read.
 // setTime, when not nil, changes their refresh and max_staleness.
-func fileSets(cfg *config.Config, loaded *Sets, setTime func(time.Duration) time.Duration) []source.File {
+func fileSets(cfg *config.Config, loaded *Sets, setTime func(time.Duration) time.Duration) []source.File[*sets.Set] {
 	if setTime == nil {
 		setTime = func(d time.Duration) time.Duration { return d }
 	}
-	var files []source.File
+	var files []source.File[*sets.Set]
 	for _, d := range cfg.SetDeclarations() {
 		s := cfg.Sets[d.Name]
 		if s.File == "" {
 			continue
 		}
-		files = append(files, source.File{
+		files = append(files, source.File[*sets.Set]{
 			Name:         d.Name,
 			Path:         s.File,
-			Type:         d.Type,
-			MaxEntries:   s.MaxEntries,
+			Parse:        source.SetParse(d.Type, s.MaxEntries),
 			Refresh:      setTime(s.Refresh),
 			MaxStaleness: setTime(s.MaxStaleness),
 			Identity:     loaded.Files[d.Name],
@@ -593,13 +659,16 @@ func (r setReports) fields(name string, more ...any) []any {
 	return append([]any{"set", name, "set_type", string(d.Type), "set_source", string(d.Source)}, more...)
 }
 
+// The Observer of the refreshers of the sets.
+var _ source.Observer[*sets.Set] = setReports{}
+
 func (r setReports) Checked(set string, result source.Result, took time.Duration, at time.Time) {
 	r.metrics.SetRefreshed(set, result, took, at)
 }
 
-func (r setReports) Loaded(set string, entries int, took time.Duration) {
-	r.metrics.SetEntries(set, entries)
-	r.logger.Info("set_loaded", r.fields(set, "entries", entries, "duration_ms", telemetry.Milliseconds(took))...)
+func (r setReports) Loaded(set string, c *sets.Set, took time.Duration) {
+	r.metrics.SetEntries(set, c.Entries())
+	r.logger.Info("set_loaded", r.fields(set, "entries", c.Entries(), "duration_ms", telemetry.Milliseconds(took))...)
 }
 
 func (r setReports) Failed(set string, err error) {
@@ -616,12 +685,114 @@ func (r setReports) Available(set string) {
 	r.logger.Info("set_available", r.fields(set)...)
 }
 
-// EnginePolicy translates a valid policy for the engine.
-func EnginePolicy(p config.Policy) engine.Policy {
+// Databases is the first copy of every database of a configuration.
+type Databases struct {
+	// Store holds the copies: the decisions read it.
+	Store *enrichment.Store
+	// Files is the identity of the file that each database was read from,
+	// and Loads the load of each, by kind.
+	Files map[enrichment.Kind]source.Identity
+	Loads map[enrichment.Kind]Load
+}
+
+// LoadDatabases reads every database of cfg, a valid configuration: geo,
+// then asn. A file that cannot be read, or whose content is invalid, is a
+// *config.Error at enrichment.<kind>.database, with the problem, never the
+// content or the path.
+func LoadDatabases(cfg *config.Config) (*Databases, error) {
+	kinds := cfg.DatabaseKinds()
+	store, err := enrichment.NewStore(kinds)
+	if err != nil {
+		return nil, err
+	}
+	out := &Databases{Store: store, Files: map[enrichment.Kind]source.Identity{}, Loads: map[enrichment.Kind]Load{}}
+	for _, k := range kinds {
+		begin := time.Now()
+		db, id, err := source.ReadDatabase(cfg.Enrichment.Database(k).Database, k)
+		if err != nil {
+			return nil, cfg.ErrorAt("enrichment."+string(k)+".database", source.Problem(err))
+		}
+		if err := store.Replace(string(k), db); err != nil {
+			return nil, err
+		}
+		end := time.Now()
+		out.Files[k] = id
+		out.Loads[k] = Load{At: end, Duration: end.Sub(begin)}
+	}
+	return out, nil
+}
+
+// databaseFiles returns the databases of cfg as their refreshers need them,
+// with the identity of the copy in loaded and the start of its read.
+// setTime, when not nil, changes their refresh.
+func databaseFiles(cfg *config.Config, loaded *Databases, setTime func(time.Duration) time.Duration) []source.File[*enrichment.Database] {
+	if setTime == nil {
+		setTime = func(d time.Duration) time.Duration { return d }
+	}
+	var files []source.File[*enrichment.Database]
+	for _, k := range loaded.Store.Kinds() {
+		db := cfg.Enrichment.Database(k)
+		files = append(files, source.File[*enrichment.Database]{
+			Name:     string(k),
+			Path:     db.Database,
+			Parse:    source.DatabaseParse(k),
+			Refresh:  setTime(db.Refresh),
+			Identity: loaded.Files[k],
+			Read:     loaded.Loads[k].At.Add(-loaded.Loads[k].Duration),
+		})
+	}
+	return files
+}
+
+// databaseStore is the store of the databases, as their refreshers change
+// it.
+type databaseStore struct{ *enrichment.Store }
+
+// errAlwaysAvailable is the error of SetAvailable on a database, which the
+// refreshers never call: a database has no max_staleness.
+var errAlwaysAvailable = errors.New("a database is always available")
+
+func (databaseStore) SetAvailable(string, bool) error { return errAlwaysAvailable }
+
+// databaseReports records what the refreshers of the databases do, in the
+// metrics and in log events.
+type databaseReports struct {
+	metrics *metrics.Metrics
+	logger  *slog.Logger
+}
+
+// The Observer of the refreshers of the databases.
+var _ source.Observer[*enrichment.Database] = databaseReports{}
+
+func (r databaseReports) Checked(name string, result source.Result, took time.Duration, at time.Time) {
+	r.metrics.DatabaseRefreshed(enrichment.Kind(name), result, took, at)
+}
+
+func (r databaseReports) Loaded(name string, db *enrichment.Database, took time.Duration) {
+	r.metrics.DatabaseBuilt(enrichment.Kind(name), db.Built())
+	r.logger.Info("database_loaded", "database", name, "database_type", db.Type(), "build_time", db.Built().Format(time.RFC3339), "duration_ms", telemetry.Milliseconds(took))
+}
+
+func (r databaseReports) Failed(name string, err error) {
+	r.logger.Warn("database_load_failed", "database", name, "error", source.Problem(err))
+}
+
+// Unavailable and Available are never called: a database has no
+// max_staleness.
+func (databaseReports) Unavailable(string) {}
+func (databaseReports) Available(string)   {}
+
+// EnginePolicy translates the policy of a valid configuration for the
+// engine, with its upstream headers and its decision fields.
+func EnginePolicy(cfg *config.Config) engine.Policy {
+	p := cfg.Policy
 	ep := engine.Policy{
-		Audit:         p.Mode == config.ModeAudit,
-		DefaultAction: engine.Action(p.DefaultAction),
-		DenyResponse:  response(p.DenyResponse),
+		Audit:           p.Mode == config.ModeAudit,
+		DefaultAction:   engine.Action(p.DefaultAction),
+		DenyResponse:    response(p.DenyResponse),
+		SecretHeaders:   cfg.SecretHeaderNames(),
+		UpstreamHeaders: namedExpressions(cfg.Upstream.Headers),
+		DecisionFields:  namedExpressions(cfg.Log.DecisionFields),
 	}
 	for _, r := range p.Rules {
 		ep.Rules = append(ep.Rules, engine.Rule{
@@ -633,6 +804,15 @@ func EnginePolicy(p config.Policy) engine.Policy {
 		})
 	}
 	return ep
+}
+
+// namedExpressions returns the expressions of m by name, sorted.
+func namedExpressions(m map[string]config.Expression) []engine.NamedExpression {
+	out := make([]engine.NamedExpression, 0, len(m))
+	for _, name := range slices.Sorted(maps.Keys(m)) {
+		out = append(out, engine.NamedExpression{Name: name, Expression: string(m[name])})
+	}
+	return out
 }
 
 func response(r config.Response) engine.Response {

@@ -12,11 +12,11 @@
 
 ## Status
 
-tessera is in development and has no release yet. `tessera serve` answers Envoy's external authorization requests with ordered rules, written in the Common Expression Language (CEL), on the host, method, path and headers of each request, on the client address, and on sets of networks, AS numbers or strings written in the configuration or read from local files, which it reloads when they change; it logs the decisions, and serves health checks and Prometheus metrics on a separate admin listener. `tessera eval` shows how the rules decide a request. Remote lists, location data and the client software are not available yet.
+tessera is in development and has no release yet. `tessera serve` answers Envoy's external authorization requests with ordered rules, written in the Common Expression Language (CEL), on the host, method, path and headers of each request, on the client address, on the location and autonomous system that it derives from the client address with MaxMind DB files, and on sets of networks, AS numbers or strings written in the configuration or read from local files; it reloads those files when they change. It can add headers of its own to the requests that it allows, logs the decisions, and serves health checks and Prometheus metrics on a separate admin listener. `tessera eval` shows how the rules decide a request.
 
 ## Development
 
-You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`. `make ci` adds the vulnerability scan, the workflow lint, and the build and checks of the documentation, as CI does. `make test-e2e` needs Docker: it runs tessera with Envoy and a test upstream. `make bench` measures a decision.
+You need Go, at the version in [`go.mod`](go.mod), and a C compiler for the race detector. Inside a Git work tree, `make check` checks formatting and modules, runs `go vet` and the tests with the race detector, and builds the binary; `make build` builds `bin/tessera`. `make ci` adds the vulnerability scan, the workflow lint, and the build and checks of the documentation, as CI does. `make test-e2e` needs Docker: it runs tessera with Envoy and a test upstream. `make bench` measures a decision, the sets and the databases.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the requirements, the checks, the documentation rules and the format of pull request titles, and [RELEASING.md](RELEASING.md) for the release process.
 

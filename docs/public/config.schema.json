@@ -133,6 +133,18 @@
             }
           ],
           "default": "deny"
+        },
+        "decision_fields": {
+          "description": "The fields that a decision event adds after duration_ms, in the order of their names: each name maps to a CEL expression whose result is a string, computed only for the events written. At most 32. A name is a lowercase letter followed by lowercase letters, digits and underscores, at most 63 characters, and not a field of the event. A field cannot read request.query, a secret header, nor request.headers otherwise than by a literal name.",
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}$"
+          },
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
         }
       }
     },
@@ -174,6 +186,69 @@
           "description": "The number of entries at the right end of X-Forwarded-For that trusted proxies wrote after the client address. Required, and allowed only, when from is x_forwarded_for.",
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "secret_headers": {
+      "description": "The headers whose values are secret, by name in any case, in addition to authorization, proxy-authorization and cookie, which are always secret and cannot be listed: a decision field cannot read them, tessera eval shows their values as [REDACTED], and tessera never logs them. At most 64, each once in any case.",
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "anyOf": [
+          {
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          },
+          {
+            "$ref": "#/$defs/environment"
+          }
+        ]
+      },
+      "default": []
+    },
+    "enrichment": {
+      "description": "The databases that the attributes geo and asn read. Without its block, an attribute does not exist, and a condition that reads it is an error.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "geo": {
+          "description": "A MaxMind DB database with the schema of GeoIP2 or GeoLite2 City or Country, which geo reads. Absent by default.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "database"
+          ],
+          "properties": {
+            "database": {
+              "description": "The path of the database file, relative to the configuration file when it is not absolute. At most 512 MiB.",
+              "type": "string"
+            },
+            "refresh": {
+              "description": "How often tessera checks the file of the database for a change. At least 1s.",
+              "$ref": "#/$defs/duration",
+              "default": "1m"
+            }
+          }
+        },
+        "asn": {
+          "description": "A MaxMind DB database with the schema of GeoLite2 ASN, which asn reads. Absent by default.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "database"
+          ],
+          "properties": {
+            "database": {
+              "description": "The path of the database file, relative to the configuration file when it is not absolute. At most 512 MiB.",
+              "type": "string"
+            },
+            "refresh": {
+              "description": "How often tessera checks the file of the database for a change. At least 1s.",
+              "$ref": "#/$defs/duration",
+              "default": "1m"
+            }
+          }
         }
       }
     },
@@ -421,6 +496,25 @@
             }
           },
           "default": []
+        }
+      }
+    },
+    "upstream": {
+      "description": "What tessera adds to the requests that Envoy sends on to the upstream.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "headers": {
+          "description": "The headers that tessera sets on every request that Envoy sends on, an allow or a denial in audit mode, replacing those of the client: each header name, in any case, maps to a CEL expression whose result is a string. An empty value, an expression that fails or an invalid value removes the header. At most 64. host, content-length, transfer-encoding, connection, authorization, proxy-authorization, cookie, keep-alive, proxy-connection, te, trailer, upgrade and the names that start with x-envoy- are not allowed.",
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          },
+          "maxProperties": 64,
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
         }
       }
     }

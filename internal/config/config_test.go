@@ -40,11 +40,12 @@ func TestDefaults(t *testing.T) {
 	want := Config{
 		Server:   Server{Listen: ":9001", MaxConnections: 1024, MaxConcurrentStreams: 1024, DrainDelay: 5 * time.Second, ShutdownTimeout: 20 * time.Second},
 		Admin:    Admin{Listen: ":9090"},
-		Log:      Log{Level: "info", Format: "logfmt", Decisions: "deny"},
+		Log:      Log{Level: "info", Format: "logfmt", Decisions: "deny", DecisionFields: map[string]Expression{}},
 		ClientIP: ClientIP{From: "peer"},
 		Policy:   Policy{Mode: "enforce", DefaultAction: "deny", DenyResponse: Response{Status: 403, Headers: map[string]string{}}, Rules: []Rule{}},
+		Upstream: Upstream{Headers: map[string]Expression{}},
 	}
-	if c.Server != want.Server || c.Admin != want.Admin || c.Log != want.Log || c.ClientIP != want.ClientIP || !reflect.DeepEqual(c.Policy, want.Policy) || c.Sets == nil || len(c.Sets) != 0 {
+	if c.Server != want.Server || c.Admin != want.Admin || !reflect.DeepEqual(c.Log, want.Log) || c.ClientIP != want.ClientIP || !reflect.DeepEqual(c.Policy, want.Policy) || c.Sets == nil || len(c.Sets) != 0 || !reflect.DeepEqual(c.Upstream, want.Upstream) || c.SecretHeaders == nil || len(c.SecretHeaders) != 0 {
 		t.Fatalf("got %+v", *c)
 	}
 }
@@ -64,20 +65,26 @@ log:
   level: debug
   format: json
   decisions: all
+  decision_fields:
+    agent: request.headers["user-agent"]
 client_ip:
   from: x_forwarded_for
   trusted_hops: 2
 policy:
   default_action: allow
+upstream:
+  headers:
+    X-Client-Address: string(client.ip)
 `, nil)
 	want := Config{
 		Server:   Server{Listen: "127.0.0.1:9101", MaxConnections: 256, MaxConcurrentStreams: 64, MaxConnectionAge: 30 * time.Minute, ShutdownTimeout: 90 * time.Second},
 		Admin:    Admin{Listen: "[::1]:9102"},
-		Log:      Log{Level: "debug", Format: "json", Decisions: "all"},
+		Log:      Log{Level: "debug", Format: "json", Decisions: "all", DecisionFields: map[string]Expression{"agent": `request.headers["user-agent"]`}},
 		ClientIP: ClientIP{From: "x_forwarded_for", TrustedHops: 2},
 		Policy:   Policy{Mode: "enforce", DefaultAction: "allow", DenyResponse: Response{Status: 403, Headers: map[string]string{}}, Rules: []Rule{}},
+		Upstream: Upstream{Headers: map[string]Expression{"X-Client-Address": "string(client.ip)"}},
 	}
-	if c.Server != want.Server || c.Admin != want.Admin || c.Log != want.Log || c.ClientIP != want.ClientIP || !reflect.DeepEqual(c.Policy, want.Policy) {
+	if c.Server != want.Server || c.Admin != want.Admin || !reflect.DeepEqual(c.Log, want.Log) || c.ClientIP != want.ClientIP || !reflect.DeepEqual(c.Policy, want.Policy) || !reflect.DeepEqual(c.Upstream, want.Upstream) {
 		t.Fatalf("got %+v", *c)
 	}
 }
@@ -299,8 +306,11 @@ log:
   level: debug
   format: '[REDACTED]'
   decisions: deny
+  decision_fields: {}
 client_ip:
   from: peer
+secret_headers: []
+enrichment: {}
 sets: {}
 policy:
   mode: enforce
@@ -310,6 +320,8 @@ policy:
     body: ""
     headers: {}
   rules: []
+upstream:
+  headers: {}
 `
 	if string(got) != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
@@ -317,7 +329,7 @@ policy:
 	// The printed configuration is itself valid, and reads back the same.
 	printed := strings.NewReplacer("format: '[REDACTED]'", "format: json", "default_action: '[REDACTED]'", "default_action: deny").Replace(string(got))
 	again := mustParse(t, printed, nil)
-	if again.Server != c.Server || again.Admin != c.Admin || again.Log != c.Log || again.ClientIP != c.ClientIP || !reflect.DeepEqual(again.Policy, c.Policy) {
+	if again.Server != c.Server || again.Admin != c.Admin || !reflect.DeepEqual(again.Log, c.Log) || again.ClientIP != c.ClientIP || !reflect.DeepEqual(again.Policy, c.Policy) || !reflect.DeepEqual(again.Upstream, c.Upstream) {
 		t.Fatalf("got %+v", *again)
 	}
 	// A literal ${ is printed escaped, so that it reads back as written.
@@ -593,6 +605,8 @@ policy:
       action: deny
       mode: enforce
       when: "true"
+upstream:
+  headers: {}
 `
 	if _, policy, _ := strings.Cut(string(got), "\npolicy:\n"); "policy:\n"+policy != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)

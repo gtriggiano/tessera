@@ -20,9 +20,10 @@ import (
 // exactly its path in backticks, followed by a "**Type:**" line, a
 // "**Default:**" line and, when validation narrows the type, an "**Allowed:**"
 // line. The default is a YAML literal in backticks, the word required when
-// omitting the key is an error at its path, or "required when `<key>` is
-// `<value>`" when omitting it is an error at its path once the other key has
-// that value. Such a key is checked with the other key set to its value. A
+// omitting the key is an error at its path, the word none for an optional
+// block, which is absent unless the file writes it, or "required when `<key>`
+// is `<value>`" when omitting it is an error at its path once the other key
+// has that value. Such a key is checked with the other key set to its value. A
 // key that takes the value of another when omitted has the default
 // "inherited from `<key>`", checked with the other key set to a value that is
 // not its default. One of two keys that are each "required unless `<key>` is
@@ -33,7 +34,9 @@ import (
 // policy.rules[].name. They are checked in a list of one item, the minimal
 // item of referenceItems. The keys of the blocks of a mapping of names are
 // written with <name> for the name, as in sets.<name>.type. They are checked
-// in a block named referenceName, the minimal block of referenceItems.
+// in a block named referenceName, the minimal block of referenceItems. The
+// keys of an optional block are checked with its minimal block of
+// referenceBlocks in the file.
 //
 // An allowed line that starts with one of these forms is checked against
 // Parse; any text may follow a form after "; ":
@@ -94,6 +97,13 @@ var referenceItems = map[string]string{
 // are checked in.
 const referenceName = "reference_name"
 
+// referenceBlocks is the smallest valid content of each optional block,
+// which its keys are checked in.
+var referenceBlocks = map[string]string{
+	"enrichment.geo": "{database: reference.mmdb}",
+	"enrichment.asn": "{database: reference.mmdb}",
+}
+
 type schemaKey struct {
 	path string
 	typ  reflect.Type
@@ -106,19 +116,48 @@ type referenceEntry struct {
 	summary  string // the default as the section's table repeats it
 	allowed  string // the text of the **Allowed:** line, or empty
 	required bool
+	absent   bool      // an optional block, absent by default
 	when     condition // the value of another key that makes it required
 	from     string    // the key that it is inherited from
 	unless   string    // the key whose presence makes it optional
+	block    string    // the optional block that holds the key
 }
 
 // base is the configuration that the key is checked in: referenceBase, with
-// the key that makes it required set to its value.
+// the minimal content of the optional block that holds the key, and the key
+// that makes it required set to its value.
 func (e referenceEntry) base(t *testing.T) []byte {
 	t.Helper()
-	if e.when == (condition{}) {
-		return []byte(referenceBase)
+	base := []byte(referenceBase)
+	if e.block != "" {
+		base = referenceVariant(t, base, e.block, referenceBlock(t, e.block))
 	}
-	return referenceVariant(t, []byte(referenceBase), e.when.path, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: e.when.value})
+	if e.when == (condition{}) {
+		return base
+	}
+	return referenceVariant(t, base, e.when.path, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: e.when.value})
+}
+
+// referenceBlock returns the minimal content of the optional block path.
+func referenceBlock(t *testing.T, path string) *yaml.Node {
+	t.Helper()
+	block, err := yamlValue(referenceBlocks[path])
+	if err != nil {
+		t.Fatalf("%s: no minimal block in referenceBlocks: %v", path, err)
+	}
+	block.Style = 0
+	return block
+}
+
+// blockOf returns the optional block that holds the key path, or "".
+func blockOf(path string) string {
+	block := ""
+	for b := range referenceBlocks {
+		if strings.HasPrefix(path, b+".") && len(b) > len(block) {
+			block = b
+		}
+	}
+	return block
 }
 
 func TestDocsConfigReference(t *testing.T) {
@@ -127,6 +166,10 @@ func TestDocsConfigReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	documented := parseReferencePage(t, string(data))
+	for path, entry := range documented {
+		entry.block = blockOf(path)
+		documented[path] = entry
+	}
 
 	var keys []schemaKey
 	collectSchemaKeys(reflect.TypeFor[Config](), "", &keys)
@@ -165,6 +208,8 @@ func TestDocsConfigReference(t *testing.T) {
 		switch {
 		case entry.required || entry.when != (condition{}):
 			checkRequired(t, key.path, entry)
+		case entry.absent:
+			checkAbsent(t, key, entry)
 		case entry.unless != "":
 			checkRequiredUnless(t, key, entry, documented[entry.unless])
 		case entry.from != "":
@@ -208,6 +253,8 @@ func collectSchemaKeys(t reflect.Type, prefix string, keys *[]schemaKey) {
 			collectSchemaKeys(f.Type.Elem(), path+"[]", keys)
 		case reflect.Map:
 			collectSchemaKeys(f.Type.Elem(), path+".<name>", keys)
+		case reflect.Pointer:
+			collectSchemaKeys(f.Type.Elem(), path, keys)
 		default:
 			collectSchemaKeys(f.Type, path, keys)
 		}
@@ -230,9 +277,13 @@ func typeName(t reflect.Type) string {
 			return "list"
 		case t.Elem() == setValueType:
 			return "list of values"
+		case t.Elem().Kind() == reflect.String:
+			return "list of strings"
 		}
 	case reflect.Map:
 		switch {
+		case t.Key().Kind() == reflect.String && t.Elem() == expressionType:
+			return "mapping of expressions"
 		case t.Key().Kind() == reflect.String && t.Elem().Kind() == reflect.String:
 			return "mapping of strings"
 		case t.Key().Kind() == reflect.String && t.Elem().Kind() == reflect.Struct:
@@ -244,6 +295,10 @@ func typeName(t reflect.Type) string {
 		return "integer"
 	case reflect.Struct:
 		return "mapping"
+	case reflect.Pointer:
+		if t.Elem().Kind() == reflect.Struct {
+			return "mapping"
+		}
 	}
 	return t.String()
 }
@@ -340,6 +395,8 @@ func parseReferencePage(t *testing.T, page string) map[string]referenceEntry {
 			entry.literal, entry.summary = m[1], "`"+m[1]+"`"
 		case body[1] == "**Default:** required":
 			entry.required, entry.summary = true, "required"
+		case body[1] == "**Default:** none":
+			entry.absent, entry.summary = true, "none"
 		case defaultWhenRE.MatchString(body[1]):
 			m := defaultWhenRE.FindStringSubmatch(body[1])
 			entry.when, entry.summary = condition{m[1], m[2]}, strings.TrimPrefix(body[1], "**Default:** ")
@@ -348,7 +405,7 @@ func parseReferencePage(t *testing.T, page string) map[string]referenceEntry {
 		case unlessRE.MatchString(body[1]):
 			entry.unless, entry.summary = unlessRE.FindStringSubmatch(body[1])[1], strings.TrimPrefix(body[1], "**Default:** ")
 		default:
-			t.Errorf("%s:%d: %s: the line after **Type:** must be **Default:** followed by `<yaml literal>`, required, required when `<key>` is `<value>`, required unless `<key>` is set, or inherited from `<key>`", referencePage, line, path)
+			t.Errorf("%s:%d: %s: the line after **Type:** must be **Default:** followed by `<yaml literal>`, required, none, required when `<key>` is `<value>`, required unless `<key>` is set, or inherited from `<key>`", referencePage, line, path)
 			continue
 		}
 		if len(body) == 3 {
@@ -373,12 +430,12 @@ func checkDefault(t *testing.T, path string, entry referenceEntry) {
 		t.Errorf("%s:%d: %s: default `%s` is not a YAML value", referencePage, entry.line, path, entry.literal)
 		return
 	}
-	omitted, err := Parse(referenceVariant(t, []byte(referenceBase), path, nil), nil)
+	omitted, err := Parse(referenceVariant(t, entry.base(t), path, nil), nil)
 	if err != nil {
 		t.Errorf("%s:%d: %s has a default, but omitting it is an error: %v", referencePage, entry.line, path, err)
 		return
 	}
-	explicit, err := Parse(referenceVariant(t, []byte(referenceBase), path, literal), nil)
+	explicit, err := Parse(referenceVariant(t, entry.base(t), path, literal), nil)
 	if err != nil {
 		t.Errorf("%s:%d: %s: documented default `%s` is rejected: %v", referencePage, entry.line, path, entry.literal, err)
 		return
@@ -386,6 +443,25 @@ func checkDefault(t *testing.T, path string, entry referenceEntry) {
 	got, want := valueAt(omitted, path), valueAt(explicit, path)
 	if !reflect.DeepEqual(got.Interface(), want.Interface()) {
 		t.Errorf("%s:%d: %s: documented default `%s` loads as %v, but omitting the key gives %v", referencePage, entry.line, path, entry.literal, want, got)
+	}
+}
+
+// checkAbsent checks an optional block: omitting it leaves it absent, and
+// its minimal block loads.
+func checkAbsent(t *testing.T, key schemaKey, entry referenceEntry) {
+	t.Helper()
+	at := fmt.Sprintf("%s:%d: %s", referencePage, entry.line, key.path)
+	if key.typ.Kind() != reflect.Pointer || referenceBlocks[key.path] == "" {
+		t.Errorf("%s: none is the default of an optional block, with a minimal block in referenceBlocks", at)
+		return
+	}
+	omitted, err := Parse(referenceVariant(t, entry.base(t), key.path, nil), nil)
+	if err != nil || !valueAt(omitted, key.path).IsNil() {
+		t.Errorf("%s: documented as absent by default, but omitting it gives %v, %v", at, err, err == nil && !valueAt(omitted, key.path).IsNil())
+	}
+	present, err := Parse(referenceVariant(t, entry.base(t), key.path, referenceBlock(t, key.path)), nil)
+	if err != nil || valueAt(present, key.path).IsNil() {
+		t.Errorf("%s: its minimal block does not load: %v", at, err)
 	}
 }
 
@@ -768,10 +844,14 @@ func mustMarshal(t *testing.T, doc *yaml.Node) []byte {
 	return data
 }
 
-// valueAt returns the loaded value at path.
+// valueAt returns the loaded value at path. An optional block on the way is
+// followed when it is present.
 func valueAt(c *Config, path string) reflect.Value {
 	v := reflect.ValueOf(c).Elem()
 	for segment := range strings.SplitSeq(path, ".") {
+		if v.Kind() == reflect.Pointer && !v.IsNil() {
+			v = v.Elem()
+		}
 		if segment == "<name>" {
 			v = v.MapIndex(reflect.ValueOf(referenceName))
 			continue

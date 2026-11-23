@@ -6,9 +6,14 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/metrics"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
+	"github.com/gtriggiano/tessera/internal/mmdbtest"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
@@ -71,5 +76,105 @@ func BenchmarkReadFile(b *testing.B) {
 		if s, _, err := ReadFile(path, sets.CIDR, n); err != nil || s.Entries() != n {
 			b.Fatalf("ReadFile: %v", err)
 		}
+	}
+}
+
+// liveHeap returns the bytes of the heap held by reachable objects, measured
+// after a garbage collection, as the benchmarks of internal/sets do.
+func liveHeap() uint64 {
+	var m runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
+}
+
+// heapObjects returns the bytes of the heap held by objects, after a garbage
+// collection, as peakHeap reads them.
+func heapObjects() uint64 {
+	runtime.GC()
+	sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	metrics.Read(sample)
+	return sample[0].Value.Uint64()
+}
+
+// peakHeap runs f, and returns the largest heap held by objects while it
+// ran, unreachable ones not yet freed included, read every 100 µs.
+func peakHeap(f func()) uint64 {
+	sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	stop, peak := make(chan struct{}), make(chan uint64)
+	go func() {
+		ticker := time.NewTicker(100 * time.Microsecond)
+		defer ticker.Stop()
+		var largest uint64
+		for {
+			metrics.Read(sample)
+			largest = max(largest, sample[0].Value.Uint64())
+			select {
+			case <-stop:
+				peak <- largest
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	f()
+	close(stop)
+	return <-peak
+}
+
+// BenchmarkReadDatabase reads a geo database as large as GeoLite2 City and
+// an asn database as large as GeoLite2 ASN, generated in 240.0.0.0/4 and
+// 2001:db8::/32, from a file, as a refresh of a changed file does: open,
+// read through the descriptor into one buffer, SHA-256 of the content, the
+// checks of the metadata and the decoding of the first records. Besides the
+// time and the allocations of one read, it reports:
+//
+//   - file-MB: the size of the file;
+//   - heap-MB: the heap that one copy holds, measured after a garbage
+//     collection;
+//   - peak-MB: the largest heap during the reads, above the heap before the
+//     first copy; each read keeps the previous copy until the new one is
+//     ready, as a refresh does, so two copies coexist.
+func BenchmarkReadDatabase(b *testing.B) {
+	for _, c := range []struct {
+		kind  enrichment.Kind
+		large func() ([]byte, []netip.Prefix, error)
+	}{
+		{enrichment.Geo, mmdbtest.LargeCityDatabase},
+		{enrichment.ASN, mmdbtest.LargeASNDatabase},
+	} {
+		b.Run(string(c.kind), func(b *testing.B) {
+			content, _, err := c.large()
+			if err != nil {
+				b.Fatal(err)
+			}
+			size := len(content)
+			path := filepath.Join(b.TempDir(), string(c.kind)+".mmdb")
+			if err := os.WriteFile(path, content, 0o644); err != nil {
+				b.Fatal(err)
+			}
+			content = nil
+			read := func() *enrichment.Database {
+				db, _, err := ReadDatabase(path, c.kind)
+				if err != nil {
+					b.Fatalf("ReadDatabase: %v", err)
+				}
+				return db
+			}
+			base, before := liveHeap(), heapObjects()
+			kept := read()
+			held := liveHeap() - base
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			peak := peakHeap(func() {
+				for b.Loop() {
+					kept = read()
+				}
+			})
+			runtime.KeepAlive(kept)
+			b.ReportMetric(float64(size)/1e6, "file-MB")
+			b.ReportMetric(float64(held)/1e6, "heap-MB")
+			b.ReportMetric(float64(peak-before)/1e6, "peak-MB")
+		})
 	}
 }

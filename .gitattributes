@@ -3,3 +3,4 @@
 *.md text
 *.yaml text
 *.yml text
+*.mmdb binary

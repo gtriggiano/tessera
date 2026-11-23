@@ -15,7 +15,7 @@ The **tessera** binary has a command that answers Envoy's authorization requests
 | [`tessera version`](#tessera-version) | Print build information |
 | [`tessera`, `tessera help`](#tessera-and-tessera-help) | Print help |
 
-Only `tessera serve` opens sockets. `tessera config print` reads one file, the configuration; `tessera serve`, `tessera eval` and `tessera config validate` read the files of its [sets](./configuration.md#sets) too.
+Only `tessera serve` opens sockets. `tessera config print` reads one file, the configuration; `tessera serve`, `tessera eval` and `tessera config validate` read the files of its [sets](./configuration.md#sets) and of its [databases](./configuration.md#enrichment) too.
 
 ## Synopsis
 
@@ -53,7 +53,7 @@ With neither, the command fails with `no configuration file; use --config or TES
 ### Output streams
 
 - Standard output carries the result of the command: help, build information, the evaluation of `tessera eval`, `configuration valid`, the printed configuration, and the [log events](./logs.md) of `tessera serve`, its errors included.
-- Standard error carries the errors of the command line, one line each: `tessera: <message>`, and the warnings of [`tessera config validate`](#tessera-config-validate): `tessera: warning: <message>`. `tessera serve` writes there only the errors found before it reads its configuration and its sets.
+- Standard error carries the errors of the command line, one line each: `tessera: <message>`, and the warnings of [`tessera config validate`](#tessera-config-validate): `tessera: warning: <message>`. `tessera serve` writes there only the errors found before it reads its configuration, its sets and its databases.
 
 ### Exit status
 
@@ -61,7 +61,7 @@ With neither, the command fails with `no configuration file; use --config or TES
 | --- | --- |
 | 0 | Success. For `tessera serve`, a shutdown in which every call finished. |
 | 1 | Runtime failure: the output could not be written, or `tessera serve` could not open a listener, a listener failed, or its shutdown was forced (see [Exit status of `serve`](#exit-status-of-serve)). |
-| 2 | Usage or configuration error: an unknown command, argument or flag, an invalid flag value, a configuration file that is not selected, missing, unreadable or invalid, or a set that cannot be read or is invalid. |
+| 2 | Usage or configuration error: an unknown command, argument or flag, an invalid flag value, a configuration file that is not selected, missing, unreadable or invalid, or a set or a database that cannot be read or is invalid. |
 
 ### Signals
 
@@ -77,10 +77,10 @@ Answers Envoy's external authorization requests on the gRPC listener, at [`serve
 
 ### Startup
 
-1. Reads the [selected file](#configuration-file) and checks it like `tessera config validate`, and loads every [set](./configuration.md#sets), reading its file when it has one. An error here, an invalid set included, prints `tessera: <message>` and exits with status 2, before anything opens.
-2. Logs [`starting`](./logs.md#starting), then a [`config_warning`](./logs.md#config-warning) for each warning of the configuration, then a [`set_loaded`](./logs.md#set-loaded) for each set.
+1. Reads the [selected file](#configuration-file) and checks it like `tessera config validate`, loads every [set](./configuration.md#sets), reading its file when it has one, and reads every [database](./configuration.md#enrichment). An error here, an invalid set or database included, prints `tessera: <message>` and exits with status 2, before anything opens.
+2. Logs [`starting`](./logs.md#starting), then a [`config_warning`](./logs.md#config-warning) for each warning of the configuration, then a [`set_loaded`](./logs.md#set-loaded) for each set and a [`database_loaded`](./logs.md#database-loaded) for each database.
 3. Opens the gRPC listener, then the admin listener, within 10 seconds for both, the time to resolve their host names included. If one cannot open, or does not open in time, the other is closed, [`startup_failed`](./logs.md#startup-failed) is logged and the exit status is 1. A signal stops a listener that is still resolving its host name in the same way.
-4. Logs [`listening`](./logs.md#listening) for each listener, reports ready, on `/readyz` and through the gRPC health service, logs [`ready`](./logs.md#ready), starts checking the file of each set every [`sets.<name>.refresh`](./configuration.md#sets-name-refresh), and starts answering.
+4. Logs [`listening`](./logs.md#listening) for each listener, reports ready, on `/readyz` and through the gRPC health service, logs [`ready`](./logs.md#ready), starts checking the file of each set every [`sets.<name>.refresh`](./configuration.md#sets-name-refresh) and the file of each database every [`enrichment.geo.refresh`](./configuration.md#enrichment-geo-refresh) or [`enrichment.asn.refresh`](./configuration.md#enrichment-asn-refresh), and starts answering.
 
 ### Output
 
@@ -93,12 +93,12 @@ SIGTERM or SIGINT starts a graceful shutdown:
 1. [`shutdown_started`](./logs.md#shutdown-started) is logged. `/readyz` answers 503 and the gRPC health service `NOT_SERVING`, and [`not_ready`](./logs.md#not-ready) is logged.
 2. For [`server.drain_delay`](./configuration.md#server-drain-delay), both listeners keep answering as before, so that Envoy and the orchestrator see the change and stop sending requests.
 3. The gRPC listener closes, every client is asked to close its connection, and the calls in progress finish, for at most [`server.shutdown_timeout`](./configuration.md#server-shutdown-timeout). A connection whose client has sent nothing is closed at once.
-4. The checks of the files of the sets stop, within the same deadline. A check in progress is cut short, and changes nothing.
+4. The checks of the files of the sets and of the databases stop, within the same deadline. A check in progress is cut short, and changes nothing.
 5. The admin listener closes, within the same deadline. A connection that has not sent a request is closed at once.
 6. The [`decision`](./logs.md#decision) events still in their [queue](./logs.md#the-queue-of-decision-events) are written, within the same deadline.
 7. [`shutdown_complete`](./logs.md#shutdown-complete) is logged with `outcome=drained`.
 
-If the deadline passes before the calls, the checks of the sets and the admin requests in progress finish, they are cancelled and every connection is closed: `shutdown_complete` reports `outcome=forced forced_by=timeout`. The same happens when the deadline passes before the queued `decision` events are written: the events left are dropped. Another signal during the shutdown does the same at once, at any step: `shutdown_complete` reports `outcome=forced forced_by=signal`. A listener that fails while tessera runs logs [`listener_failed`](./logs.md#listener-failed) and starts the same shutdown; one that fails during the shutdown is logged at its end, and the exit status is 1. Any other signal received during the startup starts the shutdown as soon as both listeners are open.
+If the deadline passes before the calls, the checks of the sets and of the databases and the admin requests in progress finish, they are cancelled and every connection is closed: `shutdown_complete` reports `outcome=forced forced_by=timeout`. The same happens when the deadline passes before the queued `decision` events are written: the events left are dropped. Another signal during the shutdown does the same at once, at any step: `shutdown_complete` reports `outcome=forced forced_by=signal`. A listener that fails while tessera runs logs [`listener_failed`](./logs.md#listener-failed) and starts the same shutdown; one that fails during the shutdown is logged at its end, and the exit status is 1. Any other signal received during the startup starts the shutdown as soon as both listeners are open.
 
 ::: tip
 Give the orchestrator a grace period longer than `server.drain_delay` plus `server.shutdown_timeout` between its signal and a forced kill: 25 seconds with the defaults.
@@ -113,13 +113,13 @@ Give the orchestrator a grace period longer than `server.drain_delay` plus `serv
 | Shutdown cut by another signal | `shutdown_complete outcome=forced forced_by=signal` | 1 |
 | A listener could not open | `startup_failed` | 1 |
 | A listener failed while serving or during the shutdown | `listener_failed` | 1 |
-| Invalid usage or configuration, an invalid set included | None: `tessera: <message>` | 2 |
+| Invalid usage or configuration, an invalid set or database included | None: `tessera: <message>` | 2 |
 
 ## `tessera eval`
 
-Shows how the policy of a configuration decides a request that the flags describe, without Envoy: the attributes that the rules read, the outcome of each rule up to the one that decides, and the decision. It loads the [sets](#sets) as `tessera serve` does, writes no [log event](./logs.md), changes no [metric](./metrics.md), and opens no socket.
+Shows how the policy of a configuration decides a request that the flags describe, without Envoy: the attributes that the rules read, the outcome of each rule up to the one that decides, the decision, and the [upstream headers](#upstream-headers) of a request that Envoy sends on. It loads the [sets](#sets) and the [enrichments](#enrichments) as `tessera serve` does, writes no [log event](./logs.md), changes no [metric](./metrics.md), and opens no socket.
 
-With the configuration of [A complete example](../guide/write-rules.md#a-complete-example), in a file named `rules.yaml`:
+With the configuration of [A complete example](../guide/policy-rules.md#a-complete-example), in a file named `rules.yaml`:
 
 ```sh
 tessera eval --config rules.yaml \
@@ -229,13 +229,117 @@ internal-hosts    false  The internal hosts, from the office only.
 decision: allow (rule default, reason default)
 ```
 
+### Enrichments
+
+`tessera eval` reads the databases of the [enrichments](./configuration.md#enrichment) of the configuration as `tessera serve` does: a file that is missing or invalid is a configuration error. It computes the attributes of [`geo`](./expressions.md#geo) and [`asn`](./expressions.md#asn) that the rules read for the address of `--ip`.
+
+With this configuration in a file named `enrichment.yaml`, and the databases `geo.mmdb` and `asn.mmdb` next to it:
+
+<<< @/examples/enrichment.yaml{yaml}
+
+```sh
+tessera eval --config enrichment.yaml --ip 192.0.2.7
+```
+
+```text
+asn.number        64496
+geo.country.code  "IT"
+geo.found         true
+geo.subdivisions  [{code: "62", name: "Lazio"}, {code: "RM", name: "Rome"}]
+
+hosting-networks   false          Networks of hosting providers.
+unknown-addresses  false (audit)  Addresses that the database does not locate.
+lazio              true -> allow  The region of the office, Lazio in Italy.
+
+decision: allow (rule lazio, reason rule)
+```
+
+An address whose record has no subdivisions and no location, outside the European Union, and in no network of the asn database:
+
+```sh
+tessera eval --config enrichment.yaml --ip 203.0.113.7
+```
+
+```text
+asn.number         0
+geo.country.code   "JP"
+geo.country.in_eu  false
+geo.found          true
+geo.location       missing
+geo.location.lat   missing
+geo.location.lon   missing
+geo.subdivisions   []
+
+hosting-networks   false          Networks of hosting providers.
+unknown-addresses  false (audit)  Addresses that the database does not locate.
+lazio              false          The region of the office, Lazio in Italy.
+european-union     false
+rome-office        false          The surroundings of the office in Rome, outside the European Union too.
+
+decision: deny (rule default, reason default)
+response: status 403
+```
+
+### Upstream headers
+
+For a request that Envoy sends on, an allowed request or a denied request that [`policy.mode: audit`](./configuration.md#policy-mode) lets through, `tessera eval` shows the headers of [`upstream.headers`](./configuration.md#upstream-headers) in a block of their own, after the decision: each header, in the order of the names, with the value that tessera sets, or `removed` when tessera removes it. A denial has no such block, and neither has a configuration without upstream headers.
+
+With this configuration in a file named `upstream.yaml`, and the databases `geo.mmdb` and `asn.mmdb` next to it:
+
+<<< @/examples/upstream.yaml{yaml}
+
+```sh
+tessera eval --config upstream.yaml --ip 192.0.2.7
+```
+
+```text
+asn.number  64496
+
+hosting-networks  false  Networks of hosting providers.
+
+decision: allow (rule default, reason default)
+
+x-client-asn      "64496"
+x-client-city     "Rome"
+x-client-country  "IT"
+```
+
+An address whose record has no city, in no network of the asn database: tessera removes the headers whose value is empty.
+
+```sh
+tessera eval --config upstream.yaml --ip 203.0.113.7
+```
+
+```text
+asn.number  0
+
+hosting-networks  false  Networks of hosting providers.
+
+decision: allow (rule default, reason default)
+
+x-client-asn      removed
+x-client-city     removed
+x-client-country  "JP"
+```
+
+The same request, with `--output json`:
+
+```sh
+tessera eval --config upstream.yaml --ip 203.0.113.7 --output json
+```
+
+```json
+{"attributes":[{"name":"asn.number","value":"0"}],"rules":[{"name":"hosting-networks","description":"Networks of hosting providers.","action":"deny","mode":"enforce","result":"false"}],"decision":{"action":"allow","enforced":true,"rule":"default","reason":"default"},"upstream":{"set":{"x-client-country":"JP"},"remove":["x-client-asn","x-client-city"]}}
+```
+
 ### The output
 
-The text output has three blocks:
+The text output has three blocks, and a fourth for the upstream headers:
 
-1. **The attributes** that the conditions of the rules evaluated read, sorted by name, with their values: a string in double quotes, `client.ip` without them, and `missing` for an attribute or a header that the request does not have. A rule that reads the whole map `request.headers`, such as with `exists`, shows every header. The values of `authorization` and `cookie` are shown as `[REDACTED]`.
-2. **The rules**, in order, up to the one that decides, each with the outcome of its condition: `true`, `false`, or `indeterminate` followed by its cause (`client_ip_missing`, `expression`, `panic` or `set_unavailable`), then `-> allow` or `-> deny` for the rule that decides, or `(audit)` for a rule in `audit` mode, then its description, on one line.
+1. **The attributes** that the conditions of the rules evaluated read, sorted by name, with their values: a string in double quotes; `client.ip`, a bool and an integer without them; a number without them, always with a decimal point, as a CEL `double` literal has one: `52.0`, not `52`, also inside an object; an object or a list of [`geo`](./expressions.md#geo) that a rule reads whole, such as `geo.location` in `has(geo.location)` or `geo.subdivisions` in `exists`, as a CEL literal without quotes around it: `{code: "IT", name: "Italy", in_eu: true}` for `geo.country`, `{code: "EU", name: "Europe"}` for `geo.continent`, `{lat: 41.8919, lon: 12.5113}` for `geo.location`, and `[{code: "62", name: "Lazio"}, {code: "RM", name: "Rome"}]` or `[]` for `geo.subdivisions`; and `missing` for an attribute or a header that the request does not have. A field of an object shows under its own name, such as `geo.country.code`, and a read of an item of `geo.subdivisions`, such as `geo.subdivisions[0].code`, shows the whole list. An attribute of `geo` or `asn` is `missing` without a client address, or when tessera cannot read the record of the address in the database, and `geo.location` and its coordinates are `missing` for a record without a location. A rule that reads the whole map `request.headers`, such as with `exists`, shows every header. The values of the [secret headers](./configuration.md#secret-headers) are shown as `[REDACTED]`.
+2. **The rules**, in order, up to the one that decides, each with the outcome of its condition: `true`, `false`, or `indeterminate` followed by its cause (`client_ip_missing`, `expression`, `panic`, `set_unavailable` or `database_error`), then `-> allow` or `-> deny` for the rule that decides, or `(audit)` for a rule in `audit` mode, then its description, on one line.
 3. **The decision**: its action, the rule that decided or `default`, and the reason (`rule`, `default`, or `error` followed by the cause), with `not enforced: policy.mode is audit` when [`policy.mode: audit`](./configuration.md#policy-mode) allows a denied request; for a denial, the status of the response.
+4. **The upstream headers**, for a request that Envoy sends on, when the configuration has some: each header, in the order of the names, with its value in double quotes, or `removed` when its expression gives an empty string, fails or gives a value that cannot be sent. The value of a header whose expression reads a secret header of the request, in any spelling, or reads the map `request.headers` otherwise than by a literal name, such as with `exists` or a key that is not a literal, is shown as `[REDACTED]`: Envoy receives the value, `tessera eval` does not print it.
 
 `--output json` writes one JSON object on one line:
 
@@ -251,9 +355,10 @@ tessera eval --config rules.yaml \
 
 | JSON field | Content |
 | --- | --- |
-| `attributes` | The attributes, as in the text output: each with `name` and `value`, a string, or `missing: true` without `value`. |
+| `attributes` | The attributes, as in the text output: each with `name` and `value`, always a string, such as `"true"`, `"64496"` or `"[{code: \"62\", name: \"Lazio\"}]"`, or `missing: true` without `value`. |
 | `rules` | The rules evaluated, in order: `name`, `description` (absent when empty), `action`, `mode`, `result` (`true`, `false` or `indeterminate`), and `cause` with `indeterminate`. |
 | `decision` | `action`, `enforced`, `rule`, `reason`; `error`, the cause, with the reason `error`; `audit_rules` and `indeterminate_rules`, absent when empty; `response`, for a denial: `status`, `body` and `headers`, by name. |
+| `upstream` | Only for a request that Envoy sends on, when the configuration has upstream headers: `set`, the headers that tessera sets, by name, with their values, redacted as in the text output, and `remove`, the names of the headers that it removes, in the order of the names. Either can be empty. |
 
 ### Exit status of `eval`
 
@@ -272,13 +377,13 @@ tessera eval --config rules.yaml \
 tessera config validate --config config.yaml
 ```
 
-Reads the [selected file](#configuration-file), checks it as the [configuration reference](./configuration.md) describes, compiles the conditions of the rules, reads the file of every [set](./configuration.md#sets), and prints `configuration valid`. It opens no socket:
+Reads the [selected file](#configuration-file), checks it as the [configuration reference](./configuration.md) describes, compiles the conditions of the rules, the upstream headers and the decision fields, reads the file of every [set](./configuration.md#sets) and every [database](./configuration.md#enrichment), and prints `configuration valid`. It opens no socket:
 
 ```text
 configuration valid
 ```
 
-An invalid configuration, or a set file that is missing or invalid, prints its first error on standard error and exits with status 2:
+An invalid configuration, or a set file or a database that is missing or invalid, prints its first error on standard error and exits with status 2:
 
 ```text
 tessera: policy.default_action (line 2, column 19): expected allow or deny
@@ -288,12 +393,17 @@ tessera: policy.default_action (line 2, column 19): expected allow or deny
 tessera: sets.partners.file (line 9, column 11): line 12 of the file: the value has a control character
 ```
 
+```text
+tessera: enrichment.geo.database (line 3, column 15): the file is not a valid MMDB database
+```
+
 [Error messages](./configuration.md#error-messages) describes their form.
 
-A warning is a problem that does not make the configuration invalid. `tessera config validate` prints each warning on standard error, in the order of the file, then `configuration valid` on standard output, and exits with status 0. The only warning is a set that no rule reads, which tessera loads and checks all the same:
+A warning is a problem that does not make the configuration invalid. `tessera config validate` prints each warning on standard error, in the order of the file, then `configuration valid` on standard output, and exits with status 0. The warnings are a set and a database that no rule, [upstream header](./configuration.md#upstream-headers) or [decision field](./configuration.md#log-decision-fields) reads, which tessera loads and checks all the same:
 
 ```text
-tessera: warning: sets.office (line 3, column 3): the set is not used by any rule
+tessera: warning: sets.office (line 3, column 3): the set is not used by any rule, upstream header or decision field
+tessera: warning: enrichment.asn (line 9, column 3): the database is not used by any rule, upstream header or decision field
 ```
 
 `tessera serve` writes the same warnings as [`config_warning`](./logs.md#config-warning) events.
@@ -304,7 +414,7 @@ tessera: warning: sets.office (line 3, column 3): the set is not used by any rul
 tessera config print --config config.yaml
 ```
 
-Reads and checks the [selected file](#configuration-file) like `tessera config validate`, without reading the files of the sets or printing the warnings, then prints the configuration as YAML, with every default applied and the keys in the order of the [configuration reference](./configuration.md). For a file that sets only `policy.default_action`:
+Reads and checks the [selected file](#configuration-file) like `tessera config validate`, without reading the files of the sets and of the databases or printing the warnings, then prints the configuration as YAML, with every default applied and the keys in the order of the [configuration reference](./configuration.md). For a file that sets only `policy.default_action`:
 
 ```text
 server:
@@ -320,8 +430,11 @@ log:
   level: info
   format: logfmt
   decisions: deny
+  decision_fields: {}
 client_ip:
   from: peer
+secret_headers: []
+enrichment: {}
 sets: {}
 policy:
   mode: enforce
@@ -331,6 +444,8 @@ policy:
     body: ""
     headers: {}
   rules: []
+upstream:
+  headers: {}
 ```
 
 - A value that contains an [environment variable substitution](./configuration.md#environment-variables) is printed as `'[REDACTED]'`.
@@ -338,8 +453,10 @@ policy:
 - Durations are printed in a normal form: `90s` is printed as `1m30s`, `30m` as `30m0s`, and `500ms` as `500ms`.
 - A relative socket path in `server.listen` is printed as an absolute path.
 - `client_ip` shows the keys of its source only: `client_ip.from`, with `client_ip.header` or `client_ip.trusted_hops` when the source has one.
+- `enrichment` shows only the databases that the file configures, each with its `database`, whose relative path is printed as an absolute path, and its `refresh`.
 - The sets are sorted by name. Each shows the keys of its source only: `type`, `values` and `max_entries` for a set of values, and every key but `values` for a set with a file, whose relative path is printed as an absolute path. A value of `values` is printed as a string, `"64496"` for the integer `64496`.
 - Each rule shows `name`, `description`, `action`, `mode` and `when`, in this order and with their defaults, and its `response` with only the keys that the file writes: the others come from `policy.deny_response`.
+- The decision fields and the upstream headers are sorted by their names, which keep the case of the file.
 
 The output is meant for reading. Because of the redacted values, it is not always a valid configuration.
 

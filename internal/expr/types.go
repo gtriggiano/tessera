@@ -12,17 +12,25 @@ import (
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
-// The CEL types that tessera declares. Request, Client and Sets are object
+// The CEL types that tessera declares. Request, Client, Sets, Geo, its
+// GeoCountry, GeoContinent, GeoSubdivision and GeoPoint, and ASN are object
 // types whose fields the provider describes; IP and the types of the sets
-// are opaque: expressions use them only through the functions of library.go.
+// are opaque: expressions use them only through the functions of
+// library.go.
 var (
-	requestType   = types.NewObjectType("tessera.Request")
-	clientType    = types.NewObjectType("tessera.Client")
-	setsType      = types.NewObjectType("tessera.Sets")
-	ipType        = types.NewOpaqueType("tessera.IP")
-	cidrSetType   = types.NewOpaqueType("tessera.CIDRSet")
-	asnSetType    = types.NewOpaqueType("tessera.ASNSet")
-	stringSetType = types.NewOpaqueType("tessera.StringSet")
+	requestType        = types.NewObjectType("tessera.Request")
+	clientType         = types.NewObjectType("tessera.Client")
+	setsType           = types.NewObjectType("tessera.Sets")
+	geoType            = types.NewObjectType("tessera.Geo")
+	geoCountryType     = types.NewObjectType("tessera.GeoCountry")
+	geoContinentType   = types.NewObjectType("tessera.GeoContinent")
+	geoSubdivisionType = types.NewObjectType("tessera.GeoSubdivision")
+	geoPointType       = types.NewObjectType("tessera.GeoPoint")
+	asnType            = types.NewObjectType("tessera.ASN")
+	ipType             = types.NewOpaqueType("tessera.IP")
+	cidrSetType        = types.NewOpaqueType("tessera.CIDRSet")
+	asnSetType         = types.NewOpaqueType("tessera.ASNSet")
+	stringSetType      = types.NewOpaqueType("tessera.StringSet")
 )
 
 // setTypes are the CEL types of the sets, by the type of a set.
@@ -71,9 +79,10 @@ func (v *ip) Type() ref.Type { return ipType }
 func (v *ip) Value() any     { return v.addr }
 
 // field is one field of an object type: its CEL type, whether it is set on a
-// value, and how to read it. The functions receive the Go value that the
-// activation returned for the variable, a *requestVal, a *clientVal or a
-// *setsVal.
+// value, and how to read it. The functions receive the Go value of the
+// object: a *requestVal, a *clientVal, a *setsVal, a *geoVal, a
+// *countryVal, a *continentVal, a *subdivisionVal, a *pointVal or an
+// *asnVal.
 type field struct {
 	typ   *types.Type
 	isSet func(obj any) bool
@@ -118,9 +127,15 @@ func newProvider(lib *library) (*provider, error) {
 	return &provider{
 		Registry: reg,
 		objects: map[string]map[string]field{
-			requestType.TypeName(): guard(requestFields),
-			clientType.TypeName():  guard(clientFields),
-			setsType.TypeName():    guard(setFields),
+			requestType.TypeName():        guard(requestFields),
+			clientType.TypeName():         guard(clientFields),
+			setsType.TypeName():           guard(setFields),
+			geoType.TypeName():            guard(geoFields),
+			geoCountryType.TypeName():     guard(countryFields),
+			geoContinentType.TypeName():   guard(continentFields),
+			geoSubdivisionType.TypeName(): guard(subdivisionFields),
+			geoPointType.TypeName():       guard(pointFields),
+			asnType.TypeName():            guard(asnFields),
 		},
 	}, nil
 }

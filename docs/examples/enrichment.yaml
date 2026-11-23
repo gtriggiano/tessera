@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../public/config.schema.json
+# The databases are files next to this one.
+enrichment:
+  geo:
+    database: geo.mmdb
+  asn:
+    database: asn.mmdb
+
+sets:
+  hosting:
+    type: asn
+    values: [64500, 64501]
+
+policy:
+  default_action: deny
+  rules:
+    - name: hosting-networks
+      description: Networks of hosting providers.
+      action: deny
+      when: sets.hosting.contains(asn.number)
+
+    - name: unknown-addresses
+      description: Addresses that the database does not locate.
+      action: deny
+      mode: audit
+      when: '!geo.found'
+
+    - name: lazio
+      description: The region of the office, Lazio in Italy.
+      action: allow
+      when: geo.country.code == "IT" && geo.subdivisions.exists(s, s.code == "62")
+
+    - name: european-union
+      action: allow
+      when: geo.country.in_eu
+
+    - name: rome-office
+      description: The surroundings of the office in Rome, outside the European Union too.
+      action: allow
+      when: |
+        has(geo.location)
+          && geo.location.lat > 41.0 && geo.location.lat < 43.0
+          && geo.location.lon > 11.5 && geo.location.lon < 13.5

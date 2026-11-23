@@ -66,7 +66,7 @@ func sampleRequest(clientIP string) *request.Request {
 // eval compiles and evaluates text for r.
 func eval(t *testing.T, env *Env, text string, r *request.Request) (bool, error) {
 	t.Helper()
-	return mustCompile(t, env, text).Eval(NewInput(r, nil))
+	return mustCompile(t, env, text).Eval(NewInput(r, nil, nil))
 }
 
 func cause(err error) Cause {
@@ -210,7 +210,9 @@ func TestCompileErrors(t *testing.T) {
 		{`size(request.path)`, 1, 1, "the condition must be a bool, not int"},
 		{`  int(request.headers["x"]) + 1`, 1, 3, "the condition must be a bool, not int"},
 		{`requests.host == "x"`, 1, 1, "undeclared reference to 'requests'"},
-		{`geo.country == "IT"`, 1, 1, "undeclared reference to 'geo'"},
+		{`geo.country.code == "IT"`, 1, 1, "geo is not available: the configuration has no enrichment.geo"},
+		{`request.host == "x" || asn.number == 64496`, 1, 24, "asn is not available: the configuration has no enrichment.asn"},
+		{`georgia == "x"`, 1, 1, "undeclared reference to 'georgia'"},
 		{`request.method in ["GET", 1]`, 1, 27, "expected type 'string' but found 'int'"},
 		{"request.method == \"GET\" &&\n    request.hots == \"x\"", 2, 12, "undefined field 'hots'"},
 		// Columns count characters: é and 🙂 are one column each.
@@ -344,7 +346,7 @@ func TestPanics(t *testing.T) {
 	}}))
 	evalAs := func(rule, text string, r *request.Request) (bool, error) {
 		t.Helper()
-		in := NewInput(r, nil)
+		in := NewInput(r, nil, nil)
 		in.SetRule(rule)
 		return mustCompile(t, env, text).Eval(in)
 	}
@@ -379,7 +381,7 @@ func TestPanics(t *testing.T) {
 	// A field read that panics, here on a request that is not there, is
 	// guarded too, and reported with its rule.
 	reported = nil
-	in := NewInput(&request.Request{}, nil)
+	in := NewInput(&request.Request{}, nil, nil)
 	in.SetRule("admin")
 	in.request.req = nil
 	_, err := mustCompile(t, env, `request.host == "x"`).Eval(in)
@@ -400,7 +402,7 @@ func TestInCidrNetworkParsedOnce(t *testing.T) {
 	c := mustCompile(t, env, `client.ip.inCidr("198.51.100.0/24") || client.ip.inCidr("203.0.113.0/24") || client.ip.inCidr("2001:db8::/32")`)
 	compiled := parses
 	for range 100 {
-		if ok, err := c.Eval(NewInput(sampleRequest("2001:db8::7"), nil)); !ok || err != nil {
+		if ok, err := c.Eval(NewInput(sampleRequest("2001:db8::7"), nil, nil)); !ok || err != nil {
 			t.Fatalf("Eval = %v, %v", ok, err)
 		}
 	}
@@ -421,7 +423,7 @@ func TestConcurrentEvaluations(t *testing.T) {
 	for w := range 8 {
 		wg.Go(func() {
 			for i := range 500 {
-				in := NewInput(sampleRequest(fmt.Sprintf("192.0.2.%d", (w*500+i)%250+1)), nil)
+				in := NewInput(sampleRequest(fmt.Sprintf("192.0.2.%d", (w*500+i)%250+1)), nil, nil)
 				for _, c := range conditions {
 					if ok, err := c.Eval(in); !ok || err != nil {
 						t.Errorf("Eval = %v, %v", ok, err)

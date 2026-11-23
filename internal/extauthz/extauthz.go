@@ -27,6 +27,7 @@ import (
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/gtriggiano/tessera/internal/engine"
 	"github.com/gtriggiano/tessera/internal/expr"
@@ -317,13 +318,23 @@ func rawRequest(req *authv3.CheckRequest) request.Raw {
 }
 
 // checkResponse translates a decision. It allows an allow, and a deny that
-// is not enforced; anything else denies, with the response of the decision,
-// or 403 without a body when it has none.
+// is not enforced, with the upstream headers of the decision: those with a
+// value to set, the others to remove. Anything else denies, with the
+// response of the decision, or 403 without a body when it has none.
 func checkResponse(d engine.Decision) *authv3.CheckResponse {
 	if d.Action == engine.Allow || d.Action == engine.Deny && !d.Enforced {
+		ok := &authv3.OkHttpResponse{}
+		for _, h := range d.Upstream {
+			if h.Value == "" {
+				ok.HeadersToRemove = append(ok.HeadersToRemove, h.Name)
+				continue
+			}
+			// The value replaces the one of the client.
+			ok.Headers = append(ok.Headers, replacing(h.Name, h.Value))
+		}
 		return &authv3.CheckResponse{
 			Status:       &rpcstatus.Status{Code: int32(codes.OK)},
-			HttpResponse: &authv3.CheckResponse_OkResponse{OkResponse: &authv3.OkHttpResponse{}},
+			HttpResponse: &authv3.CheckResponse_OkResponse{OkResponse: ok},
 		}
 	}
 	denied := &authv3.DeniedHttpResponse{Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden}}
@@ -333,18 +344,29 @@ func checkResponse(d engine.Decision) *authv3.CheckResponse {
 		denied.Status.Code = typev3.StatusCode(r.Status)
 		denied.Body = r.Body
 		// Each header replaces the one of the same name that Envoy would
-		// set: the action is explicit, as the defaults of the append fields
-		// differ in this message.
+		// set.
 		for _, h := range r.Headers {
-			denied.Headers = append(denied.Headers, &corev3.HeaderValueOption{
-				Header:       &corev3.HeaderValue{Key: h.Name, Value: h.Value},
-				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
-			})
+			denied.Headers = append(denied.Headers, replacing(h.Name, h.Value))
 		}
 	}
 	return &authv3.CheckResponse{
 		Status:       &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
 		HttpResponse: &authv3.CheckResponse_DeniedResponse{DeniedResponse: denied},
+	}
+}
+
+// replacing returns a header of a CheckResponse that replaces any header of
+// the same name, or is added. It sets both fields that say so: append, false,
+// which Envoy reads for the headers of ok_response and denied_response (up
+// to at least Envoy 1.40, false when it is absent), and append_action,
+// OVERWRITE_IF_EXISTS_OR_ADD, which Envoy reads only for
+// response_headers_to_add and which states the same intent for an Envoy that
+// reads it.
+func replacing(name, value string) *corev3.HeaderValueOption {
+	return &corev3.HeaderValueOption{
+		Header:       &corev3.HeaderValue{Key: name, Value: value},
+		Append:       wrapperspb.Bool(false),
+		AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 	}
 }
 

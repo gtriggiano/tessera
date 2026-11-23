@@ -1,13 +1,17 @@
-// Package expr compiles and evaluates the conditions of tessera's rules,
-// written in CEL: the variables request, client and sets, their types,
-// tessera's functions on IP addresses and sets, and the limits of an
-// expression.
+// Package expr compiles and evaluates the expressions of tessera, written in
+// CEL: the conditions of the rules, and the string expressions of the
+// upstream headers and of the decision fields. It declares the variables
+// request, client, sets, geo and asn, their types, tessera's functions on IP
+// addresses and sets, and the limits of an expression.
 //
-// A condition is compiled once, at startup, and type-checked: an unknown
-// attribute, a wrong type or a result that is not a bool is a CompileError
-// with a position. Evaluating it reads memory only. An evaluation that fails
-// returns an *EvalError, whose Cause says why; && and || absorb an error when
-// their other operand decides, as CEL defines.
+// An expression is compiled once, at startup, and type-checked: an unknown
+// attribute, a wrong type or a result of another type than the one expected
+// is a CompileError with a position. A decision field cannot read
+// request.query, a secret header, nor request.headers otherwise than by a
+// literal name. Evaluating an expression reads memory
+// only. An evaluation that fails returns an *EvalError, whose Cause says why;
+// && and || absorb an error when their other operand decides, as CEL
+// defines.
 package expr
 
 import (
@@ -21,8 +25,10 @@ import (
 	"cel.dev/cel-go/common"
 	"cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
@@ -39,8 +45,8 @@ type Cause string
 
 // The causes of an indeterminate condition.
 const (
-	// CauseClientIPMissing: the condition read client.ip, and the request
-	// has no client address.
+	// CauseClientIPMissing: the condition read client.ip, geo or asn, and
+	// the request has no client address.
 	CauseClientIPMissing Cause = "client_ip_missing"
 	// CauseExpression: the evaluation failed, as a conversion, an overflow
 	// or a missing map key do, or exceeded the cost limit.
@@ -50,7 +56,14 @@ const (
 	// CauseSetUnavailable: the condition read a set that was not
 	// available, and whose on_unavailable is fail.
 	CauseSetUnavailable Cause = "set_unavailable"
+	// CauseDatabaseError: the condition read geo or asn, and the lookup of
+	// the client address in the database failed.
+	CauseDatabaseError Cause = "database_error"
 )
+
+// Causes are the causes of an indeterminate condition, in the order of the
+// metrics reference.
+var Causes = []Cause{CauseClientIPMissing, CauseExpression, CausePanic, CauseSetUnavailable, CauseDatabaseError}
 
 // EvalError is the error of a condition that could not be evaluated. Its
 // message is the cause only: the error it wraps can hold request data.
@@ -75,7 +88,17 @@ type Options struct {
 	// Sets declares the sets: each is a field of the variable sets, in the
 	// order of the entries of the Snapshot that NewInput receives.
 	Sets []sets.Declaration
+	// Databases are the kinds of the configured databases: an expression
+	// can read geo, or asn, only when its kind is among them.
+	Databases []enrichment.Kind
+	// SecretHeaders are the names of the secret headers, in any case, in
+	// addition to AlwaysSecretHeaders: a decision field cannot read them.
+	SecretHeaders []string
 }
+
+// AlwaysSecretHeaders are the headers that are secret in every
+// configuration: they hold credentials.
+var AlwaysSecretHeaders = []string{"authorization", "proxy-authorization", "cookie"}
 
 // Env compiles conditions. It is immutable and safe for concurrent use.
 type Env struct {
@@ -86,7 +109,10 @@ type Env struct {
 
 // NewEnv returns an Env.
 func NewEnv(opts Options) (*Env, error) {
-	lib := &library{onPanic: opts.OnPanic, parseNetwork: parseNetwork, sets: append([]sets.Declaration(nil), opts.Sets...)}
+	lib := &library{onPanic: opts.OnPanic, parseNetwork: parseNetwork, sets: slices.Clone(opts.Sets), databases: slices.Clone(opts.Databases), secrets: slices.Clone(AlwaysSecretHeaders)}
+	for _, name := range opts.SecretHeaders {
+		lib.secrets = append(lib.secrets, strings.ToLower(name))
+	}
 	p, err := newProvider(lib)
 	if err != nil {
 		return nil, err
@@ -97,6 +123,8 @@ func NewEnv(opts Options) (*Env, error) {
 		cel.Variable("request", requestType),
 		cel.Variable("client", clientType),
 		cel.Variable("sets", setsType),
+		cel.Variable("geo", geoType),
+		cel.Variable("asn", asnType),
 		cel.ParserExpressionSizeLimit(MaxLength),
 	}
 	env, err := cel.NewEnv(append(envOpts, lib.envOptions()...)...)
@@ -119,7 +147,7 @@ func NewEnv(opts Options) (*Env, error) {
 
 // validatorMessages start the messages of the validators of the
 // environment, which hold no text of the expression.
-var validatorMessages = []string{"invalid network: ", errNetworkLiteral.Error(), "invalid regular expression: ", "comprehension exceeds nesting limit", errSetUse.Error()}
+var validatorMessages = []string{"invalid network: ", errNetworkLiteral.Error(), "invalid regular expression: ", "comprehension exceeds nesting limit", errSetUse.Error(), "geo is not available: ", "asn is not available: ", "a decision field "}
 
 // SyntaxError is the message of an issue of the parser.
 const SyntaxError = "syntax error in the expression"
@@ -172,24 +200,82 @@ func (e *CompileError) Error() string {
 	return b.String()
 }
 
+// program is a compiled expression, and what it reads.
+type program struct {
+	prg        cel.Program
+	attributes []string
+	sets       []string
+	databases  []enrichment.Kind
+	lib        *library
+}
+
 // Condition is a compiled condition. It is immutable and safe for concurrent
 // use.
 type Condition struct {
-	prg        cel.Program
-	always     bool
-	attributes []string
-	sets       []string
-	lib        *library
+	program
+	always bool
 }
+
+// StringExpr is a compiled expression whose result is a string: the value of
+// an upstream header or of a decision field. It is immutable and safe for
+// concurrent use.
+type StringExpr struct {
+	program
+	secrets bool
+}
+
+// ReadsSecrets reports whether the value of the expression can hold the
+// value of a secret header, of AlwaysSecretHeaders or of
+// Options.SecretHeaders: it reads one of them, in any spelling, or reads
+// request.headers otherwise than by a literal name. It is decided when the
+// expression is compiled, from its text. A decision field never does.
+func (s *StringExpr) ReadsSecrets() bool { return s.secrets }
 
 // Compile parses, type-checks and validates text, a condition, and builds
 // its program. A condition is an expression whose result is a bool.
 func (e *Env) Compile(text string) (*Condition, error) {
+	a, p, err := e.compile(text, types.BoolType, "the condition must be a bool, not %s", false)
+	if err != nil {
+		return nil, err
+	}
+	root := a.Expr()
+	always := root.Kind() == ast.LiteralKind && root.AsLiteral() == types.True
+	return &Condition{program: p, always: always}, nil
+}
+
+// CompileString compiles text, an expression whose result is a string, as
+// Compile compiles a condition: the value of an upstream header.
+func (e *Env) CompileString(text string) (*StringExpr, error) {
+	a, p, err := e.compile(text, types.StringType, "the expression must be a string, not %s", false)
+	if err != nil {
+		return nil, err
+	}
+	return &StringExpr{program: p, secrets: readsSecrets(a, e.lib.secrets)}, nil
+}
+
+// CompileDecisionField compiles text, the expression of a decision field,
+// as CompileString does. A decision field is written in the log events, so
+// it cannot read what tessera never logs: request.query, a secret header, in
+// any spelling, nor request.headers otherwise than by a literal name, as in request.headers["user-agent"],
+// request.headers.accept or "x-tag" in request.headers. Each such read is an
+// issue at the position of request.
+func (e *Env) CompileDecisionField(text string) (*StringExpr, error) {
+	_, p, err := e.compile(text, types.StringType, "the expression must be a string, not %s", true)
+	if err != nil {
+		return nil, err
+	}
+	return &StringExpr{program: p}, nil
+}
+
+// compile parses, type-checks and validates text, whose result must be of
+// the type want, with the message wrong otherwise, and, for a decision
+// field, checks what it reads. It returns its checked form and its program.
+func (e *Env) compile(text string, want *types.Type, wrong string, field bool) (*ast.AST, program, error) {
 	if utf8.RuneCountInString(text) > MaxLength {
-		return nil, &CompileError{Issues: []Issue{{Line: 1, Column: 1, Message: fmt.Sprintf("the expression is longer than %d characters", MaxLength)}}}
+		return nil, program{}, &CompileError{Issues: []Issue{{Line: 1, Column: 1, Message: fmt.Sprintf("the expression is longer than %d characters", MaxLength)}}}
 	}
 	if strings.TrimSpace(text) == "" {
-		return nil, &CompileError{Issues: []Issue{{Line: 1, Column: 1, Message: "the expression is empty"}}}
+		return nil, program{}, &CompileError{Issues: []Issue{{Line: 1, Column: 1, Message: "the expression is empty"}}}
 	}
 	// Issues.Err and Issues.String quote the expression: the messages are
 	// built from the errors alone. Those of the parser quote the text where
@@ -201,7 +287,7 @@ func (e *Env) Compile(text string) (*Condition, error) {
 		for _, err := range iss.Errors() {
 			ce.Issues = append(ce.Issues, issue(err.Location, SyntaxError))
 		}
-		return nil, ce
+		return nil, program{}, ce
 	}
 	a, iss := e.cel.Check(parsed)
 	if iss != nil && len(iss.Errors()) > 0 {
@@ -218,20 +304,23 @@ func (e *Env) Compile(text string) (*Condition, error) {
 			}
 			ce.Issues = append(ce.Issues, issue(err.Location, message))
 		}
-		return nil, ce
+		return nil, program{}, ce
 	}
 	native := a.NativeRep()
-	if t := a.OutputType(); !t.IsExactType(types.BoolType) {
+	if t := a.OutputType(); !t.IsExactType(want) {
 		loc := native.SourceInfo().GetLocationByOffset(start(native.Expr(), native.SourceInfo()))
-		return nil, &CompileError{Issues: []Issue{issue(loc, fmt.Sprintf("the condition must be a bool, not %s", t))}}
+		return nil, program{}, &CompileError{Issues: []Issue{issue(loc, fmt.Sprintf(wrong, t))}}
+	}
+	if field {
+		if issues := fieldIssues(native, e.lib.secrets); len(issues) > 0 {
+			return nil, program{}, &CompileError{Issues: issues}
+		}
 	}
 	prg, err := e.cel.Program(a, e.progOpts...)
 	if err != nil {
-		return nil, &CompileError{Issues: []Issue{{Line: 1, Column: 1, Message: "the expression cannot be prepared for evaluation"}}}
+		return nil, program{}, &CompileError{Issues: []Issue{{Line: 1, Column: 1, Message: "the expression cannot be prepared for evaluation"}}}
 	}
-	root := native.Expr()
-	always := root.Kind() == ast.LiteralKind && root.AsLiteral() == types.True
-	return &Condition{prg: prg, always: always, attributes: attributes(root, native.ReferenceMap()), sets: setsRead(native), lib: e.lib}, nil
+	return native, program{prg: prg, attributes: attributes(native.Expr(), native.ReferenceMap()), sets: setsRead(native), databases: databasesRead(native), lib: e.lib}, nil
 }
 
 func issue(loc common.Location, message string) Issue {
@@ -251,15 +340,41 @@ func (c *Condition) Always() bool { return c.always }
 // Eval evaluates the condition for one request. The error, if any, is an
 // *EvalError.
 func (c *Condition) Eval(in *Input) (bool, error) {
-	out, _, err := c.prg.Eval(in)
+	out, err := c.eval(in)
 	if err != nil {
-		return false, c.classify(err, in)
+		return false, err
 	}
 	b, ok := out.(types.Bool)
 	if !ok {
 		return false, &EvalError{Cause: CauseExpression, err: errors.New("the condition did not return a bool")}
 	}
 	return bool(b), nil
+}
+
+// Eval evaluates the expression for one request. The error, if any, is an
+// *EvalError.
+func (s *StringExpr) Eval(in *Input) (string, error) {
+	out, err := s.eval(in)
+	if err != nil {
+		return "", err
+	}
+	str, ok := out.(types.String)
+	if !ok {
+		return "", &EvalError{Cause: CauseExpression, err: errors.New("the expression did not return a string")}
+	}
+	return string(str), nil
+}
+
+// eval evaluates the program with in. The error, if any, is an *EvalError.
+func (p *program) eval(in *Input) (ref.Val, error) {
+	// The expressions of one Input come from one Env: its library reports a
+	// panic of a lookup.
+	in.lib = p.lib
+	out, _, err := p.prg.Eval(in)
+	if err != nil {
+		return nil, p.classify(err, in)
+	}
+	return out, nil
 }
 
 // classify sorts the errors of an evaluation:
@@ -269,12 +384,13 @@ func (c *Condition) Eval(in *Input) (bool, error) {
 //   - ErrClientIPMissing: the condition read client.ip without an address;
 //   - ErrSetUnavailable: contains on an unavailable set, whose
 //     on_unavailable is fail;
+//   - ErrDatabase: a read of geo or asn whose lookup failed;
 //   - any other *types.Err: an ordinary evaluation error;
 //   - anything else: cel-go recovered a panic outside tessera's guards and
 //     returned "internal error", without a stack; it is reported here.
-func (c *Condition) classify(err error, in *Input) *EvalError {
-	var p *Panic
-	if errors.As(err, &p) {
+func (p *program) classify(err error, in *Input) *EvalError {
+	var pn *Panic
+	if errors.As(err, &pn) {
 		return &EvalError{Cause: CausePanic, err: err}
 	}
 	var cancelled interpreter.EvalCancelledError
@@ -290,28 +406,57 @@ func (c *Condition) classify(err error, in *Input) *EvalError {
 	if errors.Is(err, ErrSetUnavailable) {
 		return &EvalError{Cause: CauseSetUnavailable, err: err}
 	}
+	if errors.Is(err, ErrDatabase) {
+		return &EvalError{Cause: CauseDatabaseError, err: err}
+	}
 	var celErr *types.Err
 	if errors.As(err, &celErr) {
 		return &EvalError{Cause: CauseExpression, err: err}
 	}
-	p = &Panic{Rule: in.rule, Value: err.Error()}
-	if c.lib.onPanic != nil {
-		c.lib.onPanic(p)
+	pn = &Panic{Rule: in.rule, Value: err.Error()}
+	if p.lib.onPanic != nil {
+		p.lib.onPanic(pn)
 	}
-	return &EvalError{Cause: CausePanic, err: p}
+	return &EvalError{Cause: CausePanic, err: pn}
 }
 
-// Attributes returns the attributes that the condition reads, sorted:
-// request.host, client.ip and the others by name, and the headers as
-// request.headers["name"] when the condition names them with a literal key,
-// or as request.headers when it reads the map otherwise.
-func (c *Condition) Attributes() []string {
-	return c.attributes
+// Attributes returns the attributes that the expression reads, sorted:
+// request.host, client.ip, geo.city and the others by name, the headers as
+// request.headers["name"] when the condition names them with a literal
+// key, or as request.headers when it reads the map otherwise; a field of an
+// object of geo, its country, continent or location, as geo.country.code or
+// geo.location.lat, or the object as geo.country when the expression reads
+// it as a whole, as has(geo.location) and geo.country == geo.country do; and
+// geo.subdivisions for any read of the list or of its items, such as
+// geo.subdivisions[0].code or a macro over it.
+func (p *program) Attributes() []string {
+	return p.attributes
 }
 
-// Sets returns the names of the sets that the condition reads, sorted.
-func (c *Condition) Sets() []string {
-	return c.sets
+// Sets returns the names of the sets that the expression reads, sorted.
+func (p *program) Sets() []string {
+	return p.sets
+}
+
+// Databases returns the kinds of the databases that the expression reads,
+// through geo or asn, sorted.
+func (p *program) Databases() []enrichment.Kind {
+	return p.databases
+}
+
+// databasesRead lists the databases that a reads: the variables geo and
+// asn, not iteration variables of the same name.
+func databasesRead(a *ast.AST) []enrichment.Kind {
+	var out []enrichment.Kind
+	for _, d := range databaseVariables {
+		if len(ast.MatchDescendants(ast.NavigateAST(a), func(e ast.NavigableExpr) bool {
+			return e.Kind() == ast.IdentKind && e.AsIdent() == string(d.kind) && a.GetType(e.ID()).IsExactType(d.typ)
+		})) > 0 {
+			out = append(out, d.kind)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // setsRead lists the sets that a reads: the fields of the variable sets, the
@@ -332,8 +477,11 @@ func setsRead(a *ast.AST) []string {
 	return out
 }
 
+// geoObjects are the fields of geo whose values are objects.
+var geoObjects = []string{"continent", "country", "location"}
+
 // attributes lists the attributes that e reads. refs tells the variables
-// request and client from iteration variables of the same name.
+// request, client, geo and asn from iteration variables of the same name.
 func attributes(e ast.Expr, refs map[int64]*ast.ReferenceInfo) []string {
 	found := map[string]bool{}
 	variable := func(e ast.Expr, name string) bool {
@@ -343,6 +491,11 @@ func attributes(e ast.Expr, refs map[int64]*ast.ReferenceInfo) []string {
 	// headers reports whether e is request.headers.
 	headers := func(e ast.Expr) bool {
 		return e.Kind() == ast.SelectKind && e.AsSelect().FieldName() == "headers" && variable(e.AsSelect().Operand(), "request")
+	}
+	// geoObject reports whether e reads an object of geo, without testing
+	// it.
+	geoObject := func(e ast.Expr) bool {
+		return e.Kind() == ast.SelectKind && !e.AsSelect().IsTestOnly() && slices.Contains(geoObjects, e.AsSelect().FieldName()) && variable(e.AsSelect().Operand(), "geo")
 	}
 	literal := func(e ast.Expr) (string, bool) {
 		if e.Kind() != ast.LiteralKind {
@@ -358,8 +511,10 @@ func attributes(e ast.Expr, refs map[int64]*ast.ReferenceInfo) []string {
 		case ast.SelectKind:
 			sel := e.AsSelect()
 			switch op := sel.Operand(); {
-			case variable(op, "request") || variable(op, "client"):
+			case variable(op, "request") || variable(op, "client") || variable(op, "geo") || variable(op, "asn"):
 				found[op.AsIdent()+"."+sel.FieldName()] = true
+			case geoObject(op):
+				found["geo."+op.AsSelect().FieldName()+"."+sel.FieldName()] = true
 			case headers(op):
 				header(sel.FieldName())
 			default:

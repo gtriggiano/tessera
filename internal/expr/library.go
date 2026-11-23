@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"runtime/debug"
+	"slices"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -17,6 +19,7 @@ import (
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
@@ -58,6 +61,11 @@ type library struct {
 	parseNetwork func(string) (netip.Prefix, error)
 	// sets are the declared sets: the fields of the variable sets.
 	sets []sets.Declaration
+	// databases are the kinds of the configured databases: geo and asn can
+	// be read only when theirs is configured.
+	databases []enrichment.Kind
+	// secrets are the names of the secret headers, in lowercase.
+	secrets []string
 }
 
 // The errors of an invalid network. They never repeat the configured value.
@@ -103,6 +111,7 @@ func (l *library) envOptions() []cel.EnvOption {
 			cel.MemberOverload(overloadStringSetContains, []*cel.Type{stringSetType, cel.StringType}, cel.BoolType,
 				cel.BinaryBinding(l.binary(stringSetContains)))),
 		cel.ASTValidators(
+			databasesValidator{lib: l},
 			setsValidator{},
 			networkValidator{lib: l},
 			regexValidator{},
@@ -196,6 +205,129 @@ func (setsValidator) Validate(_ *cel.Env, _ cel.ValidatorConfig, a *ast.AST, iss
 		}
 		iss.ReportErrorAtID(e.ID(), "%s", errSetUse)
 	}
+}
+
+// databaseVariables are the variables that read a database, with their
+// types.
+var databaseVariables = []struct {
+	kind enrichment.Kind
+	typ  *types.Type
+}{{enrichment.Geo, geoType}, {enrichment.ASN, asnType}}
+
+// databasesValidator reports each read of geo or asn whose database the
+// configuration does not have, at the position of the variable.
+type databasesValidator struct{ lib *library }
+
+func (databasesValidator) Name() string { return "tessera.validator.databases" }
+
+func (v databasesValidator) Validate(_ *cel.Env, _ cel.ValidatorConfig, a *ast.AST, iss *cel.Issues) {
+	for _, d := range databaseVariables {
+		if slices.Contains(v.lib.databases, d.kind) {
+			continue
+		}
+		for _, e := range ast.MatchDescendants(ast.NavigateAST(a), func(e ast.NavigableExpr) bool {
+			return e.Kind() == ast.IdentKind && e.AsIdent() == string(d.kind) && a.GetType(e.ID()).IsExactType(d.typ)
+		}) {
+			iss.ReportErrorAtID(e.ID(), "%s is not available: the configuration has no enrichment.%s", d.kind, d.kind)
+		}
+	}
+}
+
+// The messages of the reads that a decision field cannot make. They start
+// with a prefix of validatorMessages.
+var (
+	errFieldQuery   = errors.New("a decision field cannot read request.query")
+	errFieldSecret  = errors.New("a decision field cannot read a secret header")
+	errFieldHeaders = errors.New(`a decision field can read request.headers only by a literal name, such as request.headers["user-agent"]`)
+	errFieldRequest = errors.New("a decision field can read request only through its attributes, such as request.host")
+)
+
+// restrictedRead is a read of an expression that a decision field cannot
+// make: the request it reads, and the error that describes the read.
+type restrictedRead struct {
+	request ast.Expr
+	err     error
+}
+
+// fieldIssues returns the reads of a, the expression of a decision field,
+// that a decision field cannot make, with the secret headers secrets, each at
+// the position of the request that it reads (see restrictedReads).
+func fieldIssues(a *ast.AST, secrets []string) []Issue {
+	var out []Issue
+	for _, r := range restrictedReads(a, secrets) {
+		out = append(out, issue(a.SourceInfo().GetStartLocation(r.request.ID()), r.err.Error()))
+	}
+	return out
+}
+
+// readsSecrets reports whether a reads, or can read, the value of a header
+// of secrets: by its name, in any spelling and case, or through the map
+// request.headers otherwise than by a literal name, or through the request
+// otherwise than as the operand of an attribute.
+func readsSecrets(a *ast.AST, secrets []string) bool {
+	return slices.ContainsFunc(restrictedReads(a, secrets), func(r restrictedRead) bool { return r.err != errFieldQuery })
+}
+
+// restrictedReads returns the reads of a that a decision field cannot make:
+// request otherwise than as the operand of an attribute, request.query, even
+// in has(), and request.headers otherwise than by a literal name, as an
+// index, a field or the right side of in, or by the name of a header of
+// secrets, the secret headers in lowercase, in any case.
+func restrictedReads(a *ast.AST, secrets []string) []restrictedRead {
+	var out []restrictedRead
+	report := func(e ast.Expr, err error) {
+		out = append(out, restrictedRead{request: e, err: err})
+	}
+	literal := func(e ast.Expr) (string, bool) {
+		if e.Kind() != ast.LiteralKind {
+			return "", false
+		}
+		s, ok := e.AsLiteral().(types.String)
+		return string(s), ok
+	}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(a), func(e ast.NavigableExpr) bool {
+		return e.Kind() == ast.IdentKind && a.GetType(e.ID()).IsExactType(requestType)
+	}) {
+		sel, ok := e.Parent()
+		if !ok || sel.Kind() != ast.SelectKind {
+			report(e, errFieldRequest)
+			continue
+		}
+		switch sel.AsSelect().FieldName() {
+		case "query":
+			report(e, errFieldQuery)
+			continue
+		case "headers":
+		default:
+			continue
+		}
+		if sel.AsSelect().IsTestOnly() {
+			continue // has(request.headers) reads no header
+		}
+		// The read of the map: a header by a literal name, or nothing.
+		name, named := "", false
+		if read, ok := sel.Parent(); ok {
+			switch read.Kind() {
+			case ast.SelectKind:
+				name, named = read.AsSelect().FieldName(), true
+			case ast.CallKind:
+				call, args := read.AsCall(), read.AsCall().Args()
+				switch {
+				case call.FunctionName() == "_[_]" && len(args) == 2 && args[0].ID() == sel.ID():
+					name, named = literal(args[1])
+				case call.FunctionName() == "@in" && len(args) == 2 && args[1].ID() == sel.ID():
+					name, named = literal(args[0])
+				}
+			}
+		}
+		switch {
+		case !named:
+			report(e, errFieldHeaders)
+		case slices.Contains(secrets, strings.ToLower(name)):
+			report(e, errFieldSecret)
+		}
+	}
+	return out
 }
 
 // ipInCidrUnprepared is the binding of inCidr when its network was not
@@ -392,7 +524,8 @@ func inputOf(values ...ref.Val) *Input {
 }
 
 // guardGet guards the reading of a field in the same way: the field belongs
-// to the value of request, client or sets, which leads to the activation.
+// to the value of request, client, sets, geo, one of the objects of geo, or
+// asn, which leads to the activation.
 func (l *library) guardGet(get func(any) (any, error)) func(any) (any, error) {
 	return func(obj any) (out any, err error) {
 		defer func() {
@@ -404,6 +537,18 @@ func (l *library) guardGet(get func(any) (any, error)) func(any) (any, error) {
 				case *clientVal:
 					in = v.in
 				case *setsVal:
+					in = v.in
+				case *geoVal:
+					in = v.in
+				case *countryVal:
+					in = v.in
+				case *continentVal:
+					in = v.in
+				case *subdivisionVal:
+					in = v.in
+				case *pointVal:
+					in = v.in
+				case *asnVal:
 					in = v.in
 				}
 				out, err = nil, l.recovered(r, in)

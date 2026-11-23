@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/gtriggiano/tessera/internal/mmdbtest"
 	"github.com/gtriggiano/tessera/internal/sets"
 	"github.com/gtriggiano/tessera/internal/source"
 )
@@ -219,10 +221,42 @@ func TestDocsConfigSnippets(t *testing.T) {
 // replaces the path with the address of the published schema.
 const exampleSchemaDirective = "# yaml-language-server: $schema=../public/config.schema.json"
 
+// exampleDatabases are the databases of docs/examples/, written from the
+// example data of mmdbtest, in the documentation ranges.
+var exampleDatabases = map[string]func() *mmdbtest.Writer{
+	"geo.mmdb": func() *mmdbtest.Writer { return mmdbtest.CityDatabase(6) },
+	"asn.mmdb": mmdbtest.ASNDatabase,
+}
+
+// TestExampleDatabases fails when a database of docs/examples/ differs from
+// the one that the example data gives: regenerate them with
+//
+//	go test ./internal/config -run TestExampleDatabases -update
+func TestExampleDatabases(t *testing.T) {
+	for name, writer := range exampleDatabases {
+		want, err := writer().Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(examplesDir, name)
+		if *update {
+			if err := os.WriteFile(path, want, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%s differs from the example data (%v): regenerate it with\n\tgo test ./internal/config -run TestExampleDatabases -update", filepath.ToSlash(path), err)
+		}
+	}
+}
+
 // TestRepositoryExamples loads every .yaml file in docs/examples/ as a
 // complete configuration, with every environment variable unset, and reads
-// the file of each of its sets. A .txt file is the file of a set, which an
-// example reads.
+// the file of each of its sets and each of its databases, as tessera serve
+// does. A .txt file is the file of a set, and a .mmdb file a database, which
+// an example reads.
 func TestRepositoryExamples(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join(examplesDir, "*"))
 	if err != nil {
@@ -236,12 +270,12 @@ func TestRepositoryExamples(t *testing.T) {
 		if strings.HasPrefix(filepath.Base(file), ".") {
 			continue // Such as the .DS_Store of macOS, which Git ignores.
 		}
-		if filepath.Ext(file) == ".txt" {
-			continue // The file of a set, read with its example.
+		if filepath.Ext(file) == ".txt" || filepath.Ext(file) == ".mmdb" {
+			continue // The file of a set or a database, read with its example.
 		}
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			if filepath.Ext(file) != ".yaml" {
-				t.Fatal("docs/examples/ holds complete configurations, as .yaml files, and the files of their sets, as .txt files")
+				t.Fatal("docs/examples/ holds complete configurations, as .yaml files, the files of their sets, as .txt files, and their databases, as .mmdb files")
 			}
 			data, err := os.ReadFile(file)
 			if err != nil {
@@ -266,10 +300,18 @@ func TestRepositoryExamples(t *testing.T) {
 				}
 				read[s.File] = true
 			}
+			for _, k := range c.DatabaseKinds() {
+				path := c.Enrichment.Database(k).Database
+				if _, _, err := source.ReadDatabase(path, k); err != nil {
+					t.Errorf("enrichment.%s.database: %v", k, err)
+				}
+				read[path] = true
+			}
 		})
 	}
 	for _, file := range files {
-		if abs, err := filepath.Abs(file); err == nil && filepath.Ext(file) == ".txt" && !read[abs] {
+		ext := filepath.Ext(file)
+		if abs, err := filepath.Abs(file); err == nil && (ext == ".txt" || ext == ".mmdb") && !read[abs] {
 			t.Errorf("%s: no example reads this file", filepath.Base(file))
 		}
 	}

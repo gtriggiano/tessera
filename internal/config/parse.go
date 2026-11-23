@@ -83,8 +83,8 @@ func (c *Config) errAt(path string, l location, problem string) error {
 }
 
 // Load reads and checks the configuration file at path. It reads nothing but
-// that file, not even the files of the sets, and makes the relative paths in
-// it relative to its directory.
+// that file, not even the files of the sets or the databases, and makes the
+// relative paths in it relative to its directory.
 func Load(path string, lookup LookupEnv) (*Config, error) {
 	data, err := readFile(path)
 	if err != nil {
@@ -110,6 +110,12 @@ func Load(path string, lookup LookupEnv) (*Config, error) {
 				return nil, err
 			}
 			c.Sets[name] = s
+		}
+	}
+	for _, k := range c.DatabaseKinds() {
+		db := c.Enrichment.Database(k)
+		if db.Database, err = absolute(db.Database); err != nil {
+			return nil, err
 		}
 	}
 	if socket, ok := strings.CutPrefix(c.Server.Listen, UnixPrefix); ok {
@@ -224,6 +230,7 @@ type defaulter interface{ setDefaults() }
 
 // decode stores the YAML node n, at the key path, into v.
 func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup LookupEnv) error {
+	keyAt := c.nodes[path]
 	c.nodes[path] = location{n.Line, n.Column}
 	if n.Kind == yaml.AliasNode {
 		return c.err(path, "YAML aliases are not allowed")
@@ -269,6 +276,24 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 		return nil
 	}
 	switch v.Kind() {
+	case reflect.Pointer:
+		// An optional block: absent unless the file writes it, with the
+		// defaults of its keys when it does.
+		if v.Type().Elem().Kind() != reflect.Struct {
+			return c.err(path, "unsupported configuration type")
+		}
+		block := reflect.New(v.Type().Elem())
+		if d, ok := block.Interface().(defaulter); ok {
+			d.setDefaults()
+		}
+		if err := c.decode(n, block.Elem(), path, lookup); err != nil {
+			return err
+		}
+		v.Set(block)
+		// The block is where its key is.
+		if keyAt.line > 0 {
+			c.nodes[path] = keyAt
+		}
 	case reflect.Struct:
 		if n.Kind != yaml.MappingNode || n.Tag != "!!map" {
 			return c.err(path, "expected a mapping")
@@ -353,7 +378,13 @@ func (c *Config) decode(n *yaml.Node, v reflect.Value, path string, lookup Looku
 				return err
 			}
 			c.keys[path] = append(c.keys[path], mapKey{name: k.Value, at: at})
-			m.SetMapIndex(reflect.ValueOf(k.Value), reflect.ValueOf(s))
+			if v.Type().Elem() == expressionType {
+				// Where the file writes the expression, which places an
+				// error in it.
+				c.nodes[childPath(path, k.Value)] = valueAt
+				c.styles[childPath(path, k.Value)] = value.Style
+			}
+			m.SetMapIndex(reflect.ValueOf(k.Value), reflect.ValueOf(s).Convert(v.Type().Elem()))
 		}
 		v.Set(m)
 	case reflect.String:

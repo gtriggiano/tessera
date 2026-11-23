@@ -1,0 +1,41 @@
+# The policy of TestEnvoyEnrichment: rules on the autonomous system and the
+# country of the client, and upstream headers and decision fields read from
+# the same records. The databases are in a directory mounted as a volume at
+# /etc/tessera/databases, so that a file renamed over one on the host is
+# seen in the container. Envoy, the only proxy in front of tessera, appends
+# the address of its peer to X-Forwarded-For; the test writes the client
+# address before it.
+server:
+  drain_delay: 1s
+log:
+  format: json
+  decisions: all
+  decision_fields:
+    asn: string(asn.number)
+    country: geo.country.code
+    region: 'size(geo.subdivisions) > 0 ? geo.subdivisions[0].name : ""'
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 1
+enrichment:
+  geo:
+    database: databases/geo.mmdb
+    refresh: 1s
+  asn:
+    database: databases/asn.mmdb
+    refresh: 1s
+policy:
+  default_action: deny
+  rules:
+    - name: hosting-networks
+      action: deny
+      when: asn.number == 64500
+      response:
+        status: 451
+    - name: allowed-countries
+      action: allow
+      when: geo.country.code in ["IT", "JP"]
+upstream:
+  headers:
+    x-client-asn: 'asn.found ? string(asn.number) : ""'
+    x-client-country: geo.country.code

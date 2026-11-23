@@ -22,6 +22,7 @@ import (
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/gtriggiano/tessera/internal/engine"
 	"github.com/gtriggiano/tessera/internal/expr"
@@ -90,7 +91,7 @@ func TestCheckAnswersTheDecision(t *testing.T) {
 	denied := func(code typev3.StatusCode, body string, headers ...string) *authv3.CheckResponse {
 		r := &authv3.DeniedHttpResponse{Status: &typev3.HttpStatus{Code: code}, Body: body}
 		for i := 0; i < len(headers); i += 2 {
-			r.Headers = append(r.Headers, &corev3.HeaderValueOption{Header: &corev3.HeaderValue{Key: headers[i], Value: headers[i+1]}, AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD})
+			r.Headers = append(r.Headers, &corev3.HeaderValueOption{Header: &corev3.HeaderValue{Key: headers[i], Value: headers[i+1]}, Append: wrapperspb.Bool(false), AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD})
 		}
 		return &authv3.CheckResponse{HttpResponse: &authv3.CheckResponse_DeniedResponse{DeniedResponse: r}}
 	}
@@ -130,6 +131,56 @@ func TestCheckAnswersTheDecision(t *testing.T) {
 				if !proto.Equal(resp, tc.want) {
 					t.Fatalf("response %v, want %v", resp, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// The upstream headers of a request that Envoy sends on: those with a value
+// replace the headers of the client, the others are removed; a denial has
+// none.
+func TestCheckSendsTheUpstreamHeaders(t *testing.T) {
+	upstream := []engine.UpstreamHeader{
+		{Name: "x-client-asn", Value: ""},
+		{Name: "x-client-city", Cause: expr.CauseDatabaseError},
+		{Name: "x-client-country", Value: "IT"},
+		{Name: "x-client-ip", Value: "192.0.2.7"},
+	}
+	ok := &authv3.CheckResponse{HttpResponse: &authv3.CheckResponse_OkResponse{OkResponse: &authv3.OkHttpResponse{
+		Headers: []*corev3.HeaderValueOption{
+			{Header: &corev3.HeaderValue{Key: "x-client-country", Value: "IT"}, Append: wrapperspb.Bool(false), AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD},
+			{Header: &corev3.HeaderValue{Key: "x-client-ip", Value: "192.0.2.7"}, Append: wrapperspb.Bool(false), AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD},
+		},
+		HeadersToRemove: []string{"x-client-asn", "x-client-city"},
+	}}}
+	removed := &authv3.CheckResponse{HttpResponse: &authv3.CheckResponse_OkResponse{OkResponse: &authv3.OkHttpResponse{
+		HeadersToRemove: []string{"x-client-asn"},
+	}}}
+	for _, tc := range []struct {
+		name     string
+		decision fixed
+		code     codes.Code
+		want     *authv3.CheckResponse
+	}{
+		{"allow", fixed{Action: engine.Allow, Enforced: true, Upstream: upstream}, codes.OK, ok},
+		{"deny in audit mode", fixed{Action: engine.Deny, Enforced: false, Response: &engine.Response{Status: 403}, Upstream: upstream}, codes.OK, ok},
+		{"every header removed", fixed{Action: engine.Allow, Enforced: true, Upstream: []engine.UpstreamHeader{{Name: "x-client-asn"}}}, codes.OK, removed},
+		{"deny", fixed{Action: engine.Deny, Enforced: true, Response: &engine.Response{Status: 403}, Upstream: upstream}, codes.PermissionDenied, &authv3.CheckResponse{
+			HttpResponse: &authv3.CheckResponse_DeniedResponse{DeniedResponse: &authv3.DeniedHttpResponse{Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden}}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := dial(t, start(t, NewServer(tc.decision, defaultOptions)))
+			resp, err := check(t, conn, httpRequest("GET", "www.example.com", "/"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := codes.Code(resp.GetStatus().GetCode()); got != tc.code {
+				t.Fatalf("status %v, want %v", resp.GetStatus(), tc.code)
+			}
+			resp.Status = nil
+			if !proto.Equal(resp, tc.want) {
+				t.Fatalf("response %v, want %v", resp, tc.want)
 			}
 		})
 	}

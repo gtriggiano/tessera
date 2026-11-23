@@ -22,19 +22,26 @@ description: "The gRPC listener of tessera serve: Envoy's external authorization
 
 ### Authorization service
 
-`envoy.service.auth.v3.Authorization/Check` decides an HTTP request that Envoy describes, with the rules of [`policy`](./configuration.md#policy) (see [Write rules](../guide/write-rules.md)).
+`envoy.service.auth.v3.Authorization/Check` decides an HTTP request that Envoy describes, with the rules of [`policy`](./configuration.md#policy) (see [Write policy rules](../guide/policy-rules.md)).
 
 The call succeeds, with gRPC status `OK`, for both decisions: the decision is in the `status` field of the `CheckResponse`.
 
 | Decision | `CheckResponse` | What Envoy does |
 | --- | --- | --- |
-| Allow | `status.code` is `OK` (0). `ok_response` is empty: no header to add, set or remove. | Sends the request on, unchanged. |
+| Allow | `status.code` is `OK` (0). `ok_response` has the [upstream headers](./configuration.md#upstream-headers): in `headers`, those with a value, and in `headers_to_remove`, the names of the others. Without upstream headers, `ok_response` is empty. | Sends the request on, with the headers of `headers` set and those of `headers_to_remove` removed. |
 | Deny | `status.code` is `PERMISSION_DENIED` (7). `denied_response` has the status, the body and the headers of the response of the rule that denied the request, or of [`policy.deny_response`](./configuration.md#policy-deny-response): `403`, without a body and without headers, by default. | Answers the client with that status, body and headers. |
-| Deny, with [`policy.mode: audit`](./configuration.md#policy-mode) | As for Allow. | Sends the request on, unchanged. |
+| Deny, with [`policy.mode: audit`](./configuration.md#policy-mode) | As for Allow, with the upstream headers too. | As for Allow. |
 
-The response carries nothing else: no message in the status, no dynamic metadata. tessera sends each header of a denial with the action `OVERWRITE_IF_EXISTS_OR_ADD`, so that it replaces a header of the same name instead of adding a second one.
+The response carries nothing else: no message in the status, no dynamic metadata. tessera sends each header of `ok_response` and of a denial with `append` set to `false` and `append_action` set to `OVERWRITE_IF_EXISTS_OR_ADD`, so that Envoy replaces a header of the same name, or adds the header, instead of adding a second one: the value that the client sent for an upstream header does not reach the upstream. Envoy, up to at least version 1.40, reads `append` for these headers, and `append_action` only for `response_headers_to_add`, which tessera does not use: both fields say the same, replace the header of the same name or add it.
 
-When tessera fails while it handles a call, which it recovers (see [Failure modes](./failure-modes.md)), the call ends with the gRPC status `INTERNAL` and the message `internal error`, without a decision: Envoy handles it as it handles any call that fails (see [What Envoy needs](#what-envoy-needs)).
+An upstream header goes to `headers_to_remove` when its expression gives an empty string, fails, or gives a value that cannot be sent: longer than 4096 bytes, with an ASCII control character other than the horizontal tab, or not valid UTF-8. The decision does not change. tessera lists the headers in the order of their names. With the configuration of the example of [`upstream.headers`](./configuration.md#upstream-headers), the `ok_response` of an allowed request from an address that the databases locate in Italy, then from an address that they do not have, in the text format of Protocol Buffers:
+
+```text
+ok_response { headers { header { key: "x-client-asn" value: "64496" } append { value: false } append_action: OVERWRITE_IF_EXISTS_OR_ADD } headers { header { key: "x-client-country" value: "IT" } append { value: false } append_action: OVERWRITE_IF_EXISTS_OR_ADD } }
+ok_response { headers_to_remove: "x-client-asn" headers_to_remove: "x-client-country" }
+```
+
+When tessera fails while it handles a call, which it recovers (see [Failure modes](./failure-modes.md)), the call ends with the gRPC status `INTERNAL` and the message `internal error`, without a decision: Envoy handles it as it handles any call that fails (see [What Envoy needs](#what-envoy-needs)). A failure while it evaluates a condition or an upstream header is not such a failure: the condition is indeterminate, or the header removed.
 
 Envoy adds to a denial:
 
@@ -42,7 +49,7 @@ Envoy adds to a denial:
 - its own `date` header, and by default its own `server` header;
 - for a status that its list of statuses does not name, such as `451`, the status as it is, with the reason phrase `Unknown` in HTTP/1.1.
 
-tessera sends the header names in lowercase.
+tessera sends the header names in lowercase, those of the upstream headers too.
 
 ### Health service
 
@@ -117,9 +124,31 @@ With `failure_mode_allow: true`, Envoy allows every request that it cannot get a
 - For gRPC health checks from Envoy or from an orchestrator, use the empty service name or `envoy.service.auth.v3.Authorization`.
 - tessera reads the client address of a request from the address of the connection to Envoy, unless [`client_ip`](./configuration.md#client-ip) declares another source. [Set the client address](../guide/client-address.md) describes the Envoy settings for each source.
 
+### Header names with underscores
+
+With [`upstream.headers`](./configuration.md#upstream-headers), set [`headers_with_underscores_action`](https://www.envoyproxy.io/docs/envoy/v1.40.2/api-v3/config/core/v3/protocol.proto#envoy-v3-api-enum-config-core-v3-httpprotocoloptions-headerswithunderscoresaction) in the `common_http_protocol_options` of the HTTP connection manager, so that a client cannot send a header whose name differs from an upstream header only by underscores:
+
+```yaml [envoy.yaml]
+- name: envoy.filters.network.http_connection_manager
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+    stat_prefix: ingress
+    common_http_protocol_options:
+      headers_with_underscores_action: REJECT_REQUEST
+```
+
+- `REJECT_REQUEST` refuses a request with such a header: Envoy answers an HTTP/1 request with 400, and resets an HTTP/2 stream.
+- `DROP_HEADER` removes such a header from the request before the HTTP filters, `ext_authz` included, see it.
+
+Envoy's [edge proxy best practices](https://www.envoyproxy.io/docs/envoy/v1.40.2/configuration/best_practices/edge) set `REJECT_REQUEST` too.
+
+::: danger The default lets a header with underscores stand for an upstream header
+With the default, `ALLOW`, Envoy forwards a header such as `x_client_country`, which tessera neither replaces nor removes, since it is not the upstream header `x-client-country`. An upstream that reads the headers as CGI meta-variables, which turn `-` into `_` ([RFC 3875](https://www.rfc-editor.org/rfc/rfc3875#section-4.1.18)), as CGI applications and WSGI servers ([PEP 3333](https://peps.python.org/pep-3333/#environ-variables)) do, can read both as `HTTP_X_CLIENT_COUNTRY`, and take the value of the client for that of tessera.
+:::
+
 ### Request paths
 
-tessera receives the path of a request as Envoy sends it, and does not decode or normalize it. Let Envoy normalize the path in the HTTP connection manager, as its [edge proxy best practices](https://www.envoyproxy.io/docs/envoy/latest/configuration/best_practices/edge) recommend, so that the path that tessera receives is the path that Envoy routes and sends to the upstream:
+tessera receives the path of a request as Envoy sends it, and does not decode or normalize it. Let Envoy normalize the path in the HTTP connection manager, as its [edge proxy best practices](https://www.envoyproxy.io/docs/envoy/v1.40.2/configuration/best_practices/edge) recommend, so that the path that tessera receives is the path that Envoy routes and sends to the upstream:
 
 ```yaml [envoy.yaml]
 - name: envoy.filters.network.http_connection_manager

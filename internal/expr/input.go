@@ -9,30 +9,42 @@ import (
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/request"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
 // Input is the activation of one request: it answers the variables request,
-// client and sets. It builds the CEL value of an attribute when a condition
-// first reads it, and keeps it for the other conditions evaluated with it, so
-// one Input serves every rule of one decision. It is not safe for concurrent
-// use.
+// client, sets, geo and asn. It builds the CEL value of an attribute when a
+// condition first reads it, and keeps it for the other conditions evaluated
+// with it, so one Input serves every rule of one decision, and every
+// expression evaluated after it: geo and asn look the client address up
+// once. It is not safe for concurrent use.
 type Input struct {
 	request requestVal
 	client  clientVal
 	sets    setsVal
+	// dbs are the databases of the decision; geo and asn are nil until an
+	// expression reads them, then their value or the error of their
+	// lookup.
+	dbs      *enrichment.Snapshot
+	geo, asn ref.Val
+	// lib is the library of the conditions evaluated with the Input, which
+	// reports a panic recovered in a lookup.
+	lib *library
 	// rule is the rule being evaluated, which a recovered panic reports.
 	rule string
 }
 
 // NewInput returns the activation of r, whose ClientIP is the client
-// address, or the zero Addr when it is missing, and of snap, the state of
-// the sets for the whole decision: a Snapshot of the Store whose
-// declarations the Env was built with, or nil, in which every set is never
-// loaded. r must not change while the Input is in use.
-func NewInput(r *request.Request, snap *sets.Snapshot) *Input {
-	in := &Input{}
+// address, or the zero Addr when it is missing, of snap, the state of the
+// sets for the whole decision, and of dbs, the databases for the whole
+// decision. snap is a Snapshot of the Store whose declarations the Env was
+// built with, or nil, in which every set is never loaded; dbs is a Snapshot
+// of the store of the databases that the Env declares, or nil, which has
+// none. r must not change while the Input is in use.
+func NewInput(r *request.Request, snap *sets.Snapshot, dbs *enrichment.Snapshot) *Input {
+	in := &Input{dbs: dbs}
 	in.request = requestVal{object: object{requestType}, req: r, in: in}
 	in.client = clientVal{object: object{clientType}, in: in}
 	if r.ClientIP.IsValid() {
@@ -56,6 +68,16 @@ func (in *Input) ResolveName(name string) (any, bool) {
 		return &in.client, true
 	case "sets":
 		return &in.sets, true
+	case "geo":
+		if in.geo == nil {
+			in.geo = in.lookup(enrichment.Geo)
+		}
+		return in.geo, true
+	case "asn":
+		if in.asn == nil {
+			in.asn = in.lookup(enrichment.ASN)
+		}
+		return in.asn, true
 	}
 	return nil, false
 }
@@ -63,9 +85,283 @@ func (in *Input) ResolveName(name string) (any, bool) {
 // Parent implements interpreter.Activation.
 func (in *Input) Parent() interpreter.Activation { return nil }
 
-// ErrClientIPMissing is the error of a read of client.ip when the request has
-// no client address.
+// ErrClientIPMissing is the error of a read of client.ip, geo or asn when
+// the request has no client address.
 var ErrClientIPMissing = errors.New("client.ip is not available")
+
+// ErrDatabase is the error of a read of geo or asn whose lookup failed: the
+// database of the decision cannot be read for the client address.
+var ErrDatabase = errors.New("the database cannot be read for the client address")
+
+// lookup looks the client address up in the database of kind k, and returns
+// the value of geo or asn, or, when the request has no client address or
+// the lookup fails, an error: so that every read of the variable fails,
+// has() included.
+func (in *Input) lookup(k enrichment.Kind) (out ref.Val) {
+	if !in.client.hasIP {
+		return types.WrapErr(ErrClientIPMissing)
+	}
+	db := in.dbs.Database(k)
+	if db == nil {
+		return types.WrapErr(ErrDatabase)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			var p *Panic
+			if in.lib != nil {
+				p = in.lib.recovered(r, in)
+			} else {
+				p = &Panic{Rule: in.rule, Value: r}
+			}
+			out = types.WrapErr(p)
+		}
+	}()
+	addr := in.client.ip.addr
+	if k == enrichment.Geo {
+		rec, err := db.Geo(addr)
+		if err != nil {
+			return types.WrapErr(ErrDatabase)
+		}
+		g := &geoVal{object: object{geoType}, in: in, rec: rec}
+		g.country = countryVal{object: object{geoCountryType}, in: in, c: rec.Country}
+		g.continent = continentVal{object: object{geoContinentType}, in: in, c: rec.Continent}
+		g.location = pointVal{object: object{geoPointType}, in: in, lat: rec.Latitude, lon: rec.Longitude}
+		return g
+	}
+	rec, err := db.ASN(addr)
+	if err != nil {
+		return types.WrapErr(ErrDatabase)
+	}
+	return &asnVal{object: object{asnType}, in: in, rec: rec}
+}
+
+// Geo returns what geo reads for the request: the record of the client
+// address in the geo database of the decision, looked up once for the
+// Input. The error is ErrClientIPMissing, ErrDatabase or a *Panic.
+func (in *Input) Geo() (enrichment.GeoRecord, error) {
+	v, _ := in.ResolveName("geo")
+	if g, ok := v.(*geoVal); ok {
+		return g.rec, nil
+	}
+	return enrichment.GeoRecord{}, valueError(v)
+}
+
+// ASN returns what asn reads for the request, as Geo does for geo.
+func (in *Input) ASN() (enrichment.ASNRecord, error) {
+	v, _ := in.ResolveName("asn")
+	if a, ok := v.(*asnVal); ok {
+		return a.rec, nil
+	}
+	return enrichment.ASNRecord{}, valueError(v)
+}
+
+// valueError returns the error that an error value wraps.
+func valueError(v any) error {
+	if e, ok := v.(*types.Err); ok {
+		if inner := e.Unwrap(); inner != nil {
+			return inner
+		}
+		return e
+	}
+	return ErrDatabase
+}
+
+// geoVal is the value of the variable geo: the record of the client address
+// in the geo database. Its objects are part of it, and the list of its
+// subdivisions is built when an expression first reads it.
+type geoVal struct {
+	object
+	in           *Input
+	rec          enrichment.GeoRecord
+	country      countryVal
+	continent    continentVal
+	location     pointVal
+	subdivisions ref.Val
+}
+
+func (g *geoVal) Equal(other ref.Val) ref.Val { return types.Bool(g == other) }
+func (g *geoVal) Value() any                  { return g }
+
+// geoString declares a string field of geo.
+func geoString(pick func(r *enrichment.GeoRecord) string) field {
+	return field{
+		typ:   types.StringType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.String(pick(&obj.(*geoVal).rec)), nil },
+	}
+}
+
+// errNoLocation is the error of a read of geo.location when the record has
+// no location: an ordinary evaluation error, as a missing map key is.
+var errNoLocation = errors.New("geo.location is not set")
+
+var geoFields = map[string]field{
+	"found": {
+		typ:   types.BoolType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.Bool(obj.(*geoVal).rec.Found), nil },
+	},
+	"country": {
+		typ:   geoCountryType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return &obj.(*geoVal).country, nil },
+	},
+	"continent": {
+		typ:   geoContinentType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return &obj.(*geoVal).continent, nil },
+	},
+	"subdivisions": {
+		typ:   types.NewListType(geoSubdivisionType),
+		isSet: always,
+		get: func(obj any) (any, error) {
+			g := obj.(*geoVal)
+			if g.subdivisions == nil {
+				vals := make([]subdivisionVal, len(g.rec.Subdivisions))
+				list := make([]ref.Val, len(vals))
+				for i, s := range g.rec.Subdivisions {
+					vals[i] = subdivisionVal{object: object{geoSubdivisionType}, in: g.in, s: s}
+					list[i] = &vals[i]
+				}
+				g.subdivisions = types.NewRefValList(types.DefaultTypeAdapter, list)
+			}
+			return g.subdivisions, nil
+		},
+	},
+	"city":        geoString(func(r *enrichment.GeoRecord) string { return r.City }),
+	"postal_code": geoString(func(r *enrichment.GeoRecord) string { return r.PostalCode }),
+	"timezone":    geoString(func(r *enrichment.GeoRecord) string { return r.TimeZone }),
+	"location": {
+		typ:   geoPointType,
+		isSet: func(obj any) bool { return obj.(*geoVal).rec.HasLocation },
+		get: func(obj any) (any, error) {
+			g := obj.(*geoVal)
+			if !g.rec.HasLocation {
+				return nil, errNoLocation
+			}
+			return &g.location, nil
+		},
+	},
+}
+
+// stringField declares a string field of an object whose Go value is a *T.
+func stringField[T any](pick func(v *T) string) field {
+	return field{
+		typ:   types.StringType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.String(pick(obj.(*T))), nil },
+	}
+}
+
+// countryVal is the value of a tessera.GeoCountry. Two values with the same
+// fields are equal.
+type countryVal struct {
+	object
+	in *Input
+	c  enrichment.Country
+}
+
+func (c *countryVal) Equal(other ref.Val) ref.Val {
+	o, ok := other.(*countryVal)
+	return types.Bool(ok && c.c == o.c)
+}
+func (c *countryVal) Value() any { return c }
+
+var countryFields = map[string]field{
+	"code": stringField(func(c *countryVal) string { return c.c.Code }),
+	"name": stringField(func(c *countryVal) string { return c.c.Name }),
+	"in_eu": {
+		typ:   types.BoolType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.Bool(obj.(*countryVal).c.InEU), nil },
+	},
+}
+
+// continentVal is the value of a tessera.GeoContinent. Two values with the
+// same fields are equal.
+type continentVal struct {
+	object
+	in *Input
+	c  enrichment.Continent
+}
+
+func (c *continentVal) Equal(other ref.Val) ref.Val {
+	o, ok := other.(*continentVal)
+	return types.Bool(ok && c.c == o.c)
+}
+func (c *continentVal) Value() any { return c }
+
+var continentFields = map[string]field{
+	"code": stringField(func(c *continentVal) string { return c.c.Code }),
+	"name": stringField(func(c *continentVal) string { return c.c.Name }),
+}
+
+// subdivisionVal is the value of a tessera.GeoSubdivision. Two values with
+// the same fields are equal.
+type subdivisionVal struct {
+	object
+	in *Input
+	s  enrichment.Subdivision
+}
+
+func (s *subdivisionVal) Equal(other ref.Val) ref.Val {
+	o, ok := other.(*subdivisionVal)
+	return types.Bool(ok && s.s == o.s)
+}
+func (s *subdivisionVal) Value() any { return s }
+
+var subdivisionFields = map[string]field{
+	"code": stringField(func(s *subdivisionVal) string { return s.s.Code }),
+	"name": stringField(func(s *subdivisionVal) string { return s.s.Name }),
+}
+
+// pointVal is the value of a tessera.GeoPoint: a latitude and a longitude.
+// Two values with the same coordinates are equal.
+type pointVal struct {
+	object
+	in       *Input
+	lat, lon float64
+}
+
+func (p *pointVal) Equal(other ref.Val) ref.Val {
+	o, ok := other.(*pointVal)
+	return types.Bool(ok && p.lat == o.lat && p.lon == o.lon)
+}
+func (p *pointVal) Value() any { return p }
+
+var pointFields = map[string]field{
+	"lat": {typ: types.DoubleType, isSet: always, get: func(obj any) (any, error) { return types.Double(obj.(*pointVal).lat), nil }},
+	"lon": {typ: types.DoubleType, isSet: always, get: func(obj any) (any, error) { return types.Double(obj.(*pointVal).lon), nil }},
+}
+
+// asnVal is the value of the variable asn: the record of the client address
+// in the asn database.
+type asnVal struct {
+	object
+	in  *Input
+	rec enrichment.ASNRecord
+}
+
+func (a *asnVal) Equal(other ref.Val) ref.Val { return types.Bool(a == other) }
+func (a *asnVal) Value() any                  { return a }
+
+var asnFields = map[string]field{
+	"found": {
+		typ:   types.BoolType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.Bool(obj.(*asnVal).rec.Found), nil },
+	},
+	"number": {
+		typ:   types.IntType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.Int(obj.(*asnVal).rec.Number), nil },
+	},
+	"organization": {
+		typ:   types.StringType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.String(obj.(*asnVal).rec.Organization), nil },
+	},
+}
 
 // requestVal is the value of the variable request.
 type requestVal struct {

@@ -40,8 +40,8 @@ func (o *observer) Checked(set string, r Result, took time.Duration, at time.Tim
 	}
 }
 
-func (o *observer) Loaded(set string, entries int, took time.Duration) {
-	o.add(fmt.Sprintf("loaded %s %d", set, entries))
+func (o *observer) Loaded(set string, c *sets.Set, took time.Duration) {
+	o.add(fmt.Sprintf("loaded %s %d", set, c.Entries()))
 }
 
 func (o *observer) Failed(set string, err error) { o.add("failed " + set + ": " + Problem(err)) }
@@ -164,7 +164,7 @@ func refresherGoroutines() int {
 // fileSet is the set "blocked", of type cidr, read from path, with its store.
 type fileSet struct {
 	store *sets.Store
-	file  File
+	file  File[*sets.Set]
 }
 
 func newFileSet(t *testing.T, path string, refresh, maxStaleness time.Duration) fileSet {
@@ -181,14 +181,14 @@ func newFileSet(t *testing.T, path string, refresh, maxStaleness time.Duration) 
 	if err := store.Replace("blocked", set); err != nil {
 		t.Fatal(err)
 	}
-	return fileSet{store: store, file: File{Name: "blocked", Path: path, Type: sets.CIDR, MaxEntries: 2, Refresh: refresh, MaxStaleness: maxStaleness, Identity: id, Read: read}}
+	return fileSet{store: store, file: File[*sets.Set]{Name: "blocked", Path: path, Parse: SetParse(sets.CIDR, 2), Refresh: refresh, MaxStaleness: maxStaleness, Identity: id, Read: read}}
 }
 
 // start starts the refresher of s, and stops it at the end of the test,
 // which fails if a goroutine of a refresher is left.
 func (s fileSet) start(t *testing.T, o *observer) *Refreshers {
 	t.Helper()
-	rs := Start([]File{s.file}, s.store, o)
+	rs := Start([]File[*sets.Set]{s.file}, s.store, o)
 	t.Cleanup(func() {
 		if err := rs.Stop(context.Background()); err != nil {
 			t.Errorf("Stop: %v", err)
@@ -538,7 +538,7 @@ func startPinned(t *testing.T, path string, modTime time.Time) (fileSet, *observ
 	}
 	set := newFileSet(t, path, 5*time.Millisecond, 0)
 	o := &observer{}
-	rs := start([]File{set.file}, set.store, o, pinnedStat(modTime))
+	rs := start([]File[*sets.Set]{set.file}, set.store, o, pinnedStat(modTime))
 	t.Cleanup(func() {
 		if err := rs.Stop(context.Background()); err != nil {
 			t.Errorf("Stop: %v", err)
@@ -617,7 +617,7 @@ func TestChecksDoNotQueue(t *testing.T) {
 		return os.Stat(name)
 	}
 	o := &observer{}
-	rs := start([]File{set.file}, set.store, o, slow)
+	rs := start([]File[*sets.Set]{set.file}, set.store, o, slow)
 	eventually(t, "five checks", func() bool { return o.count(Unchanged) >= 5 })
 	if err := rs.Stop(context.Background()); err != nil {
 		t.Fatal(err)
@@ -650,7 +650,7 @@ func TestStop(t *testing.T) {
 		return os.Stat(name)
 	}
 	o := &observer{}
-	rs := start([]File{set.file}, set.store, o, stuck)
+	rs := start([]File[*sets.Set]{set.file}, set.store, o, stuck)
 	<-entered
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -674,4 +674,34 @@ func TestStop(t *testing.T) {
 	if err := (*Refreshers)(nil).Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Cancel stops the refreshers without waiting for a check in progress, which
+// records nothing once it returns; Stop then waits for the goroutines.
+func TestCancel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.txt")
+	writeFile(t, path, "198.51.100.0/24\n")
+	set := newFileSet(t, path, time.Millisecond, 0)
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	stuck := func(name string) (fs.FileInfo, error) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		return os.Stat(name)
+	}
+	o := &observer{}
+	rs := start([]File[*sets.Set]{set.file}, set.store, o, stuck)
+	<-entered
+	rs.Cancel()
+	writeFile(t, path, "203.0.113.0/24\n")
+	close(release)
+	if err := rs.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if checks, events := o.state(); len(checks) != 0 || len(events) != 0 || set.contains("203.0.113.7") {
+		t.Fatalf("recorded after Cancel: %v %v", checks, events)
+	}
+	(*Refreshers)(nil).Cancel()
 }

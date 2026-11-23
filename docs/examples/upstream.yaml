@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=../public/config.schema.json
+log:
+  decisions: all
+  decision_fields:
+    agent: request.headers["user-agent"]
+    country: geo.country.code
+
+# The databases are files next to this one.
+enrichment:
+  geo:
+    database: geo.mmdb
+  asn:
+    database: asn.mmdb
+
+policy:
+  default_action: allow
+  rules:
+    - name: hosting-networks
+      description: Networks of hosting providers.
+      action: deny
+      when: asn.number in [64500, 64501]
+
+upstream:
+  headers:
+    x-client-asn: 'asn.found ? string(asn.number) : ""'
+    x-client-city: geo.city
+    x-client-country: geo.country.code

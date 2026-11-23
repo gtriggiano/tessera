@@ -17,13 +17,18 @@ description: "Every Prometheus metric that tessera serve exports on the admin li
 | [`tessera_rule_evaluation_errors_total`](#tessera-rule-evaluation-errors-total) | counter | `rule`, `cause` |
 | [`tessera_policy_audit_mode`](#tessera-policy-audit-mode) | gauge | none |
 | [`tessera_decision_logs_dropped_total`](#tessera-decision-logs-dropped-total) | counter | none |
+| [`tessera_upstream_header_errors_total`](#tessera-upstream-header-errors-total) | counter | `header`, `cause` |
 | [`tessera_set_entries`](#tessera-set-entries) | gauge | `set`, `type`, `source` |
 | [`tessera_set_available`](#tessera-set-available) | gauge | `set`, `type`, `source` |
 | [`tessera_set_last_refresh_success_timestamp_seconds`](#tessera-set-last-refresh-success-timestamp-seconds) | gauge | `set`, `type`, `source` |
 | [`tessera_set_refreshes_total`](#tessera-set-refreshes-total) | counter | `set`, `type`, `source`, `result` |
 | [`tessera_set_refresh_duration_seconds`](#tessera-set-refresh-duration-seconds) | histogram | `set`, `type`, `source` |
+| [`tessera_enrichment_database_build_timestamp_seconds`](#tessera-enrichment-database-build-timestamp-seconds) | gauge | `database` |
+| [`tessera_enrichment_database_last_refresh_success_timestamp_seconds`](#tessera-enrichment-database-last-refresh-success-timestamp-seconds) | gauge | `database` |
+| [`tessera_enrichment_database_refreshes_total`](#tessera-enrichment-database-refreshes-total) | counter | `database`, `result` |
+| [`tessera_enrichment_database_refresh_duration_seconds`](#tessera-enrichment-database-refresh-duration-seconds) | histogram | `database` |
 
-Every series exists from startup, at zero for a counter: the values of the labels come from the configuration and from fixed lists, never from a request, so the number of series depends on the configuration alone. A thousand hosts, paths or client addresses add no series. Scrapes read memory only.
+Every series exists from startup, at zero for a counter: the values of the labels come from the configuration and from fixed lists, never from a request, so the number of series depends on the configuration alone. A thousand hosts, paths or client addresses add no series.
 
 ## Build and configuration
 
@@ -95,7 +100,7 @@ tessera_decisions_total{action="deny",enforced="true",reason="default",rule="def
 **Labels:** `action`\
 **Buckets:** `0.000025`, `0.00005`, `0.0001`, `0.00025`, `0.0005`, `0.001`, `0.0025`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`
 
-The time of a decision, by `action`, `allow` or `deny`: from when tessera received the call of Envoy to the decision, the reading of the request and of its client address and the evaluation of the rules included. It does not count the recording of the decision, nor the time of the call in the network.
+The time of a decision, by `action`, `allow` or `deny`: from when tessera received the call of Envoy to the decision, the reading of the request and of its client address, the evaluation of the rules and of the [upstream headers](./configuration.md#upstream-headers) included. It does not count the recording of the decision, nor the time of the call in the network.
 
 The rate of the sum over both actions, such as `sum(rate(tessera_decision_duration_seconds_sum[5m]))`, is the average number of decisions in progress over that window, as this histogram measures them.
 
@@ -119,6 +124,7 @@ The conditions that could not be evaluated and that counted against allowing, by
 | `expression` | Failed otherwise, such as on a missing header, a failed conversion, or the cost limit. |
 | `panic` | Made tessera fail while it evaluated the condition, which it recovered (see [`panic_recovered`](./logs.md#panic-recovered)). |
 | `set_unavailable` | Looked a value up in a set that was unavailable, with [`on_unavailable: fail`](./configuration.md#sets-name-on-unavailable). |
+| `database_error` | Read [`geo` or `asn`](./expressions.md#geo), and tessera could not read the record of the client address in the database. |
 
 A failure that `&&` or `||` absorbs does not make the condition indeterminate, and is not counted. A failure of tessera outside the evaluation of a condition is not counted either: the call fails without a decision, and [`panic_recovered`](./logs.md#panic-recovered) reports it (see [Failure modes](./failure-modes.md)). The log event [`evaluation_error`](./logs.md#evaluation-error) reports the same conditions.
 
@@ -135,6 +141,23 @@ A failure that `&&` or `||` absorbs does not make the condition indeterminate, a
 **Labels:** none
 
 The [`decision`](./logs.md#decision) events that tessera dropped instead of writing them: because their queue was full, as when standard output is slower than the decisions, because the output was closed at the end of a shutdown, or because a write to standard output failed. See [The queue of decision events](./logs.md#the-queue-of-decision-events).
+
+### `tessera_upstream_header_errors_total`
+
+**Type:** counter\
+**Labels:** `header`, `cause`
+
+The [upstream headers](./configuration.md#upstream-headers) that tessera removed from a request that Envoy sends on because their expression failed or gave a value that cannot be sent, by header and cause. `header` is the name of the header, in lowercase, and each declared header has a series for each cause:
+
+| `cause` | The expression |
+| --- | --- |
+| `client_ip_missing` | Read `client.ip`, `geo` or `asn`, and the request had no client address. |
+| `expression` | Failed otherwise, such as on a missing header, a failed conversion, or the cost limit; or gave a value longer than 4096 bytes, with an ASCII control character other than the horizontal tab, or not valid UTF-8. |
+| `panic` | Made tessera fail while it evaluated the expression, which it recovered (see [`panic_recovered`](./logs.md#panic-recovered)). |
+| `set_unavailable` | Looked a value up in a set that was unavailable, with [`on_unavailable: fail`](./configuration.md#sets-name-on-unavailable). |
+| `database_error` | Read [`geo` or `asn`](./expressions.md#geo), and tessera could not read the record of the client address in the database. |
+
+An expression that gives an empty string removes its header on purpose, and is not counted. The decision never changes, and no log event reports these errors: `tessera eval` shows the value of each header for a request (see [Upstream headers](./cli.md#upstream-headers)).
 
 ## Sets
 
@@ -192,6 +215,52 @@ The checks of the file of a set, the load at startup included, by result. Each s
 
 The time of each check of the file of a set that [`tessera_set_refreshes_total`](#tessera-set-refreshes-total) counts, whatever its result, the load at startup included: the reading of the state of the file and, when it has to be read, the reading of the file and the building of the new copy. A check that trusts the state of an unchanged file reads no content.
 
+## Enrichments
+
+The metrics of the [enrichments](./configuration.md#enrichment) follow the checks of their databases, and have the label `database`: `geo` for [`enrichment.geo`](./configuration.md#enrichment-geo), and `asn` for [`enrichment.asn`](./configuration.md#enrichment-asn). Each configured enrichment has its series from startup, and an enrichment that the configuration does not have has none. tessera loads every database before it opens its listeners, and that load counts as a check with the result `updated`. The log events [`database_loaded`](./logs.md#database-loaded) and [`database_load_failed`](./logs.md#database-load-failed) report the same changes.
+
+### `tessera_enrichment_database_build_timestamp_seconds`
+
+**Type:** gauge\
+**Labels:** `database`
+
+The build time of the copy of the database in use, from its metadata, in seconds since the Unix epoch: the time of `build_time` in [`database_loaded`](./logs.md#database-loaded). `time() - tessera_enrichment_database_build_timestamp_seconds` is the age of the data that tessera reads, whatever the time of the file: alert on it to learn that the updates of a database stopped.
+
+```text
+tessera_enrichment_database_build_timestamp_seconds{database="geo"} 1.7949096e+09
+```
+
+### `tessera_enrichment_database_last_refresh_success_timestamp_seconds`
+
+**Type:** gauge\
+**Labels:** `database`
+
+The time of the last successful check of the file of the database, in seconds since the Unix epoch: a check that found the file unchanged or that replaced the copy, the load at startup included. See [`enrichment.geo.refresh`](./configuration.md#enrichment-geo-refresh).
+
+### `tessera_enrichment_database_refreshes_total`
+
+**Type:** counter\
+**Labels:** `database`, `result`
+
+The checks of the file of a database, the load at startup included, by result, with the values of [`tessera_set_refreshes_total`](#tessera-set-refreshes-total):
+
+| `result` | The check |
+| --- | --- |
+| `updated` | Found a new valid database, which replaced the copy in use. The load at startup counts here. |
+| `unchanged` | Found the file unchanged, or read it and found the content of the copy in use. |
+| `rejected` | Found a file that is not a valid database, or larger than 512 MiB: the copy in use stays. |
+| `error` | Found no file, or one that cannot be opened or read, or that is not a regular file: the copy in use stays. |
+
+A check that fails is counted at each `refresh` for as long as the file stays the same, while [`database_load_failed`](./logs.md#database-load-failed) reports the failure once.
+
+### `tessera_enrichment_database_refresh_duration_seconds`
+
+**Type:** histogram\
+**Labels:** `database`\
+**Buckets:** `0.0001`, `0.001`, `0.01`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`
+
+The time of each check of the file of a database that [`tessera_enrichment_database_refreshes_total`](#tessera-enrichment-database-refreshes-total) counts, whatever its result, the load at startup included: the reading of the state of the file and, when it has to be read, the reading of the file and the checks of the database.
+
 ## Go and process metrics
 
 `/metrics` also exports the standard collectors of the Prometheus Go client:
@@ -199,4 +268,4 @@ The time of each check of the file of a set that [`tessera_set_refreshes_total`]
 - `go_*`: the Go runtime, such as `go_goroutines`, `go_threads`, `go_info`, `go_gc_duration_seconds` and the `go_memstats_*` memory statistics;
 - `process_*`: the process, such as `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and `process_start_time_seconds`. Which `process_*` metrics exist depends on the operating system.
 
-There are no metrics about the scrapes themselves.
+A scrape reads the `tessera_*` metrics from the counters, gauges and histograms that tessera keeps in memory, and the `go_*` and `process_*` metrics from the statistics of the process itself: from the Go runtime for `go_*`, and from the operating system for `process_*`. There are no metrics about the scrapes themselves.

@@ -9,6 +9,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
@@ -18,20 +19,25 @@ type LookupEnv func(string) (string, bool)
 
 // Config is a valid configuration with its defaults applied.
 type Config struct {
-	Server   Server         `yaml:"server"`
-	Admin    Admin          `yaml:"admin"`
-	Log      Log            `yaml:"log"`
-	ClientIP ClientIP       `yaml:"client_ip"`
-	Sets     map[string]Set `yaml:"sets"`
-	Policy   Policy         `yaml:"policy"`
+	Server   Server   `yaml:"server"`
+	Admin    Admin    `yaml:"admin"`
+	Log      Log      `yaml:"log"`
+	ClientIP ClientIP `yaml:"client_ip"`
+	// SecretHeaders are the headers that the configuration makes secret, in
+	// addition to those that are always secret, by name in any case.
+	SecretHeaders []string       `yaml:"secret_headers"`
+	Enrichment    Enrichment     `yaml:"enrichment"`
+	Sets          map[string]Set `yaml:"sets"`
+	Policy        Policy         `yaml:"policy"`
+	Upstream      Upstream       `yaml:"upstream"`
 
 	// nodes maps the path of each key read from the file to its position.
 	nodes map[string]location
 	// tainted holds the paths of the values that contain a ${...}
 	// substitution.
 	tainted map[string]bool
-	// keys holds the keys of each mapping of strings or of named blocks, in
-	// the order of the file, by the path of the mapping.
+	// keys holds the keys of each mapping of strings, of expressions or of
+	// named blocks, in the order of the file, by the path of the mapping.
 	keys map[string][]mapKey
 	// integers holds the paths of the values of a list of set values that
 	// the file writes as YAML integers.
@@ -67,12 +73,15 @@ type Admin struct {
 	Listen string `yaml:"listen"`
 }
 
-// Log selects the level and the format of the log events, and the decisions
-// that are logged.
+// Log selects the level and the format of the log events, the decisions
+// that are logged, and the fields that their events add.
 type Log struct {
 	Level     string `yaml:"level"`
 	Format    string `yaml:"format"`
 	Decisions string `yaml:"decisions"`
+	// DecisionFields maps the name of each field of the decision event that
+	// the configuration adds to the expression of its value.
+	DecisionFields map[string]Expression `yaml:"decision_fields"`
 }
 
 // ClientIP is the one source of the client address of a request. Header
@@ -102,6 +111,38 @@ func (c ClientIP) MarshalYAML() (any, error) {
 	return struct {
 		From string `yaml:"from"`
 	}{c.From}, nil
+}
+
+// Enrichment holds the databases that the attributes geo and asn read. A
+// block that the file does not write is nil, and its attribute does not
+// exist; config print leaves it out.
+type Enrichment struct {
+	Geo *Database `yaml:"geo,omitempty"`
+	ASN *Database `yaml:"asn,omitempty"`
+}
+
+// Database is a MaxMind DB file, which tessera reads at startup and checks
+// again every Refresh.
+type Database struct {
+	// Database is the path of the file. Load makes a relative path absolute.
+	Database string        `yaml:"database"`
+	Refresh  time.Duration `yaml:"refresh"`
+}
+
+func (d *Database) setDefaults() {
+	d.Refresh = DefaultDatabaseRefresh
+}
+
+// Database returns the database of kind k, or nil when the configuration
+// does not have it.
+func (e Enrichment) Database(k enrichment.Kind) *Database {
+	switch k {
+	case enrichment.Geo:
+		return e.Geo
+	case enrichment.ASN:
+		return e.ASN
+	}
+	return nil
 }
 
 // Set is a named set: its type and its one source, values or file. Refresh,
@@ -166,6 +207,13 @@ type Response struct {
 
 // Expression is the text of a CEL expression.
 type Expression string
+
+// Upstream holds what tessera adds to the requests that Envoy sends on.
+type Upstream struct {
+	// Headers maps each header name, in any case, to the expression of its
+	// value.
+	Headers map[string]Expression `yaml:"headers"`
+}
 
 // Rule is one rule of the policy. Once the configuration is valid, the
 // Response of a deny rule is the response it sends: its own keys, and the
@@ -253,6 +301,18 @@ const (
 	DecisionsAll  = "all"
 )
 
+// The limits of log.decision_fields.
+const (
+	MaxDecisionFields          = 32
+	MaxDecisionFieldNameLength = 63
+)
+
+// MaxUpstreamHeaders is the largest number of upstream.headers.
+const MaxUpstreamHeaders = 64
+
+// MaxSecretHeaders is the largest number of secret_headers.
+const MaxSecretHeaders = 64
+
 // The values of client_ip.from.
 const (
 	ClientIPPeer          = "peer"
@@ -280,6 +340,12 @@ const (
 	MinSetRefresh     = time.Second
 	DefaultMaxEntries = 1_000_000
 	MaxSetNameLength  = 63
+)
+
+// The defaults and limits of a database.
+const (
+	DefaultDatabaseRefresh = time.Minute
+	MinDatabaseRefresh     = time.Second
 )
 
 // The values of policy.default_action and policy.rules[].action.
@@ -320,15 +386,17 @@ func defaults() *Config {
 			DrainDelay:           5 * time.Second,
 			ShutdownTimeout:      20 * time.Second,
 		},
-		Admin:    Admin{Listen: ":9090"},
-		Log:      Log{Level: LevelInfo, Format: FormatLogfmt, Decisions: DecisionsDeny},
-		ClientIP: ClientIP{From: ClientIPPeer},
-		Sets:     map[string]Set{},
+		Admin:         Admin{Listen: ":9090"},
+		Log:           Log{Level: LevelInfo, Format: FormatLogfmt, Decisions: DecisionsDeny, DecisionFields: map[string]Expression{}},
+		ClientIP:      ClientIP{From: ClientIPPeer},
+		SecretHeaders: []string{},
+		Sets:          map[string]Set{},
 		Policy: Policy{
 			Mode:         ModeEnforce,
 			DenyResponse: Response{Status: 403, Headers: map[string]string{}},
 			Rules:        []Rule{},
 		},
+		Upstream: Upstream{Headers: map[string]Expression{}},
 		nodes:    map[string]location{},
 		tainted:  map[string]bool{},
 		keys:     map[string][]mapKey{},

@@ -15,14 +15,19 @@ export const sidebar: DefaultTheme.SidebarMulti = {
   '/guide/': [
     {
       text: 'Get started',
-      items: [{ text: 'What is tessera?', link: '/guide/what-is-tessera' }],
+      items: [
+        { text: 'What is tessera?', link: '/guide/what-is-tessera' },
+        { text: 'How tessera works', link: '/guide/how-tessera-works' },
+      ],
     },
     {
       text: 'Set up',
       items: [
-        { text: 'Write rules', link: '/guide/write-rules' },
         { text: 'Client address', link: '/guide/client-address' },
-        { text: 'Use sets', link: '/guide/sets' },
+        { text: 'Enrichments', link: '/guide/enrichments' },
+        { text: 'Sets', link: '/guide/sets' },
+        { text: 'Policy rules', link: '/guide/policy-rules' },
+        { text: 'Responses and logs', link: '/guide/responses-and-logs' },
       ],
     },
   ],

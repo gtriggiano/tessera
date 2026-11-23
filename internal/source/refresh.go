@@ -12,7 +12,7 @@ import (
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
-// Result is the outcome of a check of a file.
+// Result is the outcome of a check of a file: of a set or of a database.
 type Result = sets.RefreshResult
 
 // The results of a check of a file.
@@ -45,12 +45,14 @@ const racyMargin = 2 * time.Second
 // read started at read, cannot be trusted.
 func racy(modTime, read time.Time) bool { return !modTime.Before(read.Add(-racyMargin)) }
 
-// File is a set whose source is a file, as its refresher needs it.
-type File struct {
-	Name       string
-	Path       string
-	Type       sets.Type
-	MaxEntries int
+// File is a file whose content a refresher keeps up to date: the file of a
+// set, or of a database. T is the type of a copy of its content.
+type File[T any] struct {
+	// Name names the copy in the Store and in the calls to the Observer.
+	Name string
+	Path string
+	// Parse builds a copy from the content of the file.
+	Parse Parse[T]
 	// Refresh is the time from the end of a check to the start of the next.
 	Refresh time.Duration
 	// MaxStaleness is how long the copy in use stays available after the
@@ -63,31 +65,39 @@ type File struct {
 	Read     time.Time
 }
 
+// Store holds the copies of the files, by name.
+type Store[T any] interface {
+	// Replace makes c the copy in use of name, available.
+	Replace(name string, c T) error
+	// SetAvailable marks the copy in use of name available or not. The
+	// refreshers call it only for a file with a MaxStaleness.
+	SetAvailable(name string, available bool) error
+}
+
 // Observer receives what the refreshers do, from their goroutines: the
-// calls about one set come one at a time, and none comes after Stop has
-// returned. The calls about different sets can be concurrent.
-type Observer interface {
-	// Checked reports a check of the file of set: its result, how long it
+// calls about one file come one at a time, and none comes after Stop has
+// returned. The calls about different files can be concurrent.
+type Observer[T any] interface {
+	// Checked reports a check of the file name: its result, how long it
 	// took, and when it ended.
-	Checked(set string, r Result, took time.Duration, at time.Time)
-	// Loaded reports that a new copy of set, of entries entries, read in
-	// took, is in use.
-	Loaded(set string, entries int, took time.Duration)
-	// Failed reports a new failure of the checks of set, rejected or not: a
+	Checked(name string, r Result, took time.Duration, at time.Time)
+	// Loaded reports that c, a new copy of name, read in took, is in use.
+	Loaded(name string, c T, took time.Duration)
+	// Failed reports a new failure of the checks of name, rejected or not: a
 	// failure on another version of the file, or with another error, than
 	// the last one. A check that fails again in the same way reports only
 	// Checked.
-	Failed(set string, err error)
-	// Unavailable reports that set became unavailable, because its last
+	Failed(name string, err error)
+	// Unavailable reports that name became unavailable, because its last
 	// successful check is older than its MaxStaleness.
-	Unavailable(set string)
-	// Available reports that set is available again, after a successful
+	Unavailable(name string)
+	// Available reports that name is available again, after a successful
 	// check.
-	Available(set string)
+	Available(name string)
 }
 
-// Refreshers keep the copies of the sets read from files up to date in a
-// sets.Store, each in the background with its own goroutine:
+// Refreshers keep the copies read from files up to date in a Store, each in
+// the background with its own goroutine:
 //
 //   - Every Refresh, counted from the end of the previous check, a check
 //     reads the state of the file, following symbolic links. A file with the
@@ -100,12 +110,12 @@ type Observer interface {
 //     the check, and the copy in use stays. A version of the file that was
 //     rejected, and is not racy, is not read again: each check rejects it at
 //     once, until the file changes.
-//   - A set with a MaxStaleness has a second goroutine, which marks the set
-//     unavailable as soon as its last successful check, unchanged or
+//   - A file with a MaxStaleness has a second goroutine, which marks its
+//     copy unavailable as soon as its last successful check, unchanged or
 //     updated, is older than MaxStaleness, even while a check is in
 //     progress. Before the first check, the age counts from Start, not from
 //     the read of the copy in the store. The next successful check makes the
-//     set available again.
+//     copy available again.
 //
 // The decisions read the copies and their availability from the store, and
 // never wait for a refresher.
@@ -113,17 +123,20 @@ type Refreshers struct {
 	cancel  context.CancelFunc
 	running atomic.Int64  // goroutines that have not returned
 	done    chan struct{} // closed once every goroutine has returned
-	all     []*refresher
+	all     []stoppable
 }
 
+// stoppable is a refresher, whatever the type of its copies.
+type stoppable interface{ stop() }
+
 // Start starts a refresher for each of files, whose copies are in store,
-// and reports what they do to obs.
-func Start(files []File, store *sets.Store, obs Observer) *Refreshers {
+// available, and reports what they do to obs.
+func Start[T any](files []File[T], store Store[T], obs Observer[T]) *Refreshers {
 	return start(files, store, obs, os.Stat)
 }
 
 // start is Start, with the function that reads the state of a file.
-func start(files []File, store *sets.Store, obs Observer, stat func(string) (fs.FileInfo, error)) *Refreshers {
+func start[T any](files []File[T], store Store[T], obs Observer[T], stat func(string) (fs.FileInfo, error)) *Refreshers {
 	ctx, cancel := context.WithCancel(context.Background())
 	rs := &Refreshers{cancel: cancel, done: make(chan struct{})}
 	// One more than the goroutines, until they have all started.
@@ -131,9 +144,7 @@ func start(files []File, store *sets.Store, obs Observer, stat func(string) (fs.
 	for _, f := range files {
 		// The first window of staleness starts now: the first check comes
 		// Refresh later.
-		r := &refresher{File: f, store: store, obs: obs, stat: stat, current: f.Identity, racy: racy(f.Identity.ModTime, f.Read), lastSuccess: time.Now()}
-		e, _ := store.Get(f.Name)
-		r.available = e.Available
+		r := &refresher[T]{File: f, store: store, obs: obs, stat: stat, current: f.Identity, racy: racy(f.Identity.ModTime, f.Read), available: true, lastSuccess: time.Now()}
 		rs.all = append(rs.all, r)
 		if f.MaxStaleness > 0 {
 			r.stale = time.NewTimer(f.MaxStaleness)
@@ -162,24 +173,29 @@ func (rs *Refreshers) returned() {
 	}
 }
 
-// Stop stops every refresher: a check in progress is cut short, at the
-// latest when the read of the file returns, and recorded nowhere. No call
-// to the Observer follows the return of Stop. Stop waits until every
+// Cancel stops every refresher without waiting for its goroutines: a check
+// in progress is cut short, at the latest when the read of the file
+// returns, and recorded nowhere. No change of the store and no call to the
+// Observer follows the return of Cancel. A nil Refreshers has nothing to
+// cancel.
+func (rs *Refreshers) Cancel() {
+	if rs == nil {
+		return
+	}
+	rs.cancel()
+	for _, r := range rs.all {
+		r.stop()
+	}
+}
+
+// Stop cancels every refresher, as Cancel does, then waits until every
 // goroutine has returned, or until ctx ends, and then returns ctx.Err(). A
 // nil Refreshers has nothing to stop.
 func (rs *Refreshers) Stop(ctx context.Context) error {
 	if rs == nil {
 		return nil
 	}
-	rs.cancel()
-	for _, r := range rs.all {
-		r.mu.Lock()
-		r.stopped = true
-		if r.stale != nil {
-			r.stale.Stop()
-		}
-		r.mu.Unlock()
-	}
+	rs.Cancel()
 	select {
 	case <-rs.done:
 		return nil
@@ -188,11 +204,11 @@ func (rs *Refreshers) Stop(ctx context.Context) error {
 	}
 }
 
-// refresher keeps the copy of one set up to date.
-type refresher struct {
-	File
-	store *sets.Store
-	obs   Observer
+// refresher keeps the copy of one file up to date.
+type refresher[T any] struct {
+	File[T]
+	store Store[T]
+	obs   Observer[T]
 	stat  func(string) (fs.FileInfo, error)
 
 	// Owned by the goroutine of the checks, which changes them with mu held.
@@ -218,17 +234,28 @@ type failure struct {
 }
 
 // outcome is what a check found.
-type outcome struct {
+type outcome[T any] struct {
 	result Result
-	set    *sets.Set // the new copy, when Updated
-	id     Identity  // of the version of the file
-	racy   bool      // id cannot be trusted: see racyMargin
-	err    error     // of a failure
+	copy   T        // the new copy, when Updated
+	id     Identity // of the version of the file
+	racy   bool     // id cannot be trusted: see racyMargin
+	err    error    // of a failure
+}
+
+// stop records that the refreshers are stopped: no change of the store and
+// no call to the Observer follows.
+func (r *refresher[T]) stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stopped = true
+	if r.stale != nil {
+		r.stale.Stop()
+	}
 }
 
 // run checks the file every Refresh, from the end of the previous check, so
 // that checks never queue up, until ctx ends.
-func (r *refresher) run(ctx context.Context) {
+func (r *refresher[T]) run(ctx context.Context) {
 	timer := time.NewTimer(r.Refresh)
 	defer timer.Stop()
 	for {
@@ -242,9 +269,9 @@ func (r *refresher) run(ctx context.Context) {
 	}
 }
 
-// watch marks the set unavailable when its timer of staleness fires, until
+// watch marks the copy unavailable when its timer of staleness fires, until
 // ctx ends.
-func (r *refresher) watch(ctx context.Context) {
+func (r *refresher[T]) watch(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -255,7 +282,7 @@ func (r *refresher) watch(ctx context.Context) {
 	}
 }
 
-func (r *refresher) expire() {
+func (r *refresher[T]) expire() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped || !r.available {
@@ -272,7 +299,7 @@ func (r *refresher) expire() {
 }
 
 // check checks the file once, and records the result.
-func (r *refresher) check(ctx context.Context) {
+func (r *refresher[T]) check(ctx context.Context) {
 	begin := time.Now()
 	o := r.inspect(ctx, begin)
 	if ctx.Err() != nil {
@@ -288,10 +315,10 @@ func (r *refresher) check(ctx context.Context) {
 	r.obs.Checked(r.Name, o.result, took, end)
 	switch o.result {
 	case Updated:
-		// The copy has the type of the set.
-		_ = r.store.Replace(r.Name, o.set)
+		// The copy has the type of the file.
+		_ = r.store.Replace(r.Name, o.copy)
 		r.current, r.racy, r.failure = o.id, o.racy, nil
-		r.obs.Loaded(r.Name, o.set.Entries(), took)
+		r.obs.Loaded(r.Name, o.copy, took)
 		r.succeeded(end, true)
 	case Unchanged:
 		r.current, r.racy, r.failure = o.id, o.racy, nil
@@ -307,7 +334,7 @@ func (r *refresher) check(ctx context.Context) {
 
 // succeeded records a successful check, at, which replaced the copy in use
 // or not. r.mu is held.
-func (r *refresher) succeeded(at time.Time, replaced bool) {
+func (r *refresher[T]) succeeded(at time.Time, replaced bool) {
 	r.lastSuccess = at
 	if r.stale != nil {
 		r.stale.Reset(r.MaxStaleness)
@@ -324,33 +351,33 @@ func (r *refresher) succeeded(at time.Time, replaced bool) {
 
 // inspect reads the state of the file and, when it has changed or its
 // identity cannot be trusted, its content. begin is the start of the check.
-func (r *refresher) inspect(ctx context.Context, begin time.Time) outcome {
+func (r *refresher[T]) inspect(ctx context.Context, begin time.Time) outcome[T] {
 	info, err := r.stat(r.Path)
 	if err != nil {
-		return outcome{result: Failed, err: openError(err)}
+		return outcome[T]{result: Failed, err: openError(err)}
 	}
 	id := identity(info)
 	switch {
 	case !info.Mode().IsRegular():
-		return outcome{result: Failed, id: id, err: ErrNotRegular}
+		return outcome[T]{result: Failed, id: id, err: ErrNotRegular}
 	case sameFile(id, r.current) && !r.racy:
-		return outcome{result: Unchanged, id: r.current}
+		return outcome[T]{result: Unchanged, id: r.current}
 	case r.failure != nil && r.failure.result == Rejected && !r.failure.racy && sameFile(id, r.failure.id):
-		return outcome{result: Rejected, id: r.failure.id, err: r.failure.err}
+		return outcome[T]{result: Rejected, id: r.failure.id, err: r.failure.err}
 	}
-	set, read, err := readFile(ctx, r.Path, r.Type, r.MaxEntries)
-	unsure := racy(read.ModTime, begin)
-	var invalid *sets.Error
+	c, got, err := read(ctx, r.Path, r.Parse)
+	unsure := racy(got.ModTime, begin)
+	var invalid *Invalid
 	switch {
 	case errors.As(err, &invalid):
-		return outcome{result: Rejected, id: read, racy: unsure, err: err}
+		return outcome[T]{result: Rejected, id: got, racy: unsure, err: invalid.Err}
 	case err != nil:
-		return outcome{result: Failed, id: id, err: err}
-	case read.Sum == r.current.Sum:
+		return outcome[T]{result: Failed, id: id, err: err}
+	case got.Sum == r.current.Sum:
 		// The content of the copy in use, in another file, as when a
 		// Kubernetes ConfigMap changes another of its files, or in the same
 		// racy version.
-		return outcome{result: Unchanged, id: read, racy: unsure}
+		return outcome[T]{result: Unchanged, id: got, racy: unsure}
 	}
-	return outcome{result: Updated, set: set, id: read, racy: unsure}
+	return outcome[T]{result: Updated, copy: c, id: got, racy: unsure}
 }

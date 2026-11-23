@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,14 +14,13 @@ import (
 	"github.com/gtriggiano/tessera/internal/app"
 	"github.com/gtriggiano/tessera/internal/config"
 	"github.com/gtriggiano/tessera/internal/engine"
+	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/request"
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
-// redactedHeaders are the headers whose values eval never prints, as the
-// log events never write them.
-var redactedHeaders = []string{"authorization", "cookie"}
-
+// redacted replaces the values that eval never prints: those of the secret
+// headers, which the log events never write either.
 const redacted = "[REDACTED]"
 
 type evalFlags struct {
@@ -35,10 +35,12 @@ func evalCommand(lookup config.LookupEnv) *cobra.Command {
 		Short: "Show how the policy decides a request",
 		Long: "Decide a request described by the flags with the policy of the configuration\n" +
 			"file, and show the attributes that the rules read, the outcome of each rule up\n" +
-			"to the one that decides, and the decision. The request goes through the same\n" +
-			"normalization as a request from Envoy; --ip sets client.ip, which is missing\n" +
-			"without it. The sets are loaded as serve loads them, their files included,\n" +
-			"except those that --set replaces. Nothing is logged and no socket is opened.\n\n" +
+			"to the one that decides, the decision, and the upstream headers of a request\n" +
+			"that Envoy sends on. The request goes through the same normalization as a\n" +
+			"request from Envoy; --ip sets client.ip, which is missing without it. The sets\n" +
+			"are loaded as serve loads them, their files included, except those that --set\n" +
+			"replaces, and so are the databases of geo and asn. Nothing is logged and no\n" +
+			"socket is opened.\n\n" +
 			"Exit status: 0 whatever the decision; 2 for usage and configuration errors.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -65,11 +67,16 @@ func evalCommand(lookup config.LookupEnv) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			e, err := app.NewEngine(cfg.Policy, loaded.Store, nil)
+			databases, err := app.LoadDatabases(cfg)
+			if err != nil {
+				return err
+			}
+			e, err := app.NewEngine(cfg, loaded.Store, databases.Store, nil)
 			if err != nil {
 				return runtimeError{errors.New("cannot compile the policy")}
 			}
-			out := explain(cfg.Policy, r, e.Explain(r))
+			secretHeaders := append(slices.Clone(expr.AlwaysSecretHeaders), cfg.SecretHeaderNames()...)
+			out := explain(cfg.Policy, r, e.Explain(r), secretHeaders, e.HeaderReadsSecrets)
 			var data []byte
 			if f.output == "json" {
 				if data, err = json.Marshal(out); err != nil {
@@ -188,12 +195,34 @@ type evalOutput struct {
 	Attributes []evalAttribute `json:"attributes"`
 	Rules      []evalRule      `json:"rules"`
 	Decision   evalDecision    `json:"decision"`
+	// Upstream, for a request that Envoy sends on and a policy with
+	// upstream headers, holds them.
+	Upstream *evalUpstream `json:"upstream,omitempty"`
+}
+
+// evalUpstream holds the upstream headers: those set, by name, and the names
+// of those removed.
+type evalUpstream struct {
+	Set    map[string]string `json:"set"`
+	Remove []string          `json:"remove"`
+	// headers are all of them, in the order of their names, for the text.
+	headers []evalHeader
+}
+
+// evalHeader is an upstream header in the text: its value, or removed; a
+// value that can hold the value of a secret header is redacted.
+type evalHeader struct {
+	name, value       string
+	removed, redacted bool
 }
 
 type evalAttribute struct {
 	Name    string  `json:"name"`
 	Value   *string `json:"value,omitempty"`
 	Missing bool    `json:"missing,omitempty"`
+	// bare: the text output writes the value without quotes, as for an
+	// address, a bool or a number.
+	bare bool
 }
 
 type evalRule struct {
@@ -222,10 +251,13 @@ type evalResponse struct {
 	Headers map[string]string `json:"headers"`
 }
 
-func explain(p config.Policy, r *request.Request, x engine.Explanation) evalOutput {
+// explain renders x, the explanation of r with the policy p. The values of
+// secretHeaders, in lowercase, are redacted, and so are the upstream headers
+// for which secrets reports that their values can hold one of them.
+func explain(p config.Policy, r *request.Request, x engine.Explanation, secretHeaders []string, secrets func(header string) bool) evalOutput {
 	out := evalOutput{Attributes: []evalAttribute{}, Rules: []evalRule{}}
 	for _, name := range x.Attributes {
-		out.Attributes = append(out.Attributes, attributes(name, r)...)
+		out.Attributes = append(out.Attributes, attributes(name, r, x.Input, secretHeaders)...)
 	}
 	slices.SortFunc(out.Attributes, func(a, b evalAttribute) int { return strings.Compare(a.Name, b.Name) })
 	out.Attributes = slices.CompactFunc(out.Attributes, func(a, b evalAttribute) bool { return a.Name == b.Name })
@@ -265,20 +297,42 @@ func explain(p config.Policy, r *request.Request, x engine.Explanation) evalOutp
 		}
 		out.Decision.Response = resp
 	}
+	if len(d.Upstream) > 0 {
+		up := &evalUpstream{Set: map[string]string{}, Remove: []string{}}
+		for _, h := range d.Upstream {
+			shown := evalHeader{name: h.Name, value: h.Value}
+			switch {
+			case h.Value == "":
+				shown.removed = true
+				up.Remove = append(up.Remove, h.Name)
+			case secrets(h.Name):
+				shown.value, shown.redacted = redacted, true
+				up.Set[h.Name] = redacted
+			default:
+				up.Set[h.Name] = h.Value
+			}
+			up.headers = append(up.headers, shown)
+		}
+		out.Upstream = up
+	}
 	return out
 }
 
 // attributes returns the value of the attribute name, as an expression
-// names it, for r: every header when name is request.headers.
-func attributes(name string, r *request.Request) []evalAttribute {
+// names it, for r: every header when name is request.headers, those of
+// secretHeaders redacted. in reads geo and asn as the decision did.
+func attributes(name string, r *request.Request, in *expr.Input, secretHeaders []string) []evalAttribute {
 	str := func(name, s string) evalAttribute { return evalAttribute{Name: name, Value: &s} }
+	if a, ok := databaseAttribute(name, in); ok {
+		return []evalAttribute{a}
+	}
 	header := func(key string) evalAttribute {
 		name := fmt.Sprintf("request.headers[%q]", key)
 		v, ok := r.Headers[key]
 		switch {
 		case !ok:
 			return evalAttribute{Name: name, Missing: true}
-		case slices.Contains(redactedHeaders, key):
+		case slices.Contains(secretHeaders, key):
 			return str(name, redacted)
 		}
 		return str(name, v)
@@ -288,7 +342,9 @@ func attributes(name string, r *request.Request) []evalAttribute {
 		if !r.ClientIP.IsValid() {
 			return []evalAttribute{{Name: name, Missing: true}}
 		}
-		return []evalAttribute{str(name, r.ClientIP.String())}
+		a := str(name, r.ClientIP.String())
+		a.bare = true
+		return []evalAttribute{a}
 	case "request.host":
 		return []evalAttribute{str(name, r.Host)}
 	case "request.method":
@@ -316,8 +372,105 @@ func attributes(name string, r *request.Request) []evalAttribute {
 	return nil
 }
 
+// databaseAttribute returns the value of name when it is an attribute of
+// geo or asn: missing when the request has no client address, when the
+// lookup failed, and for the location of a record without one. An object or
+// a list read as a whole is written as a CEL literal, such as
+// {code: "IT", name: "Italy", in_eu: true}, and a double always has a decimal
+// point, as a CEL double literal: 52.0, not 52.
+func databaseAttribute(name string, in *expr.Input) (evalAttribute, bool) {
+	value := func(s string, bare bool) (evalAttribute, bool) {
+		return evalAttribute{Name: name, Value: &s, bare: bare}, true
+	}
+	missing := evalAttribute{Name: name, Missing: true}
+	number := func(f float64) string {
+		s := strconv.FormatFloat(f, 'f', -1, 64)
+		if !math.IsInf(f, 0) && !math.IsNaN(f) && !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return s
+	}
+	if field, ok := strings.CutPrefix(name, "geo."); ok {
+		g, err := in.Geo()
+		if err != nil {
+			return missing, true
+		}
+		if !g.HasLocation && strings.HasPrefix(field, "location") {
+			return missing, true
+		}
+		switch field {
+		case "found":
+			return value(strconv.FormatBool(g.Found), true)
+		case "country":
+			return value(literal("code", strconv.Quote(g.Country.Code), "name", strconv.Quote(g.Country.Name), "in_eu", strconv.FormatBool(g.Country.InEU)), true)
+		case "country.code":
+			return value(g.Country.Code, false)
+		case "country.name":
+			return value(g.Country.Name, false)
+		case "country.in_eu":
+			return value(strconv.FormatBool(g.Country.InEU), true)
+		case "continent":
+			return value(literal("code", strconv.Quote(g.Continent.Code), "name", strconv.Quote(g.Continent.Name)), true)
+		case "continent.code":
+			return value(g.Continent.Code, false)
+		case "continent.name":
+			return value(g.Continent.Name, false)
+		case "subdivisions":
+			items := make([]string, len(g.Subdivisions))
+			for i, s := range g.Subdivisions {
+				items[i] = literal("code", strconv.Quote(s.Code), "name", strconv.Quote(s.Name))
+			}
+			return value("["+strings.Join(items, ", ")+"]", true)
+		case "city":
+			return value(g.City, false)
+		case "postal_code":
+			return value(g.PostalCode, false)
+		case "timezone":
+			return value(g.TimeZone, false)
+		case "location":
+			return value(literal("lat", number(g.Latitude), "lon", number(g.Longitude)), true)
+		case "location.lat":
+			return value(number(g.Latitude), true)
+		case "location.lon":
+			return value(number(g.Longitude), true)
+		}
+		return missing, true
+	}
+	if field, ok := strings.CutPrefix(name, "asn."); ok {
+		a, err := in.ASN()
+		if err != nil {
+			return missing, true
+		}
+		switch field {
+		case "found":
+			return value(strconv.FormatBool(a.Found), true)
+		case "number":
+			return value(strconv.FormatInt(a.Number, 10), true)
+		case "organization":
+			return value(a.Organization, false)
+		}
+		return missing, true
+	}
+	return evalAttribute{}, false
+}
+
+// literal writes an object as a CEL literal, from the names and the values
+// of its fields, in pairs: {name: value, name: value}.
+func literal(fields ...string) string {
+	var b strings.Builder
+	b.WriteString("{")
+	for i := 0; i+1 < len(fields); i += 2 {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(fields[i] + ": " + fields[i+1])
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
 // text renders the result as three blocks: the attributes, the rules and the
-// decision.
+// decision, and a fourth for the upstream headers, when there are some.
 func (o evalOutput) text() []byte {
 	var b strings.Builder
 	width := 0
@@ -328,7 +481,7 @@ func (o evalOutput) text() []byte {
 		value := "missing"
 		switch {
 		case a.Missing:
-		case a.Name == "client.ip" || *a.Value == redacted:
+		case a.bare || *a.Value == redacted:
 			value = *a.Value
 		default:
 			value = strconv.Quote(*a.Value)
@@ -372,6 +525,24 @@ func (o evalOutput) text() []byte {
 	b.WriteString("\n")
 	if d.Response != nil {
 		fmt.Fprintf(&b, "response: status %d\n", d.Response.Status)
+	}
+	if o.Upstream != nil {
+		b.WriteString("\n")
+		width = 0
+		for _, h := range o.Upstream.headers {
+			width = max(width, len(h.name))
+		}
+		for _, h := range o.Upstream.headers {
+			value := "removed"
+			switch {
+			case h.removed:
+			case h.redacted:
+				value = h.value
+			default:
+				value = strconv.Quote(h.value)
+			}
+			fmt.Fprintf(&b, "%-*s  %s\n", width, h.name, value)
+		}
 	}
 	return []byte(b.String())
 }

@@ -27,13 +27,14 @@ import (
 //
 //	go test ./internal/config -run TestJSONSchema -update
 //
-// rewrites the file.
+// rewrites the file, with the databases of docs/examples/ (see
+// TestExampleDatabases).
 //
 // The schema states what a document can state on its own: key names, types,
 // enumerations, bounds and the form of some strings. It leaves out every rule
 // that involves two keys or the environment, so it never rejects a file that
 // tessera accepts: TestJSONSchemaAcceptsValidConfigurations keeps it so.
-var updateJSONSchema = flag.Bool("update", false, "rewrite docs/public/config.schema.json")
+var update = flag.Bool("update", false, "rewrite the generated files: docs/public/config.schema.json and the databases of docs/examples/")
 
 var jsonSchemaFile = filepath.Join("..", "..", "docs", "public", "config.schema.json")
 
@@ -49,6 +50,7 @@ const (
 	jsonSchemaHeaderPattern   = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
 	jsonSchemaRuleNamePattern = "^[a-z0-9-]{1,63}$"
 	jsonSchemaSetNamePattern  = "^[a-z][a-z0-9_]{0,62}$"
+	jsonSchemaFieldPattern    = "^[a-z][a-z0-9_]{0,62}$"
 )
 
 // jsonSchemaNote is what the types and defaults do not say about a key.
@@ -63,6 +65,7 @@ type jsonSchemaNote struct {
 	min, max     int  // of an integer; 0 leaves the bound out
 	nonNegative  bool // of an integer: a minimum of 0, which min cannot state
 	maxItems     int  // of a list; 0 leaves the bound out
+	uniqueItems  bool // of a list of strings: no item twice, as written
 	pattern      string
 	// inherited is the key whose value this key takes when the file does not
 	// write it. The schema states no default for it.
@@ -71,8 +74,12 @@ type jsonSchemaNote struct {
 	// the two is required. The schema states neither this rule, which
 	// involves two keys, nor a default.
 	requiredUnless string
-	// names is the pattern of the names of a mapping of names.
+	// names is the pattern of the names of a mapping of names or of
+	// expressions.
 	names string
+	// maxProperties bounds the entries of a mapping of expressions; 0
+	// leaves the bound out.
+	maxProperties int
 }
 
 // condition is a key that has a value.
@@ -90,15 +97,26 @@ var jsonSchemaNotes = map[string]jsonSchemaNote{
 	"admin":        {doc: "The listener of the health checks and the metrics."},
 	"admin.listen": {doc: "The address of the admin listener, as host:port. It must not share its address and port with server.listen.", pattern: jsonSchemaPortPattern},
 
-	"log":           {doc: "The log events, written to standard output."},
-	"log.level":     {doc: "The lowest level of the events that are written.", enum: []string{LevelDebug, LevelInfo, LevelWarn, LevelError}},
-	"log.format":    {doc: "The format of the events: one line of key=value pairs, or one JSON object per line.", enum: []string{FormatLogfmt, FormatJSON}},
-	"log.decisions": {doc: "The decisions that a decision event reports: none; deny, the denials, and the allows in which an audit rule with action deny matched; or all.", enum: []string{DecisionsNone, DecisionsDeny, DecisionsAll}},
+	"log":                 {doc: "The log events, written to standard output."},
+	"log.level":           {doc: "The lowest level of the events that are written.", enum: []string{LevelDebug, LevelInfo, LevelWarn, LevelError}},
+	"log.format":          {doc: "The format of the events: one line of key=value pairs, or one JSON object per line.", enum: []string{FormatLogfmt, FormatJSON}},
+	"log.decisions":       {doc: "The decisions that a decision event reports: none; deny, the denials, and the allows in which an audit rule with action deny matched; or all.", enum: []string{DecisionsNone, DecisionsDeny, DecisionsAll}},
+	"log.decision_fields": {doc: "The fields that a decision event adds after duration_ms, in the order of their names: each name maps to a CEL expression whose result is a string, computed only for the events written. At most 32. A name is a lowercase letter followed by lowercase letters, digits and underscores, at most 63 characters, and not a field of the event. A field cannot read request.query, a secret header, nor request.headers otherwise than by a literal name.", names: jsonSchemaFieldPattern, maxProperties: MaxDecisionFields},
 
 	"client_ip":              {doc: "Where tessera reads the client address of a request: from one source, without falling back on another."},
 	"client_ip.from":         {doc: "The source of the client address: peer, the address of the connection to Envoy; header, a header that holds one address; x_forwarded_for, the X-Forwarded-For header, read from the right.", enum: []string{ClientIPPeer, ClientIPHeader, ClientIPXForwardedFor}},
 	"client_ip.header":       {doc: "The header that holds the client address, in any case. Required, and allowed only, when from is header.", requiredWhen: condition{"client_ip.from", ClientIPHeader}, pattern: jsonSchemaHeaderPattern},
 	"client_ip.trusted_hops": {doc: "The number of entries at the right end of X-Forwarded-For that trusted proxies wrote after the client address. Required, and allowed only, when from is x_forwarded_for.", requiredWhen: condition{"client_ip.from", ClientIPXForwardedFor}, nonNegative: true},
+
+	"secret_headers": {doc: "The headers whose values are secret, by name in any case, in addition to authorization, proxy-authorization and cookie, which are always secret and cannot be listed: a decision field cannot read them, tessera eval shows their values as [REDACTED], and tessera never logs them. At most 64, each once in any case.", pattern: jsonSchemaHeaderPattern, maxItems: MaxSecretHeaders, uniqueItems: true},
+
+	"enrichment":              {doc: "The databases that the attributes geo and asn read. Without its block, an attribute does not exist, and a condition that reads it is an error."},
+	"enrichment.geo":          {doc: "A MaxMind DB database with the schema of GeoIP2 or GeoLite2 City or Country, which geo reads. Absent by default."},
+	"enrichment.geo.database": {doc: "The path of the database file, relative to the configuration file when it is not absolute. At most 512 MiB.", required: true},
+	"enrichment.geo.refresh":  {doc: "How often tessera checks the file of the database for a change. At least 1s."},
+	"enrichment.asn":          {doc: "A MaxMind DB database with the schema of GeoLite2 ASN, which asn reads. Absent by default."},
+	"enrichment.asn.database": {doc: "The path of the database file, relative to the configuration file when it is not absolute. At most 512 MiB.", required: true},
+	"enrichment.asn.refresh":  {doc: "How often tessera checks the file of the database for a change. At least 1s."},
 
 	"sets":                       {doc: "The named sets that conditions read with sets.<name>.contains(value). A name is a lowercase letter followed by lowercase letters, digits and underscores, at most 63 characters, and not a reserved word of the expression language.", names: jsonSchemaSetNamePattern},
 	"sets.<name>.type":           {doc: "The type of the values: cidr, IP networks and addresses; asn, autonomous system numbers; string, strings compared exactly.", required: true, enum: []string{SetTypeCIDR, SetTypeASN, SetTypeString}},
@@ -126,6 +144,9 @@ var jsonSchemaNotes = map[string]jsonSchemaNote{
 	"policy.rules[].response.status":  {doc: "The HTTP status of the denial. By default, policy.deny_response.status.", min: 400, max: 599, inherited: "policy.deny_response.status"},
 	"policy.rules[].response.body":    {doc: "The body of the denial, at most 8 KiB. By default, policy.deny_response.body.", inherited: "policy.deny_response.body"},
 	"policy.rules[].response.headers": {doc: "The headers of the denial, which replace policy.deny_response.headers as a whole. By default, policy.deny_response.headers.", inherited: "policy.deny_response.headers"},
+
+	"upstream":         {doc: "What tessera adds to the requests that Envoy sends on to the upstream."},
+	"upstream.headers": {doc: "The headers that tessera sets on every request that Envoy sends on, an allow or a denial in audit mode, replacing those of the client: each header name, in any case, maps to a CEL expression whose result is a string. An empty value, an expression that fails or an invalid value removes the header. At most 64. host, content-length, transfer-encoding, connection, authorization, proxy-authorization, cookie, keep-alive, proxy-connection, te, trailer, upgrade and the names that start with x-envoy- are not allowed.", names: jsonSchemaHeaderPattern, maxProperties: MaxUpstreamHeaders},
 }
 
 // jsonObject is a JSON object that keeps the order of its members.
@@ -269,6 +290,10 @@ func (b *jsonSchemaBuilder) field(t reflect.Type, path string, note jsonSchemaNo
 		out = append(out, jsonMember{"$ref", "#/$defs/duration"})
 	case t.Kind() == reflect.Struct:
 		return append(out, b.mapping(t, path, v)...)
+	case t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct:
+		// An optional block: absent by default, with the defaults of its
+		// keys when present.
+		return append(out, b.mapping(t.Elem(), path, listItem(t.Elem()))...)
 	case t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Struct:
 		out = append(out, jsonMember{"type", "array"})
 		if note.maxItems > 0 {
@@ -280,12 +305,30 @@ func (b *jsonSchemaBuilder) field(t reflect.Type, path string, note jsonSchemaNo
 			jsonObject{{"type", "string"}},
 			jsonObject{{"type", "integer"}, {"minimum", 1}, {"maximum", sets.MaxASN}},
 		}}}})
+	case t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.String:
+		out = append(out, jsonMember{"type", "array"})
+		if note.maxItems > 0 {
+			out = append(out, jsonMember{"maxItems", note.maxItems})
+		}
+		if note.uniqueItems {
+			out = append(out, jsonMember{"uniqueItems", true})
+		}
+		out = append(out, jsonMember{"items", jsonSchemaString(note.enum, note.pattern)})
 	case t.Kind() == reflect.Map && t.Elem().Kind() == reflect.Struct:
 		out = append(out, jsonMember{"type", "object"})
 		if note.names != "" {
 			out = append(out, jsonMember{"propertyNames", jsonObject{{"pattern", note.names}}})
 		}
 		out = append(out, jsonMember{"additionalProperties", b.mapping(t.Elem(), path+".<name>", listItem(t.Elem()))})
+	case t.Kind() == reflect.Map && t.Elem() == expressionType:
+		out = append(out, jsonMember{"type", "object"})
+		if note.names != "" {
+			out = append(out, jsonMember{"propertyNames", jsonObject{{"pattern", note.names}}})
+		}
+		if note.maxProperties > 0 {
+			out = append(out, jsonMember{"maxProperties", note.maxProperties})
+		}
+		out = append(out, jsonMember{"additionalProperties", jsonObject{{"type", "string"}}})
 	case t.Kind() == reflect.Map && t.Elem().Kind() == reflect.String:
 		out = append(out, jsonMember{"type", "object"}, jsonMember{"additionalProperties", jsonObject{{"type", "string"}}})
 	case t.Kind() == reflect.String:
@@ -367,7 +410,7 @@ func TestJSONSchema(t *testing.T) {
 	if t.Failed() {
 		return
 	}
-	if *updateJSONSchema {
+	if *update {
 		if err := os.WriteFile(jsonSchemaFile, want, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -534,9 +577,21 @@ func jsonSchemaProblems(t *testing.T, root, schema map[string]any, value any, pa
 					problems = append(problems, jsonSchemaProblems(t, root, rule.(map[string]any), name, childPath(path, name))...)
 				}
 			}
+		case "uniqueItems":
+			if items, ok := value.([]any); ok && rule == true {
+				for i := range items {
+					if slices.Contains(items[:i], items[i]) {
+						report("item %d is repeated", i)
+					}
+				}
+			}
 		case "maxItems":
 			if items, ok := value.([]any); ok && float64(len(items)) > rule.(float64) {
 				report("more than %v items", rule)
+			}
+		case "maxProperties":
+			if m, ok := value.(map[string]any); ok && float64(len(m)) > rule.(float64) {
+				report("more than %v keys", rule)
 			}
 		case "items":
 			if items, ok := value.([]any); ok {
@@ -600,9 +655,17 @@ admin:
 log:
   level: debug
   format: json
+  decision_fields:
+    agent: request.headers["user-agent"]
+    country: geo.country.code
 client_ip:
   from: x_forwarded_for
   trusted_hops: 0
+secret_headers: [x-api-key, X-Tenant-Token]
+upstream:
+  headers:
+    X-Client-Country: geo.country.code
+    x-client-asn: 'asn.found ? string(asn.number) : ""'
 policy:
   mode: audit
   default_action: allow
@@ -624,6 +687,13 @@ policy:
     - name: everyone
       action: allow
       mode: audit
+enrichment:
+  geo:
+    database: /var/lib/geoip/city.mmdb
+    refresh: 10m
+  asn:
+    database: asn.mmdb
+    refresh: 1s
 sets:
   office:
     type: cidr
@@ -660,6 +730,7 @@ log:
 client_ip:
   from: ${SOURCE}
   header: ${HEADER}
+secret_headers: ["${SECRET_HEADER:-x-api-key}"]
 sets:
   hosts:
     type: ${SET_TYPE:-string}
@@ -701,44 +772,60 @@ policy:
 func TestJSONSchemaRejectsInvalidConfigurations(t *testing.T) {
 	schema := loadJSONSchema(t)
 	for name, text := range map[string]string{
-		"missing policy":            "log:\n  level: info\n",
-		"missing default action":    "policy: {}\n",
-		"unknown top-level key":     "policy: {default_action: deny}\nroutes: {}\n",
-		"set name":                  "policy: {default_action: deny}\nsets: {Office: {type: string, values: []}}\n",
-		"set without a type":        "policy: {default_action: deny}\nsets: {office: {values: []}}\n",
-		"set type":                  "policy: {default_action: deny}\nsets: {office: {type: area, file: a.json}}\n",
-		"unknown set key":           "policy: {default_action: deny}\nsets: {office: {type: cidr, values: [], url: x}}\n",
-		"set values not a list":     "policy: {default_action: deny}\nsets: {office: {type: cidr, values: 192.0.2.0/24}}\n",
-		"set value not a scalar":    "policy: {default_action: deny}\nsets: {office: {type: cidr, values: [[192.0.2.0/24]]}}\n",
-		"AS number zero":            "policy: {default_action: deny}\nsets: {asns: {type: asn, values: [0]}}\n",
-		"set answer":                "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, on_unavailable: allow}}\n",
-		"set refresh":               "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, refresh: 10}}\n",
-		"set max entries":           "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, max_entries: 0}}\n",
-		"unknown key":               "policy: {default_action: deny}\nserver:\n  lisen: :9001\n",
-		"unknown value":             "policy: {default_action: maybe}\n",
-		"unknown log level":         "policy: {default_action: deny}\nlog: {level: trace}\n",
-		"number for a duration":     "policy: {default_action: deny}\nserver: {drain_delay: 5}\n",
-		"duration without unit":     "policy: {default_action: deny}\nserver: {drain_delay: \"5\"}\n",
-		"duration in days":          "policy: {default_action: deny}\nserver: {drain_delay: 1d}\n",
-		"string for an integer":     "policy: {default_action: deny}\nserver: {max_concurrent_streams: \"16\"}\n",
-		"integer below bound":       "policy: {default_action: deny}\nserver: {max_concurrent_streams: 0}\n",
-		"integer above bound":       "policy: {default_action: deny}\nserver: {max_concurrent_streams: 4294967296}\n",
-		"listen without port":       "policy: {default_action: deny}\nserver: {listen: localhost}\n",
-		"admin on a socket":         "policy: {default_action: deny}\nadmin: {listen: \"unix:/run/admin.sock\"}\n",
-		"scalar for a mapping":      "policy: deny\n",
-		"unknown source":            "policy: {default_action: deny}\nclient_ip: {from: forwarded}\n",
-		"header name with space":    "policy: {default_action: deny}\nclient_ip: {from: header, header: \"x client\"}\n",
-		"negative trusted hops":     "policy: {default_action: deny}\nclient_ip: {from: x_forwarded_for, trusted_hops: -1}\n",
-		"unknown policy mode":       "policy: {default_action: deny, mode: observe}\n",
-		"status out of range":       "policy: {default_action: deny, deny_response: {status: 302}}\n",
-		"header value not a string": "policy: {default_action: deny, deny_response: {headers: {x-a: 1}}}\n",
-		"rules not a list":          "policy: {default_action: deny, rules: {}}\n",
-		"rule without a name":       "policy: {default_action: deny, rules: [{action: deny}]}\n",
-		"rule name":                 "policy: {default_action: deny, rules: [{name: Office, action: deny}]}\n",
-		"unknown rule key":          "policy: {default_action: deny, rules: [{name: r, action: deny, then: x}]}\n",
-		"rule action":               "policy: {default_action: deny, rules: [{name: r, action: block}]}\n",
-		"rule status":               "policy: {default_action: deny, rules: [{name: r, action: deny, response: {status: 200}}]}\n",
-		"too many rules":            "policy: {default_action: deny, rules: [" + strings.Repeat("{name: r, action: deny, when: \"false\"},", MaxRules+1) + "]}\n",
+		"missing policy":               "log:\n  level: info\n",
+		"missing default action":       "policy: {}\n",
+		"unknown top-level key":        "policy: {default_action: deny}\nroutes: {}\n",
+		"set name":                     "policy: {default_action: deny}\nsets: {Office: {type: string, values: []}}\n",
+		"database without a path":      "policy: {default_action: deny}\nenrichment: {geo: {refresh: 1m}}\n",
+		"unknown database":             "policy: {default_action: deny}\nenrichment: {ua: {database: ua.mmdb}}\n",
+		"unknown database key":         "policy: {default_action: deny}\nenrichment: {asn: {database: asn.mmdb, max_staleness: 1h}}\n",
+		"database refresh":             "policy: {default_action: deny}\nenrichment: {asn: {database: asn.mmdb, refresh: 60}}\n",
+		"set without a type":           "policy: {default_action: deny}\nsets: {office: {values: []}}\n",
+		"set type":                     "policy: {default_action: deny}\nsets: {office: {type: area, file: a.json}}\n",
+		"unknown set key":              "policy: {default_action: deny}\nsets: {office: {type: cidr, values: [], url: x}}\n",
+		"set values not a list":        "policy: {default_action: deny}\nsets: {office: {type: cidr, values: 192.0.2.0/24}}\n",
+		"set value not a scalar":       "policy: {default_action: deny}\nsets: {office: {type: cidr, values: [[192.0.2.0/24]]}}\n",
+		"AS number zero":               "policy: {default_action: deny}\nsets: {asns: {type: asn, values: [0]}}\n",
+		"set answer":                   "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, on_unavailable: allow}}\n",
+		"set refresh":                  "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, refresh: 10}}\n",
+		"set max entries":              "policy: {default_action: deny}\nsets: {office: {type: cidr, file: o.txt, max_entries: 0}}\n",
+		"unknown key":                  "policy: {default_action: deny}\nserver:\n  lisen: :9001\n",
+		"unknown value":                "policy: {default_action: maybe}\n",
+		"unknown log level":            "policy: {default_action: deny}\nlog: {level: trace}\n",
+		"number for a duration":        "policy: {default_action: deny}\nserver: {drain_delay: 5}\n",
+		"duration without unit":        "policy: {default_action: deny}\nserver: {drain_delay: \"5\"}\n",
+		"duration in days":             "policy: {default_action: deny}\nserver: {drain_delay: 1d}\n",
+		"string for an integer":        "policy: {default_action: deny}\nserver: {max_concurrent_streams: \"16\"}\n",
+		"integer below bound":          "policy: {default_action: deny}\nserver: {max_concurrent_streams: 0}\n",
+		"integer above bound":          "policy: {default_action: deny}\nserver: {max_concurrent_streams: 4294967296}\n",
+		"listen without port":          "policy: {default_action: deny}\nserver: {listen: localhost}\n",
+		"admin on a socket":            "policy: {default_action: deny}\nadmin: {listen: \"unix:/run/admin.sock\"}\n",
+		"scalar for a mapping":         "policy: deny\n",
+		"unknown source":               "policy: {default_action: deny}\nclient_ip: {from: forwarded}\n",
+		"header name with space":       "policy: {default_action: deny}\nclient_ip: {from: header, header: \"x client\"}\n",
+		"negative trusted hops":        "policy: {default_action: deny}\nclient_ip: {from: x_forwarded_for, trusted_hops: -1}\n",
+		"unknown policy mode":          "policy: {default_action: deny, mode: observe}\n",
+		"status out of range":          "policy: {default_action: deny, deny_response: {status: 302}}\n",
+		"header value not a string":    "policy: {default_action: deny, deny_response: {headers: {x-a: 1}}}\n",
+		"rules not a list":             "policy: {default_action: deny, rules: {}}\n",
+		"rule without a name":          "policy: {default_action: deny, rules: [{action: deny}]}\n",
+		"rule name":                    "policy: {default_action: deny, rules: [{name: Office, action: deny}]}\n",
+		"unknown rule key":             "policy: {default_action: deny, rules: [{name: r, action: deny, then: x}]}\n",
+		"rule action":                  "policy: {default_action: deny, rules: [{name: r, action: block}]}\n",
+		"rule status":                  "policy: {default_action: deny, rules: [{name: r, action: deny, response: {status: 200}}]}\n",
+		"too many rules":               "policy: {default_action: deny, rules: [" + strings.Repeat("{name: r, action: deny, when: \"false\"},", MaxRules+1) + "]}\n",
+		"decision field name":          "policy: {default_action: deny}\nlog: {decision_fields: {Country: request.host}}\n",
+		"decision field not a string":  "policy: {default_action: deny}\nlog: {decision_fields: {host: [request.host]}}\n",
+		"too many decision fields":     "policy: {default_action: deny}\nlog:\n  decision_fields:\n" + manyEntries("f", MaxDecisionFields+1),
+		"upstream header name":         "policy: {default_action: deny}\nupstream: {headers: {\"x client\": request.host}}\n",
+		"upstream header not a string": "policy: {default_action: deny}\nupstream: {headers: {x-host: 1}}\n",
+		"too many upstream headers":    "policy: {default_action: deny}\nupstream:\n  headers:\n" + manyEntries("x-h", MaxUpstreamHeaders+1),
+		"unknown upstream key":         "policy: {default_action: deny}\nupstream: {header: {}}\n",
+		"secret headers not a list":    "policy: {default_action: deny}\nsecret_headers: x-api-key\n",
+		"secret header name":           "policy: {default_action: deny}\nsecret_headers: [\"x api key\"]\n",
+		"secret header not a string":   "policy: {default_action: deny}\nsecret_headers: [1]\n",
+		"secret header twice":          "policy: {default_action: deny}\nsecret_headers: [x-api-key, x-api-key]\n",
+		"too many secret headers":      "policy: {default_action: deny}\nsecret_headers: [" + strings.TrimSuffix(strings.Repeat("x-h,", MaxSecretHeaders+1), ",") + "]\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			data := []byte(text)
@@ -750,4 +837,14 @@ func TestJSONSchemaRejectsInvalidConfigurations(t *testing.T) {
 			}
 		})
 	}
+}
+
+// manyEntries writes n entries of a mapping of expressions, at the indent
+// of the keys of a block, named prefix0, prefix1 and so on.
+func manyEntries(prefix string, n int) string {
+	var b strings.Builder
+	for i := range n {
+		fmt.Fprintf(&b, "    %s%d: request.host\n", prefix, i)
+	}
+	return b.String()
 }
