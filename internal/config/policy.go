@@ -47,12 +47,12 @@ func (c *Config) validatePolicy() error {
 	if len(p.Rules) > MaxRules {
 		return c.err("policy.rules", "more than "+strconv.Itoa(MaxRules)+" rules")
 	}
-	env, err := expr.NewEnv(expr.Options{Sets: c.SetDeclarations(), Databases: c.DatabaseKinds(), SecretHeaders: c.SecretHeaderNames()})
+	env, err := expr.NewEnv(expr.Options{Sets: c.SetDeclarations(), Databases: c.DatabaseKinds(), UserAgent: c.Enrichment.UserAgent != nil, SecretHeaders: c.SecretHeaderNames()})
 	if err != nil {
 		return errors.New("configuration: cannot prepare the expressions")
 	}
 	names := map[string]int{}
-	u := uses{sets: map[string]bool{}, databases: map[enrichment.Kind]bool{}}
+	u := &uses{sets: map[string]bool{}, databases: map[enrichment.Kind]bool{}}
 	for i := range p.Rules {
 		if err := c.validateRule(env, i, names, u); err != nil {
 			return err
@@ -64,7 +64,7 @@ func (c *Config) validatePolicy() error {
 	if err := c.validateDecisionFields(env, u); err != nil {
 		return err
 	}
-	// A set or a database that nothing reads is still loaded and checked.
+	// A set or an enrichment that nothing reads is still loaded and checked.
 	for _, k := range c.keys["sets"] {
 		if !u.sets[k.name] {
 			c.warnings = append(c.warnings, Warning{Path: childPath("sets", k.name), Line: k.at.line, Column: k.at.column, Problem: "the set is not used by any rule, upstream header or decision field"})
@@ -77,6 +77,11 @@ func (c *Config) validatePolicy() error {
 			c.warnings = append(c.warnings, Warning{Path: p, Line: at.line, Column: at.column, Problem: "the database is not used by any rule, upstream header or decision field"})
 		}
 	}
+	if c.Enrichment.UserAgent != nil && !u.userAgent {
+		const p = "enrichment.user_agent"
+		at := c.nodes[p]
+		c.warnings = append(c.warnings, Warning{Path: p, Line: at.line, Column: at.column, Problem: "the enrichment is not used by any rule, upstream header or decision field"})
+	}
 	slices.SortStableFunc(c.warnings, func(a, b Warning) int {
 		if a.Line != b.Line {
 			return a.Line - b.Line
@@ -86,16 +91,19 @@ func (c *Config) validatePolicy() error {
 	return nil
 }
 
-// uses are the sets and the databases that the expressions read.
+// uses are the sets, the databases and the analysis of the user-agent header
+// that the expressions read.
 type uses struct {
 	sets      map[string]bool
 	databases map[enrichment.Kind]bool
+	userAgent bool
 }
 
 // add records what e, a compiled expression, reads.
-func (u uses) add(e interface {
+func (u *uses) add(e interface {
 	Sets() []string
 	Databases() []enrichment.Kind
+	ReadsUserAgent() bool
 }) {
 	for _, name := range e.Sets() {
 		u.sets[name] = true
@@ -103,6 +111,7 @@ func (u uses) add(e interface {
 	for _, k := range e.Databases() {
 		u.databases[k] = true
 	}
+	u.userAgent = u.userAgent || e.ReadsUserAgent()
 }
 
 // forbiddenUpstreamHeaders are the headers that change the meaning of the
@@ -113,7 +122,7 @@ var forbiddenUpstreamHeaders = []string{"host", "content-length", "transfer-enco
 
 // validateUpstream checks upstream.headers: their number, their names, in the
 // order of the file, and their expressions, whose reads it adds to used.
-func (c *Config) validateUpstream(env *expr.Env, used uses) error {
+func (c *Config) validateUpstream(env *expr.Env, used *uses) error {
 	const path = "upstream.headers"
 	if len(c.Upstream.Headers) > MaxUpstreamHeaders {
 		return c.err(path, "more than "+strconv.Itoa(MaxUpstreamHeaders)+" headers")
@@ -141,7 +150,7 @@ func (c *Config) validateUpstream(env *expr.Env, used uses) error {
 
 // validateDecisionFields checks the expressions of log.decision_fields, in
 // the order of the file, and adds their reads to used.
-func (c *Config) validateDecisionFields(env *expr.Env, used uses) error {
+func (c *Config) validateDecisionFields(env *expr.Env, used *uses) error {
 	const path = "log.decision_fields"
 	for _, k := range c.keys[path] {
 		text := string(c.Log.DecisionFields[k.name])
@@ -166,7 +175,7 @@ func (c *Config) compileError(report, path, text string, err error) error {
 
 // validateRule checks the rule i, and adds the sets and the databases that
 // its condition reads to used.
-func (c *Config) validateRule(env *expr.Env, i int, names map[string]int, used uses) error {
+func (c *Config) validateRule(env *expr.Env, i int, names map[string]int, used *uses) error {
 	r := &c.Policy.Rules[i]
 	path := itemPath("policy.rules", i)
 	switch {

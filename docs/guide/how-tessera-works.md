@@ -13,9 +13,9 @@ Envoy asks tessera about each HTTP request, and tessera answers with a decision.
 ```mermaid
 flowchart TD
     accTitle: The path of a request through tessera
-    accDescr: Envoy sends tessera a check request. tessera reads the client address from it. The enrichments describe the client address, and the sets hold the lists that the rules look values up in. The policy rules read the request, the client address, the enrichments and the sets, and decide. A denial gives Envoy the response for the client; an allowed request goes on to the upstream with the upstream headers. tessera then counts the decision in its metrics and writes a decision event for it when the configuration selects it.
+    accDescr: Envoy sends tessera a check request. tessera reads the client address from it. The enrichments describe the client address and the client software, and the sets hold the lists that the rules look values up in. The policy rules read the request, the client address, the enrichments and the sets, and decide. A denial gives Envoy the response for the client; an allowed request goes on to the upstream with the upstream headers. tessera then counts the decision in its metrics and writes a decision event for it when the configuration selects it.
     envoy([Envoy: check request]) --> address[Client address]
-    address --> enrichments[Enrichments: geo, asn]
+    address --> enrichments[Enrichments: geo, asn, ua]
     enrichments --> sets[Sets]
     sets --> rules{Policy rules}
     rules -- deny --> denial[Denial: status, body, headers]
@@ -24,7 +24,7 @@ flowchart TD
     allowed --> record
 ```
 
-Each step can use what the steps above it give: an enrichment describes the client address, a set can be looked up with the client address or with an enrichment, as in `sets.hosting.contains(asn.number)`, and a rule reads all of them. tessera does not run the steps one after the other, though: it reads the client address with the request, and an enrichment or a set only when an expression reads it (see [What a decision reads](#what-a-decision-reads)).
+Each step can use what the steps above it give: an enrichment describes the client address or the client software, a set can be looked up with the client address or with an enrichment, as in `sets.hosting.contains(asn.number)`, and a rule reads all of them. tessera does not run the steps one after the other, though: it reads the client address with the request, and an enrichment or a set only when an expression reads it (see [What a decision reads](#what-a-decision-reads)).
 
 ### Envoy asks
 
@@ -36,11 +36,11 @@ tessera reads the address of the client from the one source that [`client_ip`](.
 
 ### Enrichments
 
-An enrichment is a group of attributes that tessera derives from the client address, and that every expression can read. tessera has two: `geo`, where the address is, from its country to its coordinates, and `asn`, its autonomous system, which it reads from files in the MaxMind DB format that [`enrichment`](../reference/configuration.md#enrichment) names. [Enrich requests](./enrichments.md) shows how to get the files, keep them up to date and use them; [`geo`](../reference/expressions.md#geo) and [`asn`](../reference/expressions.md#asn) list the attributes.
+An enrichment is a group of attributes that tessera derives from the request, and that every expression can read. tessera has three, which [`enrichment`](../reference/configuration.md#enrichment) configures. Two describe the client address: `geo`, where the address is, from its country to its coordinates, and `asn`, its autonomous system, which tessera reads from files in the MaxMind DB format. The third, `ua`, describes the client software, from the `user-agent` header of the request, without a file: its browser, its operating system, the kind of device, and whether it is a bot. [Enrich requests](./enrichments.md) shows how to get the files, keep them up to date and use the enrichments; [`geo`](../reference/expressions.md#geo), [`asn`](../reference/expressions.md#asn) and [`ua`](../reference/expressions.md#ua) list the attributes.
 
 ### Sets
 
-A set is a named list of networks, autonomous system numbers or strings, declared in [`sets`](../reference/configuration.md#sets) with its values or a file, that a condition looks a value up in with `sets.<name>.contains(value)`. Sets keep the lists that change on their own, such as a block list, apart from the rules. [Use sets](./sets.md) shows how to declare and update them, and [Sets](../reference/expressions.md#sets) in the expression language reference how `contains` reads them.
+A set is a named list of networks, autonomous system numbers, strings or geographic areas, declared in [`sets`](../reference/configuration.md#sets) with its values or a file, that a condition looks a value up in with `sets.<name>.contains(value)`. Sets keep the lists that change on their own, such as a block list, apart from the rules. [Use sets](./sets.md) shows how to declare and update them, and [Sets](../reference/expressions.md#sets) in the expression language reference how `contains` reads them.
 
 ### Policy rules
 
@@ -66,7 +66,7 @@ tessera loads the sets and the files of the enrichments into memory before it op
 
 | On the request path, for each decision | In the background |
 | --- | --- |
-| Read the request and its client address, then evaluate the rules in order, with the enrichments and the sets that they read. | Check the file of each set and of each enrichment every `refresh`, and replace the copy in memory when the file has new valid content. |
+| Read the request and its client address, then evaluate the rules in order, with the enrichments and the sets that they read. | Check the file of each set and of each database of the enrichments every `refresh`, and replace the copy in memory when the file has new valid content. |
 | Compute the upstream headers of a request that Envoy sends on. | Make a set read from a file unavailable once its copy is older than its [`max_staleness`](../reference/configuration.md#sets-name-max-staleness), and available again at its next successful check. |
 | Count the decision in the metrics, queue its `decision` event with its decision fields when tessera writes one, and answer Envoy. | Write the queued `decision` events to standard output, and the reports of the conditions that could not be evaluated. |
 
@@ -76,13 +76,13 @@ A `decision` event that does not fit its queue is dropped and counted, rather th
 
 tessera reads its configuration file once, when it starts, and checks all of it before it opens a socket: every key, every expression, every set and every file of an enrichment. An error stops it with exit status 2 before it serves anything (see [Startup](../reference/cli.md#startup)). The configuration does not change while tessera runs: a change to the file takes effect when tessera starts again.
 
-The data that the configuration points to changes without a restart. tessera checks the file of each set every [`sets.<name>.refresh`](../reference/configuration.md#sets-name-refresh) and the file of each enrichment every [`enrichment.geo.refresh`](../reference/configuration.md#enrichment-geo-refresh) or [`enrichment.asn.refresh`](../reference/configuration.md#enrichment-asn-refresh). A file with new valid content replaces the copy in use, atomically. A file that is missing or invalid does not: tessera keeps the copy it has, and a set read from a file becomes unavailable only once its copy is older than its `max_staleness`. The [failure modes](../reference/failure-modes.md) list what happens in each case, and the events and metrics of each load show it as it happens.
+The data that the configuration points to changes without a restart. tessera checks the file of each set every [`sets.<name>.refresh`](../reference/configuration.md#sets-name-refresh) and the file of each database of the enrichments every [`enrichment.geo.refresh`](../reference/configuration.md#enrichment-geo-refresh) or [`enrichment.asn.refresh`](../reference/configuration.md#enrichment-asn-refresh). A file with new valid content replaces the copy in use, atomically. A file that is missing or invalid does not: tessera keeps the copy it has, and a set read from a file becomes unavailable only once its copy is older than its `max_staleness`. The [failure modes](../reference/failure-modes.md) list what happens in each case, and the events and metrics of each load show it as it happens.
 
 ### What a decision reads
 
-Each decision reads one consistent state. Every expression of a decision, whether a condition, an upstream header or a decision field, reads the same request and the same copies of the sets and of the enrichments: those in use when the decision started. A copy replaced meanwhile serves the next decisions (see [Sets](../reference/expressions.md#sets) in the expression language reference).
+Each decision reads one consistent state. Every expression of a decision, whether a condition, an upstream header or a decision field, reads the same request and the same copies of the sets and of the databases of the enrichments: those in use when the decision started. A copy replaced meanwhile serves the next decisions (see [Sets](../reference/expressions.md#sets) in the expression language reference).
 
-tessera looks the client address up in an enrichment only when an expression reads it, at the first read in a decision, and every later read in the same decision reuses the result: a request that a rule decides before any expression reads `geo` or `asn` looks nothing up (see [When tessera computes an enrichment](../reference/expressions.md#when-tessera-computes-an-enrichment)).
+tessera computes an enrichment only when an expression reads it, at the first read in a decision, and every later read in the same decision reuses the result: it looks the client address up in a database for `geo` and `asn`, and analyzes the `user-agent` header for `ua`. A request that a rule decides before any expression reads them computes nothing (see [When tessera computes an enrichment](../reference/expressions.md#when-tessera-computes-an-enrichment)). The records of recent `user-agent` headers stay in a cache of limited size that every decision shares, and a header found there is not analyzed again (see [`enrichment.user_agent.cache_entries`](../reference/configuration.md#enrichment-user-agent-cache-entries)).
 
 ### Failures close
 

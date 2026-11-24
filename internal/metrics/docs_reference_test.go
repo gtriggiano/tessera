@@ -12,6 +12,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/gtriggiano/tessera/internal/useragent"
 )
 
 // metricsReference is the metrics reference that this test keeps equal to
@@ -32,7 +34,7 @@ type family struct {
 // see, so that no family escapes the comparison.
 func exportedFamilies(t *testing.T) map[string]family {
 	t.Helper()
-	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases, useragent.New(100))
 	got := map[string]family{}
 	for name, f := range gather(t, m) {
 		if !strings.HasPrefix(name, namespace+"_") {

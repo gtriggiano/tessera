@@ -1,8 +1,8 @@
 // Package expr compiles and evaluates the expressions of tessera, written in
 // CEL: the conditions of the rules, and the string expressions of the
 // upstream headers and of the decision fields. It declares the variables
-// request, client, sets, geo and asn, their types, tessera's functions on IP
-// addresses and sets, and the limits of an expression.
+// request, client, sets, geo, asn and ua, their types, tessera's functions on
+// IP addresses and sets, and the limits of an expression.
 //
 // An expression is compiled once, at startup, and type-checked: an unknown
 // attribute, a wrong type or a result of another type than the one expected
@@ -91,6 +91,9 @@ type Options struct {
 	// Databases are the kinds of the configured databases: an expression
 	// can read geo, or asn, only when its kind is among them.
 	Databases []enrichment.Kind
+	// UserAgent: the analysis of the user-agent header is configured, and
+	// an expression can read ua.
+	UserAgent bool
 	// SecretHeaders are the names of the secret headers, in any case, in
 	// addition to AlwaysSecretHeaders: a decision field cannot read them.
 	SecretHeaders []string
@@ -109,7 +112,7 @@ type Env struct {
 
 // NewEnv returns an Env.
 func NewEnv(opts Options) (*Env, error) {
-	lib := &library{onPanic: opts.OnPanic, parseNetwork: parseNetwork, sets: slices.Clone(opts.Sets), databases: slices.Clone(opts.Databases), secrets: slices.Clone(AlwaysSecretHeaders)}
+	lib := &library{onPanic: opts.OnPanic, parseNetwork: parseNetwork, sets: slices.Clone(opts.Sets), databases: slices.Clone(opts.Databases), userAgent: opts.UserAgent, secrets: slices.Clone(AlwaysSecretHeaders)}
 	for _, name := range opts.SecretHeaders {
 		lib.secrets = append(lib.secrets, strings.ToLower(name))
 	}
@@ -125,6 +128,7 @@ func NewEnv(opts Options) (*Env, error) {
 		cel.Variable("sets", setsType),
 		cel.Variable("geo", geoType),
 		cel.Variable("asn", asnType),
+		cel.Variable("ua", userAgentType),
 		cel.ParserExpressionSizeLimit(MaxLength),
 	}
 	env, err := cel.NewEnv(append(envOpts, lib.envOptions()...)...)
@@ -139,6 +143,7 @@ func NewEnv(opts Options) (*Env, error) {
 			// regular expression, once, when the program is built.
 			cel.EvalOptions(cel.OptOptimize),
 			cel.CustomDecoratorV2(lib.prepareInCidr),
+			cel.CustomDecoratorV2(lib.prepareAreaContains),
 			cel.CostLimit(CostLimit),
 			cel.CostTrackerOptions(costOptions()...),
 		},
@@ -147,7 +152,7 @@ func NewEnv(opts Options) (*Env, error) {
 
 // validatorMessages start the messages of the validators of the
 // environment, which hold no text of the expression.
-var validatorMessages = []string{"invalid network: ", errNetworkLiteral.Error(), "invalid regular expression: ", "comprehension exceeds nesting limit", errSetUse.Error(), "geo is not available: ", "asn is not available: ", "a decision field "}
+var validatorMessages = []string{"invalid network: ", errNetworkLiteral.Error(), "invalid regular expression: ", "comprehension exceeds nesting limit", errSetUse.Error(), "geo is not available: ", "asn is not available: ", errUserAgentMissing.Error(), "a decision field "}
 
 // SyntaxError is the message of an issue of the parser.
 const SyntaxError = "syntax error in the expression"
@@ -206,6 +211,7 @@ type program struct {
 	attributes []string
 	sets       []string
 	databases  []enrichment.Kind
+	userAgent  bool
 	lib        *library
 }
 
@@ -320,7 +326,7 @@ func (e *Env) compile(text string, want *types.Type, wrong string, field bool) (
 	if err != nil {
 		return nil, program{}, &CompileError{Issues: []Issue{{Line: 1, Column: 1, Message: "the expression cannot be prepared for evaluation"}}}
 	}
-	return native, program{prg: prg, attributes: attributes(native.Expr(), native.ReferenceMap()), sets: setsRead(native), databases: databasesRead(native), lib: e.lib}, nil
+	return native, program{prg: prg, attributes: attributes(native.Expr(), native.ReferenceMap()), sets: setsRead(native), databases: databasesRead(native), userAgent: userAgentRead(native), lib: e.lib}, nil
 }
 
 func issue(loc common.Location, message string) Issue {
@@ -421,14 +427,15 @@ func (p *program) classify(err error, in *Input) *EvalError {
 }
 
 // Attributes returns the attributes that the expression reads, sorted:
-// request.host, client.ip, geo.city and the others by name, the headers as
-// request.headers["name"] when the condition names them with a literal
-// key, or as request.headers when it reads the map otherwise; a field of an
-// object of geo, its country, continent or location, as geo.country.code or
-// geo.location.lat, or the object as geo.country when the expression reads
-// it as a whole, as has(geo.location) and geo.country == geo.country do; and
-// geo.subdivisions for any read of the list or of its items, such as
-// geo.subdivisions[0].code or a macro over it.
+// request.host, client.ip, geo.city, ua.device and the others by name, the
+// headers as request.headers["name"] when the condition names them with a
+// literal key, or as request.headers when it reads the map otherwise; a
+// field of an object of geo, its country, continent or location, or of ua,
+// its browser, operating system or bot, as geo.country.code,
+// geo.location.lat or ua.browser.name, or the object as geo.country or
+// ua.browser when the expression reads it as a whole, as has(geo.location)
+// and ua.browser == ua.browser do; and geo.subdivisions for any read of the
+// list or of its items, such as geo.subdivisions[0].code or a macro over it.
 func (p *program) Attributes() []string {
 	return p.attributes
 }
@@ -442,6 +449,17 @@ func (p *program) Sets() []string {
 // through geo or asn, sorted.
 func (p *program) Databases() []enrichment.Kind {
 	return p.databases
+}
+
+// ReadsUserAgent reports whether the expression reads ua.
+func (p *program) ReadsUserAgent() bool {
+	return p.userAgent
+}
+
+// userAgentRead reports whether a reads the variable ua, not an iteration
+// variable of the same name.
+func userAgentRead(a *ast.AST) bool {
+	return len(ast.MatchDescendants(ast.NavigateAST(a), func(e ast.NavigableExpr) bool { return isUserAgent(a, e) })) > 0
 }
 
 // databasesRead lists the databases that a reads: the variables geo and
@@ -477,11 +495,15 @@ func setsRead(a *ast.AST) []string {
 	return out
 }
 
-// geoObjects are the fields of geo whose values are objects.
-var geoObjects = []string{"continent", "country", "location"}
+// objectFields are the fields of geo and ua whose values are objects, by
+// the name of the variable.
+var objectFields = map[string][]string{
+	"geo": {"continent", "country", "location"},
+	"ua":  {"bot", "browser", "os"},
+}
 
 // attributes lists the attributes that e reads. refs tells the variables
-// request, client, geo and asn from iteration variables of the same name.
+// request, client, geo, asn and ua from iteration variables of the same name.
 func attributes(e ast.Expr, refs map[int64]*ast.ReferenceInfo) []string {
 	found := map[string]bool{}
 	variable := func(e ast.Expr, name string) bool {
@@ -492,10 +514,18 @@ func attributes(e ast.Expr, refs map[int64]*ast.ReferenceInfo) []string {
 	headers := func(e ast.Expr) bool {
 		return e.Kind() == ast.SelectKind && e.AsSelect().FieldName() == "headers" && variable(e.AsSelect().Operand(), "request")
 	}
-	// geoObject reports whether e reads an object of geo, without testing
-	// it.
-	geoObject := func(e ast.Expr) bool {
-		return e.Kind() == ast.SelectKind && !e.AsSelect().IsTestOnly() && slices.Contains(geoObjects, e.AsSelect().FieldName()) && variable(e.AsSelect().Operand(), "geo")
+	// objectOf returns the variable, geo or ua, whose object e reads,
+	// without testing it, or an empty string.
+	objectOf := func(e ast.Expr) string {
+		if e.Kind() != ast.SelectKind || e.AsSelect().IsTestOnly() {
+			return ""
+		}
+		for name, fields := range objectFields {
+			if slices.Contains(fields, e.AsSelect().FieldName()) && variable(e.AsSelect().Operand(), name) {
+				return name
+			}
+		}
+		return ""
 	}
 	literal := func(e ast.Expr) (string, bool) {
 		if e.Kind() != ast.LiteralKind {
@@ -511,10 +541,10 @@ func attributes(e ast.Expr, refs map[int64]*ast.ReferenceInfo) []string {
 		case ast.SelectKind:
 			sel := e.AsSelect()
 			switch op := sel.Operand(); {
-			case variable(op, "request") || variable(op, "client") || variable(op, "geo") || variable(op, "asn"):
+			case variable(op, "request") || variable(op, "client") || variable(op, "geo") || variable(op, "asn") || variable(op, "ua"):
 				found[op.AsIdent()+"."+sel.FieldName()] = true
-			case geoObject(op):
-				found["geo."+op.AsSelect().FieldName()+"."+sel.FieldName()] = true
+			case objectOf(op) != "":
+				found[objectOf(op)+"."+op.AsSelect().FieldName()+"."+sel.FieldName()] = true
 			case headers(op):
 				header(sel.FieldName())
 			default:

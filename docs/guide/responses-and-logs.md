@@ -105,7 +105,7 @@ policy:
       when: '"x-api-key" in request.headers && request.headers["x-api-key"].startsWith("k-")'
 ```
 
-Conditions and upstream headers read a secret header as any other. What tessera writes keeps its value out: a decision field cannot read it, so no event holds it, and `tessera eval` shows it as `[REDACTED]`, together with the value of an upstream header that reads it.
+Conditions and upstream headers read a secret header as any other. What tessera writes keeps its value out: a decision field cannot read it, so no event holds it, and `tessera eval` shows it as `[REDACTED]`, together with the value of an upstream header that reads it. Only the value is secret: what tessera derives from the header is not, such as the attributes of `ua` with `user-agent` among the secret headers (see [`secret_headers`](../reference/configuration.md#secret-headers)).
 
 ## See them before you deploy
 

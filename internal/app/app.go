@@ -6,10 +6,11 @@
 //
 // The sets and the databases are loaded before Run, by LoadSets and
 // LoadDatabases: an invalid one is a configuration error. Run builds the
-// engine on them and the metrics, logs starting, a config_warning for each
-// warning of the configuration, a set_loaded for each set and a
-// database_loaded for each database, then builds the gRPC server and the
-// admin server before it opens any socket. It opens the gRPC listener, then
+// analysis of the user-agent header, with its cache, the engine on them and
+// the metrics, logs starting, a config_warning for each warning of the
+// configuration, a set_loaded for each set and a database_loaded for each
+// database, then builds the gRPC server and the admin server before it opens
+// any socket. It opens the gRPC listener, then
 // the admin listener, resolving their host names within listenTimeout; if
 // one cannot open, the other is closed, startup_failed is logged and Run
 // fails. A signal received while a listener opens cancels it. Once both are
@@ -109,6 +110,7 @@ import (
 	"github.com/gtriggiano/tessera/internal/sets"
 	"github.com/gtriggiano/tessera/internal/source"
 	"github.com/gtriggiano/tessera/internal/telemetry"
+	"github.com/gtriggiano/tessera/internal/useragent"
 )
 
 // The names of the listeners in the log events.
@@ -191,7 +193,13 @@ func Run(cfg *config.Config, opts Options) error {
 	}
 	policy := EnginePolicy(cfg)
 	declared := loaded.Store.Declarations()
-	m := metrics.New(opts.Build, opts.ConfigHash, policy, declared, databases.Store.Kinds())
+	// The analysis of the user-agent header, whose cache every decision
+	// shares.
+	var userAgent *useragent.Analyzer
+	if cfg.Enrichment.UserAgent != nil {
+		userAgent = useragent.New(cfg.Enrichment.UserAgent.CacheEntries)
+	}
+	m := metrics.New(opts.Build, opts.ConfigHash, policy, declared, databases.Store.Kinds(), userAgent)
 	rules := make([]string, len(policy.Rules))
 	for i, r := range policy.Rules {
 		rules[i] = r.Name
@@ -209,7 +217,7 @@ func Run(cfg *config.Config, opts Options) error {
 	}})
 	var decider extauthz.Decider = opts.decider
 	if decider == nil {
-		e, err := engine.New(policy, engine.Options{OnPanic: recorder.Panic, Sets: loaded.Store, Databases: databases.Store})
+		e, err := engine.New(policy, engine.Options{OnPanic: recorder.Panic, Sets: loaded.Store, Databases: databases.Store, UserAgent: userAgent})
 		if err != nil {
 			_ = recorder.Close(context.Background())
 			return err
@@ -521,10 +529,16 @@ func (o observed) Decide(r *request.Request) engine.Decision {
 }
 
 // NewEngine builds the engine of a valid configuration, whose expressions
-// read the sets of store and the databases of dbs. onPanic, when set,
-// receives the panics recovered while an expression is evaluated.
+// read the sets of store and the databases of dbs, and analyze the
+// user-agent header, when the configuration has the analysis, without a
+// cache: the engine of tessera eval, which decides one request. onPanic, when
+// set, receives the panics recovered while an expression is evaluated.
 func NewEngine(cfg *config.Config, store *sets.Store, dbs *enrichment.Store, onPanic func(*expr.Panic)) (*engine.Engine, error) {
-	return engine.New(EnginePolicy(cfg), engine.Options{OnPanic: onPanic, Sets: store, Databases: dbs})
+	var userAgent *useragent.Analyzer
+	if cfg.Enrichment.UserAgent != nil {
+		userAgent = useragent.New(0)
+	}
+	return engine.New(EnginePolicy(cfg), engine.Options{OnPanic: onPanic, Sets: store, Databases: dbs, UserAgent: userAgent})
 }
 
 // refresherGroups are the refreshers of the sets and of the databases.

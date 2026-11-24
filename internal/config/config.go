@@ -113,12 +113,14 @@ func (c ClientIP) MarshalYAML() (any, error) {
 	}{c.From}, nil
 }
 
-// Enrichment holds the databases that the attributes geo and asn read. A
-// block that the file does not write is nil, and its attribute does not
-// exist; config print leaves it out.
+// Enrichment holds the databases that the attributes geo and asn read, and
+// the analysis of the user-agent header that the attribute ua reads. A block
+// that the file does not write is nil, and its attribute does not exist;
+// config print leaves it out.
 type Enrichment struct {
-	Geo *Database `yaml:"geo,omitempty"`
-	ASN *Database `yaml:"asn,omitempty"`
+	Geo       *Database  `yaml:"geo,omitempty"`
+	ASN       *Database  `yaml:"asn,omitempty"`
+	UserAgent *UserAgent `yaml:"user_agent,omitempty"`
 }
 
 // Database is a MaxMind DB file, which tessera reads at startup and checks
@@ -133,6 +135,17 @@ func (d *Database) setDefaults() {
 	d.Refresh = DefaultDatabaseRefresh
 }
 
+// UserAgent is the analysis of the user-agent header, which has no file: the
+// cache of its records, shared by the decisions, holds at most CacheEntries
+// of them; 0 disables it.
+type UserAgent struct {
+	CacheEntries int `yaml:"cache_entries"`
+}
+
+func (u *UserAgent) setDefaults() {
+	u.CacheEntries = DefaultUserAgentCacheEntries
+}
+
 // Database returns the database of kind k, or nil when the configuration
 // does not have it.
 func (e Enrichment) Database(k enrichment.Kind) *Database {
@@ -145,9 +158,9 @@ func (e Enrichment) Database(k enrichment.Kind) *Database {
 	return nil
 }
 
-// Set is a named set: its type and its one source, values or file. Refresh,
-// MaxStaleness and OnUnavailable belong to a file: they are errors with
-// values, whose set is always available.
+// Set is a named set: its type and its one source, values or file; an area
+// set has a file only. Refresh, MaxStaleness and OnUnavailable belong to a
+// file: they are errors with values, whose set is always available.
 type Set struct {
 	Type   string     `yaml:"type"`
 	Values []SetValue `yaml:"values"`
@@ -325,6 +338,7 @@ const (
 	SetTypeCIDR   = string(sets.CIDR)
 	SetTypeASN    = string(sets.ASN)
 	SetTypeString = string(sets.String)
+	SetTypeArea   = string(sets.Area)
 )
 
 // The values of sets.<name>.on_unavailable.
@@ -346,6 +360,12 @@ const (
 const (
 	DefaultDatabaseRefresh = time.Minute
 	MinDatabaseRefresh     = time.Second
+)
+
+// The default and the limit of enrichment.user_agent.cache_entries.
+const (
+	DefaultUserAgentCacheEntries = 10_000
+	MaxUserAgentCacheEntries     = 1_000_000
 )
 
 // The values of policy.default_action and policy.rules[].action.

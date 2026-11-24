@@ -7,7 +7,7 @@ description: "The problem tessera solves, what it leaves to other tools, and how
 **tessera** is an external authorization service for [Envoy](https://www.envoyproxy.io/). This page describes the problem it solves, what it leaves to other tools, and how it compares with the alternatives.
 
 ::: warning In development
-tessera has no release yet. [`tessera serve`](../reference/cli.md#tessera-serve) decides Envoy's authorization requests with [ordered rules](./policy-rules.md) on the host, method, path and headers of each request, on the client address, on the location and autonomous system that [enrichments](./enrichments.md) derive from it with MaxMind DB files, and on [sets](./sets.md) of networks, AS numbers or strings written in the configuration or read from local files. It reloads those files when they change.
+tessera has no release yet. [`tessera serve`](../reference/cli.md#tessera-serve) decides Envoy's authorization requests with [ordered rules](./policy-rules.md) on the host, method, path and headers of each request, on the client address, on the location and autonomous system that [enrichments](./enrichments.md) derive from it with MaxMind DB files, on the client software that they recognize in the `user-agent` header, such as the browser, the kind of device or a bot, and on [sets](./sets.md) of networks, AS numbers or strings written in the configuration or read from local files, or of geographic areas read from GeoJSON files. It reloads those files when they change.
 :::
 
 ## The problem
@@ -21,7 +21,7 @@ Teams that run an ingress based on Envoy often need to answer questions like the
 
 Envoy's own filters answer part of this: the RBAC filter, for example, matches addresses and headers against lists written in Envoy's configuration, so updating a list means updating that configuration. General-purpose policy engines can answer all of it, but they ask you to learn a language, to source the data and to build the rest yourself.
 
-tessera sits in between. Envoy asks it about each HTTP request through the `ext_authz` filter, and tessera decides from who sends the request (address, network, location, autonomous system) and what it asks for (host, method, path, headers), with ordered rules declared in one YAML file. [How tessera works](./how-tessera-works.md) follows a request through these steps.
+tessera sits in between. Envoy asks it about each HTTP request through the `ext_authz` filter, and tessera decides from who sends the request (address, network, location, autonomous system, client software) and what it asks for (host, method, path, headers), with ordered rules declared in one YAML file. [How tessera works](./how-tessera-works.md) follows a request through these steps.
 
 ## What it leaves to other tools
 

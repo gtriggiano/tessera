@@ -113,7 +113,9 @@ func TestInvalidSets(t *testing.T) {
 		{"null set", "sets:\n  office:\n", "sets.office (line 2, column 10): null is not allowed; omit the key to use its default"},
 		{"unknown key", "sets:\n  office: {type: cidr, values: [], url: x}\n", "sets.office.url (line 2, column 36): unknown key"},
 		{"no type", "sets:\n  office:\n    values: []\n", "sets.office.type (line 2, column 3): required"},
-		{"unknown type", "sets:\n  office: {type: area, file: a.geojson}\n", "sets.office.type (line 2, column 18): expected cidr, asn or string"},
+		{"unknown type", "sets:\n  office: {type: polygon, file: a.geojson}\n", "sets.office.type (line 2, column 18): expected cidr, asn, string or area"},
+		{"area of values", "sets:\n  stores:\n    type: area\n    values: []\n", "sets.stores.values (line 4, column 13): not allowed with type area: an area set reads a GeoJSON file"},
+		{"area of values and a file", "sets:\n  stores: {type: area, file: s.geojson, values: []}\n", "sets.stores.file (line 2, column 30): values and file are both set: a set has one source"},
 		{"no source", "sets:\n  office: {type: cidr}\n", "sets.office (line 2, column 3): needs a source: values or file"},
 		{"two sources", "sets:\n  office:\n    type: cidr\n    values: []\n    file: office.txt\n", "sets.office.file (line 5, column 11): values and file are both set: a set has one source"},
 		{"two sources, file first", "sets:\n  office:\n    type: cidr\n    file: office.txt\n    values: []\n", "sets.office.values (line 5, column 13): values and file are both set: a set has one source"},
@@ -268,5 +270,44 @@ func TestLoadSetPaths(t *testing.T) {
 	}
 	if got := c.Sets["office"].File; got != "" {
 		t.Errorf("a set of values has the file %q", got)
+	}
+}
+
+// An area set reads a file, relative to the configuration; contains takes
+// the location of geo.
+func TestAreaSetConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := "enrichment:\n  geo: {database: geo.mmdb}\nsets:\n  stores:\n    type: area\n    file: stores.geojson\n    max_entries: 50\npolicy:\n  default_action: deny\n  rules:\n    - name: stores\n      action: allow\n      when: sets.stores.contains(geo.location)\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Set{Type: "area", File: filepath.Join(dir, "stores.geojson"), Refresh: 10 * time.Second, OnUnavailable: "fail", MaxEntries: 50}
+	if got := c.Sets["stores"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("got  %+v\nwant %+v", got, want)
+	}
+	if got := c.SetDeclarations(); len(got) != 1 || got[0] != (sets.Declaration{Name: "stores", Type: sets.Area, Source: sets.SourceFile, OnUnavailable: sets.Fail}) {
+		t.Errorf("declarations %+v", got)
+	}
+	if got := c.Warnings(); len(got) != 0 {
+		t.Errorf("warnings %+v", got)
+	}
+	// A point of another type, or without enrichment.geo, is an error at
+	// its position in the condition.
+	for when, want := range map[string]string{
+		"sets.stores.contains(client.ip)": "policy.rules[0].when (line 13, column 33): found no matching overload for 'contains' applied to 'tessera.AreaSet.(tessera.IP)'",
+	} {
+		_, err := parse(t, strings.Replace(yaml, "sets.stores.contains(geo.location)", when, 1), nil)
+		if err == nil || err.Error() != want {
+			t.Errorf("%s: %v, want %s", when, err, want)
+		}
+	}
+	_, err = parse(t, strings.Replace(yaml, "enrichment:\n  geo: {database: geo.mmdb}\n", "", 1), nil)
+	if err == nil || err.Error() != "policy.rules[0].when (line 11, column 34): geo is not available: the configuration has no enrichment.geo" {
+		t.Errorf("without enrichment.geo: %v", err)
 	}
 }

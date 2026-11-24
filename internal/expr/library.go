@@ -23,8 +23,8 @@ import (
 	"github.com/gtriggiano/tessera/internal/sets"
 )
 
-// The overload IDs of tessera's functions. The decorator finds the calls of
-// inCidr by its ID.
+// The overload IDs of tessera's functions. The decorators find the calls of
+// inCidr and of contains on an area set by their IDs.
 const (
 	overloadIPInCidr          = "tessera_ip_in_cidr_string"
 	overloadIPFamily          = "tessera_ip_family"
@@ -32,12 +32,13 @@ const (
 	overloadCIDRSetContains   = "tessera_cidr_set_contains_ip"
 	overloadASNSetContains    = "tessera_asn_set_contains_int"
 	overloadStringSetContains = "tessera_string_set_contains_string"
+	overloadAreaSetContains   = "tessera_area_set_contains_point"
 )
 
 // setContainsOverloads are the overloads of contains on a set. Each costs
 // one unit, whatever the size of the set: a lookup in a copy does not grow
 // with it the way a scan does.
-var setContainsOverloads = []string{overloadCIDRSetContains, overloadASNSetContains, overloadStringSetContains}
+var setContainsOverloads = []string{overloadCIDRSetContains, overloadASNSetContains, overloadStringSetContains, overloadAreaSetContains}
 
 // Panic is a panic that tessera recovered while it evaluated a condition.
 type Panic struct {
@@ -64,6 +65,9 @@ type library struct {
 	// databases are the kinds of the configured databases: geo and asn can
 	// be read only when theirs is configured.
 	databases []enrichment.Kind
+	// userAgent: ua can be read, because the analysis of the user-agent
+	// header is configured.
+	userAgent bool
 	// secrets are the names of the secret headers, in lowercase.
 	secrets []string
 }
@@ -109,9 +113,14 @@ func (l *library) envOptions() []cel.EnvOption {
 			cel.MemberOverload(overloadASNSetContains, []*cel.Type{asnSetType, cel.IntType}, cel.BoolType,
 				cel.BinaryBinding(l.binary(asnSetContains))),
 			cel.MemberOverload(overloadStringSetContains, []*cel.Type{stringSetType, cel.StringType}, cel.BoolType,
-				cel.BinaryBinding(l.binary(stringSetContains)))),
+				cel.BinaryBinding(l.binary(stringSetContains))),
+			// Strict, as the others: prepareAreaContains answers false for
+			// a location that is absent, in place of this binding.
+			cel.MemberOverload(overloadAreaSetContains, []*cel.Type{areaSetType, geoPointType}, cel.BoolType,
+				cel.BinaryBinding(l.binary(areaSetContains)))),
 		cel.ASTValidators(
 			databasesValidator{lib: l},
+			userAgentValidator{lib: l},
 			setsValidator{},
 			networkValidator{lib: l},
 			regexValidator{},
@@ -161,6 +170,15 @@ func stringSetContains(set, value ref.Val) ref.Val {
 		return answer
 	}
 	return types.Bool(s.ContainsString(string(value.(types.String))))
+}
+
+func areaSetContains(set, point ref.Val) ref.Val {
+	s, answer := set.(*setVal).inUse()
+	if s == nil {
+		return answer
+	}
+	p := point.(*pointVal)
+	return types.Bool(s.ContainsPoint(p.lat, p.lon))
 }
 
 // oneUnit is the cost of contains on a set.
@@ -230,6 +248,31 @@ func (v databasesValidator) Validate(_ *cel.Env, _ cel.ValidatorConfig, a *ast.A
 		}) {
 			iss.ReportErrorAtID(e.ID(), "%s is not available: the configuration has no enrichment.%s", d.kind, d.kind)
 		}
+	}
+}
+
+// errUserAgentMissing is the message of a read of ua without the analysis of
+// the user-agent header.
+var errUserAgentMissing = errors.New("ua is not available: the configuration has no enrichment.user_agent")
+
+// isUserAgent reports whether e, an expression of a, is the variable ua, not
+// an iteration variable of the same name.
+func isUserAgent(a *ast.AST, e ast.Expr) bool {
+	return e.Kind() == ast.IdentKind && e.AsIdent() == "ua" && a.GetType(e.ID()).IsExactType(userAgentType)
+}
+
+// userAgentValidator reports each read of ua when the configuration does not
+// analyze the user-agent header, at the position of the variable.
+type userAgentValidator struct{ lib *library }
+
+func (userAgentValidator) Name() string { return "tessera.validator.user_agent" }
+
+func (v userAgentValidator) Validate(_ *cel.Env, _ cel.ValidatorConfig, a *ast.AST, iss *cel.Issues) {
+	if v.lib.userAgent {
+		return
+	}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(a), func(e ast.NavigableExpr) bool { return isUserAgent(a, e) }) {
+		iss.ReportErrorAtID(e.ID(), "%s", errUserAgentMissing)
 	}
 }
 
@@ -490,6 +533,59 @@ func (c *inCidrCall) Eval(act interpreter.Activation) ref.Val {
 	return c.Exec(interpreter.AsFrame(act))
 }
 
+// prepareAreaContains is an interpreter decorator: it replaces each call of
+// contains on an area set with one that answers false when the point is the
+// location of a record without one, instead of failing. contains stays
+// strict for every other argument that fails, and for the other overloads of
+// contains, which the decorator leaves alone: making the overload non-strict
+// would make every overload of contains non-strict, the string one included.
+func (l *library) prepareAreaContains(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	call, ok := i.(interpreter.InterpretableCall)
+	if !ok || call.OverloadID() != overloadAreaSetContains {
+		return i, nil
+	}
+	args := call.Args()
+	return &areaContainsCall{InterpretableCall: call, set: args[0], point: args[1], lib: l}, nil
+}
+
+// areaContainsCall evaluates sets.<name>.contains(point) on an area set. It
+// keeps the original call for Function, OverloadID and Args, which the cost
+// tracker reads.
+type areaContainsCall struct {
+	interpreter.InterpretableCall
+	set, point interpreter.InterpretableV2
+	lib        *library
+}
+
+func (c *areaContainsCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	set := c.set.Exec(frame)
+	if types.IsUnknownOrError(set) {
+		return set
+	}
+	point := c.point.Exec(frame)
+	if types.IsUnknownOrError(point) {
+		// geo.location of a record without one is in no area.
+		if err, ok := point.(*types.Err); ok && errors.Is(err, errNoLocation) {
+			return types.False
+		}
+		return point
+	}
+	s, ok := set.(*setVal)
+	if _, isPoint := point.(*pointVal); !ok || !isPoint {
+		return types.MaybeNoSuchOverloadErr(point)
+	}
+	return c.contains(s, point)
+}
+
+func (c *areaContainsCall) contains(set *setVal, point ref.Val) (out ref.Val) {
+	defer c.lib.recoverPanic(&out, set.in)
+	return types.LabelErrNode(c.ID(), areaSetContains(set, point))
+}
+
+func (c *areaContainsCall) Eval(act interpreter.Activation) ref.Val {
+	return c.Exec(interpreter.AsFrame(act))
+}
+
 // unary and binary guard a function binding: a panic becomes an error value
 // that wraps a *Panic with its stack, reported to onPanic, instead of an
 // "internal error" of cel-go for the whole evaluation.
@@ -524,8 +620,8 @@ func inputOf(values ...ref.Val) *Input {
 }
 
 // guardGet guards the reading of a field in the same way: the field belongs
-// to the value of request, client, sets, geo, one of the objects of geo, or
-// asn, which leads to the activation.
+// to the value of request, client, sets, geo, one of the objects of geo, asn,
+// ua or one of the objects of ua, which leads to the activation.
 func (l *library) guardGet(get func(any) (any, error)) func(any) (any, error) {
 	return func(obj any) (out any, err error) {
 		defer func() {
@@ -549,6 +645,14 @@ func (l *library) guardGet(get func(any) (any, error)) func(any) (any, error) {
 				case *pointVal:
 					in = v.in
 				case *asnVal:
+					in = v.in
+				case *userAgentVal:
+					in = v.in
+				case *browserVal:
+					in = v.in
+				case *osVal:
+					in = v.in
+				case *botVal:
 					in = v.in
 				}
 				out, err = nil, l.recovered(r, in)

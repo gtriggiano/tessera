@@ -12,14 +12,16 @@ import (
 	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/request"
 	"github.com/gtriggiano/tessera/internal/sets"
+	"github.com/gtriggiano/tessera/internal/useragent"
 )
 
 // Input is the activation of one request: it answers the variables request,
-// client, sets, geo and asn. It builds the CEL value of an attribute when a
-// condition first reads it, and keeps it for the other conditions evaluated
+// client, sets, geo, asn and ua. It builds the CEL value of an attribute when
+// a condition first reads it, and keeps it for the other conditions evaluated
 // with it, so one Input serves every rule of one decision, and every
 // expression evaluated after it: geo and asn look the client address up
-// once. It is not safe for concurrent use.
+// once, and ua analyzes the user-agent header once. It is not safe for
+// concurrent use.
 type Input struct {
 	request requestVal
 	client  clientVal
@@ -29,6 +31,10 @@ type Input struct {
 	// lookup.
 	dbs      *enrichment.Snapshot
 	geo, asn ref.Val
+	// userAgent analyzes the user-agent header; ua is nil until an
+	// expression reads it, then its value or the error of its analysis.
+	userAgent analyzer
+	ua        ref.Val
 	// lib is the library of the conditions evaluated with the Input, which
 	// reports a panic recovered in a lookup.
 	lib *library
@@ -36,15 +42,22 @@ type Input struct {
 	rule string
 }
 
+// analyzer analyzes a user-agent header, as a *useragent.Analyzer does.
+type analyzer interface {
+	Analyze(header string) useragent.Record
+}
+
 // NewInput returns the activation of r, whose ClientIP is the client
 // address, or the zero Addr when it is missing, of snap, the state of the
-// sets for the whole decision, and of dbs, the databases for the whole
-// decision. snap is a Snapshot of the Store whose declarations the Env was
-// built with, or nil, in which every set is never loaded; dbs is a Snapshot
-// of the store of the databases that the Env declares, or nil, which has
-// none. r must not change while the Input is in use.
-func NewInput(r *request.Request, snap *sets.Snapshot, dbs *enrichment.Snapshot) *Input {
-	in := &Input{dbs: dbs}
+// sets for the whole decision, of dbs, the databases for the whole decision,
+// and of ua, the analysis of the user-agent header. snap is a Snapshot of the
+// Store whose declarations the Env was built with, or nil, in which every set
+// is never loaded; dbs is a Snapshot of the store of the databases that the
+// Env declares, or nil, which has none; ua is the Analyzer of the process, or
+// nil, which analyzes without a cache. r must not change while the Input is
+// in use.
+func NewInput(r *request.Request, snap *sets.Snapshot, dbs *enrichment.Snapshot, ua *useragent.Analyzer) *Input {
+	in := &Input{dbs: dbs, userAgent: ua}
 	in.request = requestVal{object: object{requestType}, req: r, in: in}
 	in.client = clientVal{object: object{clientType}, in: in}
 	if r.ClientIP.IsValid() {
@@ -78,6 +91,11 @@ func (in *Input) ResolveName(name string) (any, bool) {
 			in.asn = in.lookup(enrichment.ASN)
 		}
 		return in.asn, true
+	case "ua":
+		if in.ua == nil {
+			in.ua = in.analyzeUserAgent()
+		}
+		return in.ua, true
 	}
 	return nil, false
 }
@@ -107,13 +125,7 @@ func (in *Input) lookup(k enrichment.Kind) (out ref.Val) {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			var p *Panic
-			if in.lib != nil {
-				p = in.lib.recovered(r, in)
-			} else {
-				p = &Panic{Rule: in.rule, Value: r}
-			}
-			out = types.WrapErr(p)
+			out = types.WrapErr(in.recovered(r))
 		}
 	}()
 	addr := in.client.ip.addr
@@ -135,6 +147,32 @@ func (in *Input) lookup(k enrichment.Kind) (out ref.Val) {
 	return &asnVal{object: object{asnType}, in: in, rec: rec}
 }
 
+// recovered reports r, a panic recovered while the value of a variable was
+// built, with the library of the expressions evaluated with in, and returns it.
+func (in *Input) recovered(r any) *Panic {
+	if in.lib != nil {
+		return in.lib.recovered(r, in)
+	}
+	return &Panic{Rule: in.rule, Value: r}
+}
+
+// analyzeUserAgent analyzes the user-agent header of the request, and returns
+// the value of ua, or, when the analysis panics, an error, so that every read
+// of the variable fails, has() included. The analysis itself never fails.
+func (in *Input) analyzeUserAgent() (out ref.Val) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = types.WrapErr(in.recovered(r))
+		}
+	}()
+	rec := in.userAgent.Analyze(in.request.req.Headers["user-agent"])
+	u := &userAgentVal{object: object{userAgentType}, in: in, rec: rec}
+	u.browser = browserVal{object: object{userAgentBrowserType}, in: in, b: rec.Browser}
+	u.os = osVal{object: object{userAgentOSType}, in: in, os: rec.OS}
+	u.bot = botVal{object: object{userAgentBotType}, in: in, b: rec.Bot}
+	return u
+}
+
 // Geo returns what geo reads for the request: the record of the client
 // address in the geo database of the decision, looked up once for the
 // Input. The error is ErrClientIPMissing, ErrDatabase or a *Panic.
@@ -153,6 +191,16 @@ func (in *Input) ASN() (enrichment.ASNRecord, error) {
 		return a.rec, nil
 	}
 	return enrichment.ASNRecord{}, valueError(v)
+}
+
+// UserAgent returns what ua reads for the request: the record of its
+// user-agent header, analyzed once for the Input. The error is a *Panic.
+func (in *Input) UserAgent() (useragent.Record, error) {
+	v, _ := in.ResolveName("ua")
+	if u, ok := v.(*userAgentVal); ok {
+		return u.rec, nil
+	}
+	return useragent.Record{}, valueError(v)
 }
 
 // valueError returns the error that an error value wraps.
@@ -361,6 +409,114 @@ var asnFields = map[string]field{
 		isSet: always,
 		get:   func(obj any) (any, error) { return types.String(obj.(*asnVal).rec.Organization), nil },
 	},
+}
+
+// userAgentVal is the value of the variable ua: the record of the
+// user-agent header of the request. Its objects are part of it.
+type userAgentVal struct {
+	object
+	in      *Input
+	rec     useragent.Record
+	browser browserVal
+	os      osVal
+	bot     botVal
+}
+
+func (u *userAgentVal) Equal(other ref.Val) ref.Val { return types.Bool(u == other) }
+func (u *userAgentVal) Value() any                  { return u }
+
+var userAgentFields = map[string]field{
+	"browser": {
+		typ:   userAgentBrowserType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return &obj.(*userAgentVal).browser, nil },
+	},
+	"os": {
+		typ:   userAgentOSType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return &obj.(*userAgentVal).os, nil },
+	},
+	"device": stringField(func(u *userAgentVal) string { return u.rec.Device }),
+	"is_bot": {
+		typ:   types.BoolType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.Bool(obj.(*userAgentVal).rec.IsBot), nil },
+	},
+	"bot": {
+		typ:   userAgentBotType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return &obj.(*userAgentVal).bot, nil },
+	},
+}
+
+// intField declares an int field of an object whose Go value is a *T.
+func intField[T any](pick func(v *T) int64) field {
+	return field{
+		typ:   types.IntType,
+		isSet: always,
+		get:   func(obj any) (any, error) { return types.Int(pick(obj.(*T))), nil },
+	}
+}
+
+// browserVal is the value of a tessera.UserAgentBrowser. Two values with the
+// same fields are equal.
+type browserVal struct {
+	object
+	in *Input
+	b  useragent.Browser
+}
+
+func (b *browserVal) Equal(other ref.Val) ref.Val {
+	o, ok := other.(*browserVal)
+	return types.Bool(ok && b.b == o.b)
+}
+func (b *browserVal) Value() any { return b }
+
+var browserFields = map[string]field{
+	"name":    stringField(func(b *browserVal) string { return b.b.Name }),
+	"version": stringField(func(b *browserVal) string { return b.b.Version }),
+	"major":   intField(func(b *browserVal) int64 { return b.b.Major }),
+	"minor":   intField(func(b *browserVal) int64 { return b.b.Minor }),
+}
+
+// osVal is the value of a tessera.UserAgentOS. Two values with the same
+// fields are equal.
+type osVal struct {
+	object
+	in *Input
+	os useragent.OS
+}
+
+func (o *osVal) Equal(other ref.Val) ref.Val {
+	v, ok := other.(*osVal)
+	return types.Bool(ok && o.os == v.os)
+}
+func (o *osVal) Value() any { return o }
+
+var osFields = map[string]field{
+	"name":    stringField(func(o *osVal) string { return o.os.Name }),
+	"version": stringField(func(o *osVal) string { return o.os.Version }),
+	"major":   intField(func(o *osVal) int64 { return o.os.Major }),
+	"minor":   intField(func(o *osVal) int64 { return o.os.Minor }),
+}
+
+// botVal is the value of a tessera.UserAgentBot. Two values with the same
+// fields are equal.
+type botVal struct {
+	object
+	in *Input
+	b  useragent.Bot
+}
+
+func (b *botVal) Equal(other ref.Val) ref.Val {
+	o, ok := other.(*botVal)
+	return types.Bool(ok && b.b == o.b)
+}
+func (b *botVal) Value() any { return b }
+
+var botFields = map[string]field{
+	"name":        stringField(func(b *botVal) string { return b.b.Name }),
+	"description": stringField(func(b *botVal) string { return b.b.Description }),
 }
 
 // requestVal is the value of the variable request.

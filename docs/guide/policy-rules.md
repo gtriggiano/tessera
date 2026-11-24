@@ -70,7 +70,7 @@ A rule without `when` matches every request, so it can only be the last rule: te
 A condition can read more than the request:
 
 - the client address, `client.ip`, with the [functions on addresses](../reference/expressions.md#functions), such as `client.ip.inCidr("203.0.113.0/24")`: [Set the client address](./client-address.md) shows where tessera reads it;
-- the enrichments of the client address: its country, region, city and location with [`geo`](../reference/expressions.md#geo), and its autonomous system with [`asn`](../reference/expressions.md#asn), such as `geo.country.code in ["IT", "FR"]`, once [Enrich requests](./enrichments.md) has set them up;
+- the enrichments of the client address: its country, region, city and location with [`geo`](../reference/expressions.md#geo), and its autonomous system with [`asn`](../reference/expressions.md#asn), such as `geo.country.code in ["IT", "FR"]`, and the enrichment of the client software, its browser, operating system and kind of device with [`ua`](../reference/expressions.md#ua), such as `ua.is_bot`, once [Enrich requests](./enrichments.md) has set them up;
 - the sets, lists kept apart from the rules, with [`sets.<name>.contains(value)`](../reference/expressions.md#sets): [Use sets](./sets.md) shows how to declare and update them.
 
 ```yaml [config.yaml]

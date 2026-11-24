@@ -255,8 +255,8 @@ func TestExampleDatabases(t *testing.T) {
 // TestRepositoryExamples loads every .yaml file in docs/examples/ as a
 // complete configuration, with every environment variable unset, and reads
 // the file of each of its sets and each of its databases, as tessera serve
-// does. A .txt file is the file of a set, and a .mmdb file a database, which
-// an example reads.
+// does. A .txt file is the file of a set, a .geojson file that of an area
+// set, and a .mmdb file a database, which an example reads.
 func TestRepositoryExamples(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join(examplesDir, "*"))
 	if err != nil {
@@ -270,12 +270,12 @@ func TestRepositoryExamples(t *testing.T) {
 		if strings.HasPrefix(filepath.Base(file), ".") {
 			continue // Such as the .DS_Store of macOS, which Git ignores.
 		}
-		if filepath.Ext(file) == ".txt" || filepath.Ext(file) == ".mmdb" {
+		if exampleDataFile(file) {
 			continue // The file of a set or a database, read with its example.
 		}
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			if filepath.Ext(file) != ".yaml" {
-				t.Fatal("docs/examples/ holds complete configurations, as .yaml files, the files of their sets, as .txt files, and their databases, as .mmdb files")
+				t.Fatal("docs/examples/ holds complete configurations, as .yaml files, the files of their sets, as .txt files or, for area sets, .geojson files, and their databases, as .mmdb files")
 			}
 			data, err := os.ReadFile(file)
 			if err != nil {
@@ -310,11 +310,20 @@ func TestRepositoryExamples(t *testing.T) {
 		})
 	}
 	for _, file := range files {
-		ext := filepath.Ext(file)
-		if abs, err := filepath.Abs(file); err == nil && (ext == ".txt" || ext == ".mmdb") && !read[abs] {
+		if abs, err := filepath.Abs(file); err == nil && exampleDataFile(file) && !read[abs] {
 			t.Errorf("%s: no example reads this file", filepath.Base(file))
 		}
 	}
+}
+
+// exampleDataFile reports whether file, in docs/examples/, is the file of a
+// set or of a database.
+func exampleDataFile(file string) bool {
+	switch filepath.Ext(file) {
+	case ".txt", ".geojson", ".mmdb":
+		return true
+	}
+	return false
 }
 
 func TestExtractConfigSnippets(t *testing.T) {

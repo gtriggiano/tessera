@@ -47,7 +47,7 @@ func TestStringExpressions(t *testing.T) {
 		{`asn.found ? string(asn.number) : ""`, "203.0.113.200", ""},
 		{`has(geo.location) ? string(geo.location.lat) : "none"`, "203.0.113.7", "none"},
 	} {
-		got, err := mustCompileString(t, env, tc.text).Eval(NewInput(sampleRequest(tc.client), snapshot(), dbStore.Snapshot()))
+		got, err := mustCompileString(t, env, tc.text).Eval(NewInput(sampleRequest(tc.client), snapshot(), dbStore.Snapshot(), nil))
 		if got != tc.want || err != nil {
 			t.Errorf("%s for %q = %q, %v; want %q", tc.text, tc.client, got, err, tc.want)
 		}
@@ -75,13 +75,13 @@ func TestStringExpressions(t *testing.T) {
 		{brokenEnv, broken, `asn.organization`, "198.51.100.7", CauseDatabaseError},
 		{withPanics(t, dbEnv), dbStore, `client.ip.boom() ? "a" : "b"`, "192.0.2.10", CausePanic},
 	} {
-		got, err := mustCompileString(t, tc.env, tc.text).Eval(NewInput(sampleRequest(tc.client), snapshot(), tc.dbs.Snapshot()))
+		got, err := mustCompileString(t, tc.env, tc.text).Eval(NewInput(sampleRequest(tc.client), snapshot(), tc.dbs.Snapshot(), nil))
 		if got != "" || cause(err) != tc.cause {
 			t.Errorf("%s for %q = %q, %v; want the cause %s", tc.text, tc.client, got, err, tc.cause)
 		}
 	}
 	// && and || absorb a failure, as in a condition.
-	if got, err := mustCompileString(t, env, `has(client.ip) && client.ip.family() == 4 ? "4" : "-"`).Eval(NewInput(sampleRequest(""), nil, nil)); got != "-" || err != nil {
+	if got, err := mustCompileString(t, env, `has(client.ip) && client.ip.family() == 4 ? "4" : "-"`).Eval(NewInput(sampleRequest(""), nil, nil, nil)); got != "-" || err != nil {
 		t.Errorf("absorbed failure: %q, %v", got, err)
 	}
 }
@@ -202,7 +202,7 @@ func TestDecisionFieldReads(t *testing.T) {
 // the client address per Input, in the databases of its snapshot.
 func TestStringExpressionsShareTheInput(t *testing.T) {
 	store, env := exampleDatabases(t)
-	in := NewInput(sampleRequest("192.0.2.7"), nil, store.Snapshot())
+	in := NewInput(sampleRequest("192.0.2.7"), nil, store.Snapshot(), nil)
 	if ok, err := mustCompile(t, env, `geo.country.code == "IT"`).Eval(in); !ok || err != nil {
 		t.Fatalf("condition: %v, %v", ok, err)
 	}
@@ -244,7 +244,7 @@ func TestConcurrentStringEvaluations(t *testing.T) {
 			for range 100 {
 				r := &request.Request{Host: "api.example.com", Headers: map[string]string{}}
 				r.ClientIP = sampleRequest("192.0.2.7").ClientIP
-				if got, err := s.Eval(NewInput(r, nil, store.Snapshot())); got != "IT/api.example.com" || err != nil {
+				if got, err := s.Eval(NewInput(r, nil, store.Snapshot(), nil)); got != "IT/api.example.com" || err != nil {
 					t.Errorf("%q, %v", got, err)
 					return
 				}

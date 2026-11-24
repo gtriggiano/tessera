@@ -4,8 +4,10 @@ go 1.27.4
 
 require (
 	cel.dev/cel-go v0.32.0
+	github.com/LumenResearch/uasurfer v0.3.1
 	github.com/envoyproxy/go-control-plane/envoy v1.40.0
 	github.com/gaissmai/bart v0.30.0
+	github.com/monperrus/crawler-user-agents v1.71.0
 	github.com/oschwald/maxminddb-golang/v2 v2.9.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3

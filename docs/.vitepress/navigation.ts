@@ -37,6 +37,7 @@ export const sidebar: DefaultTheme.SidebarMulti = {
       items: [
         { text: 'Configuration', link: '/reference/configuration' },
         { text: 'Expression language', link: '/reference/expressions' },
+        { text: 'Bot names', link: '/reference/bot-names' },
         { text: 'CLI', link: '/reference/cli' },
         { text: 'gRPC API', link: '/reference/grpc-api' },
         { text: 'Admin endpoints', link: '/reference/admin-endpoints' },

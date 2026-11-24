@@ -27,6 +27,7 @@ import (
 	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/request"
 	"github.com/gtriggiano/tessera/internal/sets"
+	"github.com/gtriggiano/tessera/internal/useragent"
 )
 
 // Action is what a decision does with a request.
@@ -144,6 +145,10 @@ type Options struct {
 	// the variables that the conditions can read, and each decision reads
 	// one snapshot of it. Nil configures no database.
 	Databases *enrichment.Store
+	// UserAgent analyzes the user-agent header that ua reads, with the cache
+	// that every decision shares. Nil configures no analysis: an expression
+	// cannot read ua.
+	UserAgent *useragent.Analyzer
 }
 
 // AuditMatch is a rule in audit mode whose condition was true.
@@ -240,6 +245,7 @@ type Engine struct {
 	onPanic       func(*expr.Panic)
 	sets          *sets.Store
 	databases     *enrichment.Store
+	userAgent     *useragent.Analyzer
 	// headers are the upstream headers, by name in lowercase, and fields
 	// the decision fields, by name, both sorted.
 	headers []named
@@ -249,7 +255,7 @@ type Engine struct {
 // New compiles p. An action other than allow or deny, or an expression that
 // does not compile, is an error: a valid configuration has neither.
 func New(p Policy, o Options) (*Engine, error) {
-	env, err := expr.NewEnv(expr.Options{OnPanic: o.OnPanic, Sets: o.Sets.Declarations(), Databases: o.Databases.Kinds(), SecretHeaders: p.SecretHeaders})
+	env, err := expr.NewEnv(expr.Options{OnPanic: o.OnPanic, Sets: o.Sets.Declarations(), Databases: o.Databases.Kinds(), UserAgent: o.UserAgent != nil, SecretHeaders: p.SecretHeaders})
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +269,7 @@ func New(p Policy, o Options) (*Engine, error) {
 		onPanic:       o.OnPanic,
 		sets:          o.Sets,
 		databases:     o.Databases,
+		userAgent:     o.UserAgent,
 	}
 	for i, r := range p.Rules {
 		if r.Action != Allow && r.Action != Deny {
@@ -374,10 +381,11 @@ func (e *Engine) HeaderReadsSecrets(name string) bool {
 
 // DecisionFields computes the decision fields of the policy for d, a
 // decision of this Engine, with what its rules read: the same snapshots of
-// the sets and the databases, and the records of geo and asn already looked
-// up. A field whose expression fails is empty. They are in the order of
-// their names; nil without fields, or for a decision of no Engine. Call it on
-// the goroutine of the decision, as the decision events do.
+// the sets and the databases, the records of geo and asn already looked up,
+// and the record of ua already analyzed. A field whose expression fails is
+// empty. They are in the order of their names; nil without fields, or for a
+// decision of no Engine. Call it on the goroutine of the decision, as the
+// decision events do.
 func (e *Engine) DecisionFields(d Decision) []Field {
 	if len(e.fields) == 0 || d.input == nil {
 		return nil
@@ -443,7 +451,8 @@ type Explanation struct {
 	// as expr.Condition.Attributes names them.
 	Attributes []string
 	// Input is the activation of the decision: its Geo and ASN read the
-	// databases as the conditions did, from the snapshot of the decision.
+	// databases as the conditions did, from the snapshot of the decision,
+	// and its UserAgent the record that the conditions read.
 	Input *expr.Input
 }
 
@@ -472,11 +481,12 @@ func (e *Engine) Explain(r *request.Request) Explanation {
 
 // decide decides r, with one snapshot of the sets and one of the databases
 // for every rule, and returns the activation of the decision, which an
-// expression evaluated after it reads in the same state. trace, when set,
-// receives the outcome of each rule evaluated.
+// expression evaluated after it reads in the same state: with the records of
+// geo, asn and ua that the rules read. trace, when set, receives the outcome
+// of each rule evaluated.
 func (e *Engine) decide(r *request.Request, trace func(*rule, Outcome)) (Decision, *expr.Input) {
 	var d Decision
-	in := expr.NewInput(r, e.sets.Snapshot(), e.databases.Snapshot())
+	in := expr.NewInput(r, e.sets.Snapshot(), e.databases.Snapshot(), e.userAgent)
 	for i := range e.rules {
 		rl := &e.rules[i]
 		in.SetRule(rl.name)

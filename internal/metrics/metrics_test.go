@@ -15,6 +15,7 @@ import (
 	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/sets"
+	"github.com/gtriggiano/tessera/internal/useragent"
 )
 
 var testBuild = BuildInfo{Version: "1.2.3", Revision: "abc123", GoVersion: "go1.test"}
@@ -64,7 +65,7 @@ func labels(m *dto.Metric) map[string]string {
 }
 
 func TestInfoGauges(t *testing.T) {
-	families := gather(t, New(testBuild, testHash, testPolicy, testSets, testDatabases))
+	families := gather(t, New(testBuild, testHash, testPolicy, testSets, testDatabases, useragent.New(100)))
 	for _, tc := range []struct {
 		name   string
 		labels map[string]string
@@ -99,7 +100,7 @@ func TestInfoGauges(t *testing.T) {
 }
 
 func TestConnectionRefused(t *testing.T) {
-	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases, useragent.New(100))
 	value := func() float64 {
 		f := gather(t, m)["tessera_grpc_connections_refused_total"]
 		if f.GetType() != dto.MetricType_COUNTER || len(f.GetMetric()) != 1 || len(f.GetMetric()[0].GetLabel()) != 0 {
@@ -119,7 +120,7 @@ func TestConnectionRefused(t *testing.T) {
 
 func TestHandlerServesTheTextFormat(t *testing.T) {
 	rec := httptest.NewRecorder()
-	New(testBuild, testHash, testPolicy, testSets, testDatabases).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	New(testBuild, testHash, testPolicy, testSets, testDatabases, useragent.New(100)).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
 		t.Fatalf("status %d, content type %q", rec.Code, rec.Header().Get("Content-Type"))
@@ -154,7 +155,7 @@ func TestDecisionSeries(t *testing.T) {
 	for _, audit := range []bool{false, true} {
 		p := testPolicy
 		p.Audit = audit
-		m := New(testBuild, testHash, p, testSets, testDatabases)
+		m := New(testBuild, testHash, p, testSets, testDatabases, useragent.New(100))
 		before := series(t, m)
 		enforced := "true"
 		if audit {
@@ -266,7 +267,7 @@ func value(t *testing.T, m *Metrics, name string, labels map[string]string) floa
 // of refreshes, with every result of tessera_set_refreshes_total, and a set
 // of values has none. Recording a check adds no series.
 func TestSetSeries(t *testing.T) {
-	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases, useragent.New(100))
 	before := series(t, m)
 	for _, d := range testSets {
 		labels := `set="` + d.Name + `",source="` + string(d.Source) + `",type="` + string(d.Type) + `"`
@@ -350,7 +351,7 @@ func TestSetSeries(t *testing.T) {
 // of tessera_enrichment_database_refreshes_total; a database that is not
 // configured has none. Recording a check adds no series.
 func TestDatabaseSeries(t *testing.T) {
-	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases, useragent.New(100))
 	before := series(t, m)
 	for _, line := range []string{
 		`tessera_enrichment_database_build_timestamp_seconds{database="geo"}`,
@@ -409,7 +410,7 @@ func TestDatabaseSeries(t *testing.T) {
 // header removed because its expression failed or gave an invalid value
 // counts, and one removed by an empty value does not.
 func TestUpstreamHeaderSeries(t *testing.T) {
-	m := New(testBuild, testHash, testPolicy, testSets, testDatabases)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases, useragent.New(100))
 	before := series(t, m)
 	var headerSeries []string
 	for _, line := range before {
@@ -464,9 +465,56 @@ func TestUpstreamHeaderSeries(t *testing.T) {
 	// A policy without upstream headers has no series.
 	plain := testPolicy
 	plain.UpstreamHeaders = nil
-	if slices.ContainsFunc(series(t, New(testBuild, testHash, plain, testSets, testDatabases)), func(s string) bool {
+	if slices.ContainsFunc(series(t, New(testBuild, testHash, plain, testSets, testDatabases, useragent.New(100))), func(s string) bool {
 		return strings.HasPrefix(s, "tessera_upstream_header_errors_total")
 	}) {
 		t.Error("series without upstream headers")
+	}
+}
+
+// The cache of the user-agent analysis has its series from the start, and a
+// scrape reads its lookups and its entries; an analysis without a cache, and
+// a configuration without the analysis, have none.
+func TestUserAgentCacheSeries(t *testing.T) {
+	ua := useragent.New(100)
+	m := New(testBuild, testHash, testPolicy, testSets, testDatabases, ua)
+	want := []string{
+		`tessera_enrichment_user_agent_cache_entries`,
+		`tessera_enrichment_user_agent_cache_lookups_total{result="hit"}`,
+		`tessera_enrichment_user_agent_cache_lookups_total{result="miss"}`,
+	}
+	got := func(m *Metrics) []string {
+		var out []string
+		for _, line := range series(t, m) {
+			if strings.HasPrefix(line, "tessera_enrichment_user_agent_") {
+				out = append(out, line)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+	if s := got(m); !slices.Equal(s, want) {
+		t.Fatalf("series at startup:\n%s\nwant:\n%s", strings.Join(s, "\n"), strings.Join(want, "\n"))
+	}
+	for _, h := range []string{"curl/8.7.1", "curl/8.7.1", "curl/8.7.1", "sqlmap/1.8", ""} {
+		ua.Analyze(h)
+	}
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   float64
+	}{
+		{"tessera_enrichment_user_agent_cache_lookups_total", map[string]string{"result": "hit"}, 2},
+		{"tessera_enrichment_user_agent_cache_lookups_total", map[string]string{"result": "miss"}, 2},
+		{"tessera_enrichment_user_agent_cache_entries", map[string]string{}, 2},
+	} {
+		if v := value(t, m, tc.name, tc.labels); v != tc.want {
+			t.Errorf("%s %v = %v, want %v", tc.name, tc.labels, v, tc.want)
+		}
+	}
+	for _, none := range []*useragent.Analyzer{useragent.New(0), nil} {
+		if s := got(New(testBuild, testHash, testPolicy, testSets, testDatabases, none)); len(s) != 0 {
+			t.Errorf("series without a cache: %v", s)
+		}
 	}
 }

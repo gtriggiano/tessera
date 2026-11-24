@@ -19,6 +19,7 @@ import (
 	"github.com/gtriggiano/tessera/internal/enrichment"
 	"github.com/gtriggiano/tessera/internal/expr"
 	"github.com/gtriggiano/tessera/internal/sets"
+	"github.com/gtriggiano/tessera/internal/useragent"
 )
 
 // DurationBuckets are the upper bounds, in seconds, of the buckets of
@@ -65,14 +66,17 @@ type Metrics struct {
 
 // New returns the metrics of a process built as build, whose configuration
 // has the hash configHash, the hexadecimal SHA-256 of the output of tessera
-// config print, the policy p, the sets declared and the databases of the
-// kinds databases. It registers the Go and process collectors too.
+// config print, the policy p, the sets declared, the databases of the kinds
+// databases and the analysis of the user-agent header userAgent, nil when it
+// is not configured. It registers the Go and process collectors too.
 //
-// Every series that p, its upstream headers included, declared and
-// databases can produce exists from the start, at zero: label values come
+// Every series that p, its upstream headers included, declared, databases
+// and userAgent can produce exists from the start, at zero: label values come
 // from the configuration and fixed sets only, so the number of series
-// depends on the configuration alone.
-func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.Declaration, databases []enrichment.Kind) *Metrics {
+// depends on the configuration alone. The metrics of the cache of the
+// user-agent analysis, which exist only when it has a cache, are read from
+// it at each scrape.
+func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.Declaration, databases []enrichment.Kind, userAgent *useragent.Analyzer) *Metrics {
 	reg := prometheus.NewRegistry()
 	buildInfo := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   namespace,
@@ -254,8 +258,37 @@ func New(build BuildInfo, configHash string, p engine.Policy, declared []sets.De
 		m.dbLastSuccess,
 		m.dbDuration,
 	)
+	if userAgent.CacheEntries() > 0 {
+		reg.MustRegister(userAgentCache{userAgent})
+	}
 	m.handler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	return m
+}
+
+// The metrics of the cache of the user-agent analysis.
+var (
+	userAgentLookups = prometheus.NewDesc(namespace+"_enrichment_user_agent_cache_lookups_total",
+		"Lookups of a user-agent header in the cache of the analysis, by result: hit, the record was there; miss, the header was analyzed.",
+		[]string{"result"}, nil)
+	userAgentEntries = prometheus.NewDesc(namespace+"_enrichment_user_agent_cache_entries",
+		"The analyzed user-agent headers in the cache.",
+		nil, nil)
+)
+
+// userAgentCache collects the metrics of the cache of a user-agent analyzer
+// from its counters, at each scrape: a lookup records nothing else.
+type userAgentCache struct{ a *useragent.Analyzer }
+
+func (userAgentCache) Describe(ch chan<- *prometheus.Desc) {
+	ch <- userAgentLookups
+	ch <- userAgentEntries
+}
+
+func (c userAgentCache) Collect(ch chan<- prometheus.Metric) {
+	hits, misses := c.a.Lookups()
+	ch <- prometheus.MustNewConstMetric(userAgentLookups, prometheus.CounterValue, float64(hits), "hit")
+	ch <- prometheus.MustNewConstMetric(userAgentLookups, prometheus.CounterValue, float64(misses), "miss")
+	ch <- prometheus.MustNewConstMetric(userAgentEntries, prometheus.GaugeValue, float64(c.a.Entries()))
 }
 
 // Decided records the decision d.

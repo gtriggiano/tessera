@@ -190,7 +190,7 @@ response: status 404
 `tessera eval` loads the [sets](./configuration.md#sets) of the configuration as `tessera serve` does, their files included: a file that is missing or invalid is a configuration error. `--set '<name>=<value>,<value>'` replaces the content of the set `<name>` for the evaluation, and its file is not read, so that `eval` works without the files of the server:
 
 - the values are separated by commas, and read as the [`values`](./configuration.md#sets-name-values) of the type of the set, with the spaces around them ignored: a value of a `string` set cannot hold a comma;
-- `--set '<name>='` makes the set empty;
+- `--set '<name>='` makes the set empty, and is the only form for an [area set](./configuration.md#sets-name-type), which has no values: it makes an empty area, which contains no point;
 - `--set` replaces one set, and is given once for each set that you replace.
 
 With this configuration in a file named `sets.yaml`, and the file of its set `blocked`, `blocked.txt`, next to it:
@@ -227,6 +227,41 @@ blocked-networks  false  Networks blocked during an incident.
 internal-hosts    false  The internal hosts, from the office only.
 
 decision: allow (rule default, reason default)
+```
+
+An area set reads the location of [`geo`](./expressions.md#geo), which `tessera eval` computes for the address of `--ip`. With this configuration in a file named `area.yaml`, and the database `geo.mmdb` and the areas `cities.geojson` next to it:
+
+<<< @/examples/area.yaml{yaml}
+
+<<< @/examples/cities.geojson{json}
+
+```sh
+tessera eval --config area.yaml --ip 192.0.2.7
+```
+
+```text
+geo.location  {lat: 41.8919, lon: 12.5113}
+
+no-location    false (audit)  Addresses that the database does not place on a map.
+office-cities  true -> allow  Rome and Milan, inside their ring roads.
+
+decision: allow (rule office-cities, reason rule)
+```
+
+An address whose record has no location is in no area:
+
+```sh
+tessera eval --config area.yaml --ip 203.0.113.7
+```
+
+```text
+geo.location  missing
+
+no-location    true (audit)  Addresses that the database does not place on a map.
+office-cities  false         Rome and Milan, inside their ring roads.
+
+decision: deny (rule default, reason default)
+response: status 403
 ```
 
 ### Enrichments
@@ -278,6 +313,42 @@ rome-office        false          The surroundings of the office in Rome, outsid
 
 decision: deny (rule default, reason default)
 response: status 403
+```
+
+`tessera eval` analyzes the `user-agent` header of `--header` as `tessera serve` does, without a cache, and shows the attributes of [`ua`](./expressions.md#ua) that the rules read. Without the header, they are those of a request without it: empty strings, numbers `0`, `ua.device` `unknown` and `ua.is_bot` `false`.
+
+With this configuration in a file named `user-agent.yaml`:
+
+<<< @/examples/user-agent.yaml{yaml}
+
+A version of Safari that the checkout pages do not support:
+
+```sh
+tessera eval --config user-agent.yaml --path /checkout/pay \
+  --header 'user-agent: Mozilla/5.0 (iPhone; CPU iPhone OS 14_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1'
+```
+
+```text
+request.path      "/checkout/pay"
+ua.browser.major  14
+ua.browser.name   "Safari"
+ua.is_bot         false
+
+checkout-bots  false         Crawlers and scripts on the checkout pages.
+old-safari     true -> deny  Versions of Safari that the checkout pages do not support.
+
+decision: deny (rule old-safari, reason rule)
+response: status 400
+```
+
+A script, with `--output json`:
+
+```sh
+tessera eval --config user-agent.yaml --path /checkout/pay --header 'user-agent: curl/8.7.1' --output json
+```
+
+```json
+{"attributes":[{"name":"request.path","value":"/checkout/pay"},{"name":"ua.is_bot","value":"true"}],"rules":[{"name":"checkout-bots","description":"Crawlers and scripts on the checkout pages.","action":"deny","mode":"enforce","result":"true"}],"decision":{"action":"deny","enforced":true,"rule":"checkout-bots","reason":"rule","response":{"status":403,"body":"","headers":{}}}}
 ```
 
 ### Upstream headers
@@ -336,7 +407,7 @@ tessera eval --config upstream.yaml --ip 203.0.113.7 --output json
 
 The text output has three blocks, and a fourth for the upstream headers:
 
-1. **The attributes** that the conditions of the rules evaluated read, sorted by name, with their values: a string in double quotes; `client.ip`, a bool and an integer without them; a number without them, always with a decimal point, as a CEL `double` literal has one: `52.0`, not `52`, also inside an object; an object or a list of [`geo`](./expressions.md#geo) that a rule reads whole, such as `geo.location` in `has(geo.location)` or `geo.subdivisions` in `exists`, as a CEL literal without quotes around it: `{code: "IT", name: "Italy", in_eu: true}` for `geo.country`, `{code: "EU", name: "Europe"}` for `geo.continent`, `{lat: 41.8919, lon: 12.5113}` for `geo.location`, and `[{code: "62", name: "Lazio"}, {code: "RM", name: "Rome"}]` or `[]` for `geo.subdivisions`; and `missing` for an attribute or a header that the request does not have. A field of an object shows under its own name, such as `geo.country.code`, and a read of an item of `geo.subdivisions`, such as `geo.subdivisions[0].code`, shows the whole list. An attribute of `geo` or `asn` is `missing` without a client address, or when tessera cannot read the record of the address in the database, and `geo.location` and its coordinates are `missing` for a record without a location. A rule that reads the whole map `request.headers`, such as with `exists`, shows every header. The values of the [secret headers](./configuration.md#secret-headers) are shown as `[REDACTED]`.
+1. **The attributes** that the conditions of the rules evaluated read, sorted by name, with their values: a string in double quotes; `client.ip`, a bool and an integer without them; a number without them, always with a decimal point, as a CEL `double` literal has one: `52.0`, not `52`, also inside an object; an object or a list of [`geo`](./expressions.md#geo), or an object of [`ua`](./expressions.md#ua), that a rule reads whole, such as `geo.location` in `has(geo.location)`, `geo.subdivisions` in `exists` or `ua.browser` in `ua.browser == ua.browser`, as a CEL literal without quotes around it, its strings in double quotes: `{code: "IT", name: "Italy", in_eu: true}` for `geo.country`, `{code: "EU", name: "Europe"}` for `geo.continent`, `{lat: 41.8919, lon: 12.5113}` for `geo.location`, `[{code: "62", name: "Lazio"}, {code: "RM", name: "Rome"}]` or `[]` for `geo.subdivisions`, `{name: "Chrome", version: "131.0.6778", major: 131, minor: 0}` for `ua.browser`, `{name: "Windows", version: "10.0.0", major: 10, minor: 0}` for `ua.os`, and `{name: "", description: ""}` for `ua.bot` of a client that is not a bot; and `missing` for an attribute or a header that the request does not have. A field of an object shows under its own name, such as `geo.country.code` or `ua.browser.name`, and a read of an item of `geo.subdivisions`, such as `geo.subdivisions[0].code`, shows the whole list. An attribute of `geo` or `asn` is `missing` without a client address, or when tessera cannot read the record of the address in the database, and `geo.location` and its coordinates are `missing` for a record without a location. An attribute of `ua` is `missing` only when tessera fails while it analyzes the header. A rule that reads the whole map `request.headers`, such as with `exists`, shows every header. The values of the [secret headers](./configuration.md#secret-headers) are shown as `[REDACTED]`.
 2. **The rules**, in order, up to the one that decides, each with the outcome of its condition: `true`, `false`, or `indeterminate` followed by its cause (`client_ip_missing`, `expression`, `panic`, `set_unavailable` or `database_error`), then `-> allow` or `-> deny` for the rule that decides, or `(audit)` for a rule in `audit` mode, then its description, on one line.
 3. **The decision**: its action, the rule that decided or `default`, and the reason (`rule`, `default`, or `error` followed by the cause), with `not enforced: policy.mode is audit` when [`policy.mode: audit`](./configuration.md#policy-mode) allows a denied request; for a denial, the status of the response.
 4. **The upstream headers**, for a request that Envoy sends on, when the configuration has some: each header, in the order of the names, with its value in double quotes, or `removed` when its expression gives an empty string, fails or gives a value that cannot be sent. The value of a header whose expression reads a secret header of the request, in any spelling, or reads the map `request.headers` otherwise than by a literal name, such as with `exists` or a key that is not a literal, is shown as `[REDACTED]`: Envoy receives the value, `tessera eval` does not print it.
@@ -370,6 +441,7 @@ tessera eval --config rules.yaml \
 | `invalid --set: the configuration declares no set of this name` | No set of [`sets`](./configuration.md#sets) has the name. |
 | `invalid --set: the set <name> is given twice` | Two `--set` flags replace the same set. |
 | `invalid --set for the set <name>: value <n>: <problem>` | The value in position `<n>`, from 1, is not a value of the type of the set, as for [`sets.<name>.values`](./configuration.md#sets-name-values). |
+| `invalid --set for the set <name>: an area set takes no values; --set <name>= makes it empty` | The set is an area set, and the flag gives it values. |
 
 ## `tessera config validate`
 
@@ -397,13 +469,18 @@ tessera: sets.partners.file (line 9, column 11): line 12 of the file: the value 
 tessera: enrichment.geo.database (line 3, column 15): the file is not a valid MMDB database
 ```
 
+```text
+tessera: sets.stores.file (line 9, column 11): line 3, column 88 of the file: feature 3, polygon 1, ring 2: the ring is not closed: its last position differs from its first
+```
+
 [Error messages](./configuration.md#error-messages) describes their form.
 
-A warning is a problem that does not make the configuration invalid. `tessera config validate` prints each warning on standard error, in the order of the file, then `configuration valid` on standard output, and exits with status 0. The warnings are a set and a database that no rule, [upstream header](./configuration.md#upstream-headers) or [decision field](./configuration.md#log-decision-fields) reads, which tessera loads and checks all the same:
+A warning is a problem that does not make the configuration invalid. `tessera config validate` prints each warning on standard error, in the order of the file, then `configuration valid` on standard output, and exits with status 0. The warnings are a set or a database that no rule, [upstream header](./configuration.md#upstream-headers) or [decision field](./configuration.md#log-decision-fields) reads, which tessera loads and checks all the same, and the analysis of the user-agent header, [`enrichment.user_agent`](./configuration.md#enrichment-user-agent), when none of them reads `ua`:
 
 ```text
 tessera: warning: sets.office (line 3, column 3): the set is not used by any rule, upstream header or decision field
 tessera: warning: enrichment.asn (line 9, column 3): the database is not used by any rule, upstream header or decision field
+tessera: warning: enrichment.user_agent (line 11, column 3): the enrichment is not used by any rule, upstream header or decision field
 ```
 
 `tessera serve` writes the same warnings as [`config_warning`](./logs.md#config-warning) events.

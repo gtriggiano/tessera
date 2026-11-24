@@ -208,7 +208,7 @@
       "default": []
     },
     "enrichment": {
-      "description": "The databases that the attributes geo and asn read. Without its block, an attribute does not exist, and a condition that reads it is an error.",
+      "description": "The databases that the attributes geo and asn read, and the analysis of the user-agent header that the attribute ua reads. Without its block, an attribute does not exist, and a condition that reads it is an error.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -249,6 +249,20 @@
               "default": "1m"
             }
           }
+        },
+        "user_agent": {
+          "description": "The analysis of the user-agent header, which ua reads: its first 512 bytes, without a file. Absent by default; write user_agent: {} to turn it on with its defaults.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cache_entries": {
+              "description": "The largest number of analyzed headers that tessera keeps, in a cache that every decision shares. 0 disables the cache.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "default": 10000
+            }
+          }
         }
       }
     },
@@ -266,14 +280,15 @@
         ],
         "properties": {
           "type": {
-            "description": "The type of the values: cidr, IP networks and addresses; asn, autonomous system numbers; string, strings compared exactly.",
+            "description": "The type of the values: cidr, IP networks and addresses; asn, autonomous system numbers; string, strings compared exactly; area, polygons read from a GeoJSON file.",
             "type": "string",
             "anyOf": [
               {
                 "enum": [
                   "cidr",
                   "asn",
-                  "string"
+                  "string",
+                  "area"
                 ]
               },
               {
@@ -282,7 +297,7 @@
             ]
           },
           "values": {
-            "description": "The values of the set, written here: strings, or for an asn set integers too. A set has one source: values or file.",
+            "description": "The values of the set, written here: strings, or for an asn set integers too. A set has one source: values or file; an area set has file only.",
             "type": "array",
             "items": {
               "anyOf": [
@@ -298,7 +313,7 @@
             }
           },
           "file": {
-            "description": "The file of the set, relative to the configuration file when it is not absolute: one value per line, # starts a comment. A set has one source: values or file.",
+            "description": "The file of the set, relative to the configuration file when it is not absolute: one value per line, # starts a comment; for an area set, a GeoJSON document. A set has one source: values or file.",
             "type": "string"
           },
           "refresh": {
@@ -329,7 +344,7 @@
             "default": "fail"
           },
           "max_entries": {
-            "description": "The largest number of values of the set, duplicates included; more is an error.",
+            "description": "The largest number of values of the set, duplicates included, or of polygons of an area set; more is an error.",
             "type": "integer",
             "minimum": 1,
             "default": 1000000

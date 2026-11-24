@@ -78,7 +78,7 @@ The first event of `tessera serve`, written before any listener opens. It is the
 
 ### `config_warning`
 
-A problem of the configuration that does not make it invalid, such as a set or a database that no rule, [upstream header](./configuration.md#upstream-headers) or [decision field](./configuration.md#log-decision-fields) reads. `tessera serve` writes one event for each warning, in the order of the file, right after `starting`, and [`tessera config validate`](./cli.md#tessera-config-validate) prints the same warnings.
+A problem of the configuration that does not make it invalid, such as a set, a database or the analysis of the user-agent header that no rule, [upstream header](./configuration.md#upstream-headers) or [decision field](./configuration.md#log-decision-fields) reads. `tessera serve` writes one event for each warning, in the order of the file, right after `starting`, and [`tessera config validate`](./cli.md#tessera-config-validate) prints the same warnings.
 
 ```text
 ts=2026-11-22T10:15:00.124Z level=warn msg=config_warning key=sets.office warning="the set is not used by any rule, upstream header or decision field"
@@ -86,7 +86,7 @@ ts=2026-11-22T10:15:00.124Z level=warn msg=config_warning key=sets.office warnin
 
 | Field | Value |
 | --- | --- |
-| `key` | The key of the configuration that the warning is about, such as `sets.office` or `enrichment.asn`. |
+| `key` | The key of the configuration that the warning is about, such as `sets.office`, `enrichment.asn` or `enrichment.user_agent`. |
 | `warning` | The problem. It never repeats a configured value. |
 
 ### `listening`
@@ -164,9 +164,9 @@ The same event at startup for a set of `values`, in the `json` format:
 | Field | Value |
 | --- | --- |
 | `set` | The name of the set. |
-| `set_type` | The type of the set: `cidr`, `asn` or `string`, as the label `type` of the [metrics of the sets](./metrics.md#sets). |
+| `set_type` | The type of the set: `cidr`, `asn`, `string` or `area`, as the label `type` of the [metrics of the sets](./metrics.md#sets). |
 | `set_source` | Where tessera reads the set from: `values` or `file`, as the label `source` of the metrics of the sets. |
-| `entries` | The entries of the new copy: the values read, a value written twice counted twice, as [`sets.<name>.max_entries`](./configuration.md#sets-name-max-entries) counts them. |
+| `entries` | The entries of the new copy: the values read, a value written twice counted twice, or the polygons of an area set, as [`sets.<name>.max_entries`](./configuration.md#sets-name-max-entries) counts them. |
 | `duration_ms` | The time of the load, in milliseconds with the precision of a microsecond, as in [`decision`](#decision): for a file, from the check of its state to the new copy, the reading of the file included. |
 
 ### `set_load_failed`
@@ -181,7 +181,7 @@ ts=2026-11-22T10:20:00.125Z level=warn msg=set_load_failed set=partners set_type
 | --- | --- |
 | `set` | The name of the set. |
 | `set_type`, `set_source` | The type and the source of the set, as in [`set_loaded`](#set-loaded). |
-| `error` | The problem. Content that is invalid or exceeds a ceiling gives `line <n> of the file: <problem>`, such as `line 12 of the file: more entries than max_entries`, or `the content is larger than 256 MiB`. A file that cannot be read gives `the file does not exist`, `not a regular file`, `the file cannot be opened: permission denied`, `the file cannot be opened` or `the file cannot be read`. It never repeats the content of the file or its path. |
+| `error` | The problem. Content that is invalid or exceeds a ceiling gives `line <n> of the file: <problem>`, such as `line 12 of the file: more entries than max_entries`, or `the content is larger than 256 MiB`; the GeoJSON document of an area set gives the column too, and the place of the problem in the document, such as `line 3, column 88 of the file: feature 3, polygon 1, ring 2: the ring is not closed: its last position differs from its first`. A file that cannot be read gives `the file does not exist`, `not a regular file`, `the file cannot be opened: permission denied`, `the file cannot be opened` or `the file cannot be read`. It never repeats the content of the file or its path. |
 
 ### `set_unavailable`
 
@@ -273,7 +273,7 @@ ts=2026-11-22T10:16:04.512Z level=warn msg=decision request_id=6f1c0f6e-5a1b-4a0
 
 - Every field but `audit_rules`, `indeterminate_rules` and `error` is in every `decision` event, in the order of the table. The lists are strings in both formats: rule names contain no comma.
 - `request_id`, `host`, `method` and `path` come from the request: tessera cuts each of them to 1024 bytes, at a character boundary, and so it cuts the value of a decision field.
-- tessera computes the decision fields only for an event that it writes, before the event enters [its queue](#the-queue-of-decision-events), with what the decision read: the same sets and databases, and the record of the client address that a rule looked up.
+- tessera computes the decision fields only for an event that it writes, before the event enters [its queue](#the-queue-of-decision-events), with what the decision read: the same sets and databases, and the records of the enrichments that a rule computed.
 - The event never holds the query of the request, nor a header, unless a decision field reads the header (see [What is never logged](#what-is-never-logged)).
 - tessera writes the event after the decision: the event cannot change it.
 
@@ -325,6 +325,6 @@ tessera recovered from a failure of its own code, and went on serving. During th
 
 ## What is never logged
 
-- The query of a request, and the values of its [secret headers](./configuration.md#secret-headers): `authorization`, `proxy-authorization`, `cookie` and those of `secret_headers`. A [decision field](./configuration.md#log-decision-fields) cannot read them.
+- The query of a request, and the values of its [secret headers](./configuration.md#secret-headers): `authorization`, `proxy-authorization`, `cookie` and those of `secret_headers`. A [decision field](./configuration.md#log-decision-fields) cannot read them. What tessera derives from a secret header, such as the attributes of `ua`, is not secret (see [`secret_headers`](./configuration.md#secret-headers)).
 - The other headers of a request, but `x-request-id`, which is `request_id`, unless a decision field reads them.
 - Configuration values, except the path of the configuration file, the addresses of the listeners, the keys that `config_warning` names, the names of the rules, of the sets and of the decision fields, and the types of the sets. The names of `secret_headers` and of `upstream.headers` are never logged. The value of a decision field is not a configuration value: it is what its expression computes for the request.

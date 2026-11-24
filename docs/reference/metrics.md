@@ -27,6 +27,8 @@ description: "Every Prometheus metric that tessera serve exports on the admin li
 | [`tessera_enrichment_database_last_refresh_success_timestamp_seconds`](#tessera-enrichment-database-last-refresh-success-timestamp-seconds) | gauge | `database` |
 | [`tessera_enrichment_database_refreshes_total`](#tessera-enrichment-database-refreshes-total) | counter | `database`, `result` |
 | [`tessera_enrichment_database_refresh_duration_seconds`](#tessera-enrichment-database-refresh-duration-seconds) | histogram | `database` |
+| [`tessera_enrichment_user_agent_cache_lookups_total`](#tessera-enrichment-user-agent-cache-lookups-total) | counter | `result` |
+| [`tessera_enrichment_user_agent_cache_entries`](#tessera-enrichment-user-agent-cache-entries) | gauge | none |
 
 Every series exists from startup, at zero for a counter: the values of the labels come from the configuration and from fixed lists, never from a request, so the number of series depends on the configuration alone. A thousand hosts, paths or client addresses add no series.
 
@@ -120,7 +122,7 @@ The conditions that could not be evaluated and that counted against allowing, by
 
 | `cause` | The condition |
 | --- | --- |
-| `client_ip_missing` | Read `client.ip`, and the request had no client address. |
+| `client_ip_missing` | Read `client.ip`, `geo` or `asn`, and the request had no client address. |
 | `expression` | Failed otherwise, such as on a missing header, a failed conversion, or the cost limit. |
 | `panic` | Made tessera fail while it evaluated the condition, which it recovered (see [`panic_recovered`](./logs.md#panic-recovered)). |
 | `set_unavailable` | Looked a value up in a set that was unavailable, with [`on_unavailable: fail`](./configuration.md#sets-name-on-unavailable). |
@@ -161,7 +163,7 @@ An expression that gives an empty string removes its header on purpose, and is n
 
 ## Sets
 
-The metrics of the sets have three labels: `set` is the name of the set, `type` its type, `cidr`, `asn` or `string`, and `source` where tessera reads it from:
+The metrics of the sets have three labels: `set` is the name of the set, `type` its type, `cidr`, `asn`, `string` or `area`, and `source` where tessera reads it from:
 
 | `source` | The set | Series |
 | --- | --- | --- |
@@ -175,7 +177,7 @@ Each series that a set has exists from startup. tessera loads every set before i
 **Type:** gauge\
 **Labels:** `set`, `type`, `source`
 
-The entries of the copy of the set in use: the values read from its source, a value written twice counted twice, as [`sets.<name>.max_entries`](./configuration.md#sets-name-max-entries) counts them. It changes when a new copy replaces the one in use, and stays the same when a check fails.
+The entries of the copy of the set in use: the values read from its source, a value written twice counted twice, or the polygons of an area set, as [`sets.<name>.max_entries`](./configuration.md#sets-name-max-entries) counts them. It changes when a new copy replaces the one in use, and stays the same when a check fails.
 
 ### `tessera_set_available`
 
@@ -217,7 +219,9 @@ The time of each check of the file of a set that [`tessera_set_refreshes_total`]
 
 ## Enrichments
 
-The metrics of the [enrichments](./configuration.md#enrichment) follow the checks of their databases, and have the label `database`: `geo` for [`enrichment.geo`](./configuration.md#enrichment-geo), and `asn` for [`enrichment.asn`](./configuration.md#enrichment-asn). Each configured enrichment has its series from startup, and an enrichment that the configuration does not have has none. tessera loads every database before it opens its listeners, and that load counts as a check with the result `updated`. The log events [`database_loaded`](./logs.md#database-loaded) and [`database_load_failed`](./logs.md#database-load-failed) report the same changes.
+The metrics of the databases of the [enrichments](./configuration.md#enrichment) follow the checks of their files, and have the label `database`: `geo` for [`enrichment.geo`](./configuration.md#enrichment-geo), and `asn` for [`enrichment.asn`](./configuration.md#enrichment-asn). Each configured database has its series from startup, and a database that the configuration does not have has none. tessera loads every database before it opens its listeners, and that load counts as a check with the result `updated`. The log events [`database_loaded`](./logs.md#database-loaded) and [`database_load_failed`](./logs.md#database-load-failed) report the same changes.
+
+The metrics of the analysis of the user-agent header, [`enrichment.user_agent`](./configuration.md#enrichment-user-agent), follow its cache: they exist from startup when the configuration has the analysis with a cache, that is with [`enrichment.user_agent.cache_entries`](./configuration.md#enrichment-user-agent-cache-entries) greater than `0`, and not otherwise.
 
 ### `tessera_enrichment_database_build_timestamp_seconds`
 
@@ -260,6 +264,27 @@ A check that fails is counted at each `refresh` for as long as the file stays th
 **Buckets:** `0.0001`, `0.001`, `0.01`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`
 
 The time of each check of the file of a database that [`tessera_enrichment_database_refreshes_total`](#tessera-enrichment-database-refreshes-total) counts, whatever its result, the load at startup included: the reading of the state of the file and, when it has to be read, the reading of the file and the checks of the database.
+
+### `tessera_enrichment_user_agent_cache_lookups_total`
+
+**Type:** counter\
+**Labels:** `result`
+
+The lookups of a user-agent header in the cache of the analysis, one for each decision that reads [`ua`](./expressions.md#ua) and whose request has a nonempty `user-agent` header, by result. A decision that does not read `ua`, and a request without the header, look nothing up.
+
+| `result` | The lookup |
+| --- | --- |
+| `hit` | Found the record of the header in the cache: tessera did not analyze it. |
+| `miss` | Did not find it: tessera analyzed the header, and put its record in the cache unless other decisions were using the cache at that moment. |
+
+`rate(tessera_enrichment_user_agent_cache_lookups_total{result="hit"}[5m])` divided by the rate of all lookups is the share of the decisions that found their header in the cache: a low share with a cache that stays full means that clients send more different headers than it holds.
+
+### `tessera_enrichment_user_agent_cache_entries`
+
+**Type:** gauge\
+**Labels:** none
+
+The headers whose records the cache holds, read at each scrape. It never exceeds [`enrichment.user_agent.cache_entries`](./configuration.md#enrichment-user-agent-cache-entries).
 
 ## Go and process metrics
 

@@ -42,7 +42,7 @@ func testSets(t testing.TB, answer sets.OnUnavailable) (*sets.Store, Options) {
 
 func evalWith(t *testing.T, env *Env, text string, r *request.Request, store *sets.Store) (bool, error) {
 	t.Helper()
-	return mustCompile(t, env, text).Eval(NewInput(r, store.Snapshot(), nil))
+	return mustCompile(t, env, text).Eval(NewInput(r, store.Snapshot(), nil, nil))
 }
 
 func TestSetContains(t *testing.T) {
@@ -118,7 +118,7 @@ func TestSetUnavailable(t *testing.T) {
 		}
 		// A set never loaded is unavailable too: an Input without a
 		// snapshot has none loaded.
-		got, err := mustCompile(t, env, `sets.hosts.contains("api.example.com")`).Eval(NewInput(r, nil, nil))
+		got, err := mustCompile(t, env, `sets.hosts.contains("api.example.com")`).Eval(NewInput(r, nil, nil, nil))
 		if got != tc.want || cause(err) != tc.cause {
 			t.Errorf("on_unavailable %s, never loaded: %v, %v", tc.answer, got, err)
 		}
@@ -229,7 +229,7 @@ func TestSetSnapshotPerDecision(t *testing.T) {
 	env := newEnv(t, opts)
 	c := mustCompile(t, env, `sets.hosts.contains(request.host)`)
 	r := sampleRequest("192.0.2.10")
-	in := NewInput(r, store.Snapshot(), nil)
+	in := NewInput(r, store.Snapshot(), nil, nil)
 	if ok, err := c.Eval(in); !ok || err != nil {
 		t.Fatalf("before the replacement: %v, %v", ok, err)
 	}
@@ -243,7 +243,7 @@ func TestSetSnapshotPerDecision(t *testing.T) {
 	if ok, err := c.Eval(in); !ok || err != nil {
 		t.Errorf("same decision, after the replacement: %v, %v; want the copy it started with", ok, err)
 	}
-	if _, err := c.Eval(NewInput(r, store.Snapshot(), nil)); cause(err) != CauseSetUnavailable {
+	if _, err := c.Eval(NewInput(r, store.Snapshot(), nil, nil)); cause(err) != CauseSetUnavailable {
 		t.Errorf("next decision: %v; want the set unavailable", err)
 	}
 }
@@ -278,7 +278,7 @@ func TestSetsConcurrentReplacement(t *testing.T) {
 	for range 8 {
 		workers.Go(func() {
 			for range 2000 {
-				in := NewInput(sampleRequest("192.0.2.10"), store.Snapshot(), nil)
+				in := NewInput(sampleRequest("192.0.2.10"), store.Snapshot(), nil, nil)
 				a, errA := first.Eval(in)
 				b, errB := second.Eval(in)
 				if a != b || cause(errA) != cause(errB) {
@@ -301,7 +301,7 @@ func TestSetContainsCost(t *testing.T) {
 	cost := func(host string) uint64 {
 		r := sampleRequest("192.0.2.10")
 		r.Host = host
-		_, details, err := c.prg.Eval(NewInput(r, store.Snapshot(), nil))
+		_, details, err := c.prg.Eval(NewInput(r, store.Snapshot(), nil, nil))
 		if err != nil || details == nil || details.ActualCost() == nil {
 			t.Fatalf("no cost: %v", err)
 		}

@@ -1,8 +1,9 @@
 # The test upstream: every request on port 8081 gets 200 with the body
 # "upstream", so that the test knows the request reached it. A request whose
 # path starts with /reflect/ gets in its response the values of the headers
-# x-client-asn and x-client-country that reached the upstream, as
-# x-upstream-client-asn and x-upstream-client-country: the first value of
+# x-client-asn, x-client-country, x-client-device and x-client-bot that
+# reached the upstream, as x-upstream-client-asn, x-upstream-client-country,
+# x-upstream-client-device and x-upstream-client-bot: the first value of
 # each, and no header when the request had none.
 static_resources:
   listeners:
@@ -27,6 +28,8 @@ static_resources:
                           response_headers_to_add:
                             - header: { key: x-upstream-client-asn, value: "%REQ(x-client-asn)%" }
                             - header: { key: x-upstream-client-country, value: "%REQ(x-client-country)%" }
+                            - header: { key: x-upstream-client-device, value: "%REQ(x-client-device)%" }
+                            - header: { key: x-upstream-client-bot, value: "%REQ(x-client-bot)%" }
                         - match: { prefix: "/" }
                           direct_response:
                             status: 200

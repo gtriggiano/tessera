@@ -108,9 +108,9 @@ func (c *Config) validateDecisionFieldNames() error {
 	return nil
 }
 
-// validateEnrichment checks each database that the file writes. The files
-// of the databases are not read here: their loader reports their errors
-// with ErrorAt.
+// validateEnrichment checks each database that the file writes, and the
+// analysis of the user-agent header. The files of the databases are not read
+// here: their loader reports their errors with ErrorAt.
 func (c *Config) validateEnrichment() error {
 	for _, k := range c.DatabaseKinds() {
 		db, p := c.Enrichment.Database(k), "enrichment."+string(k)
@@ -124,6 +124,9 @@ func (c *Config) validateEnrichment() error {
 		case db.Refresh < MinDatabaseRefresh:
 			return c.err(p+".refresh", "must be at least 1s")
 		}
+	}
+	if u := c.Enrichment.UserAgent; u != nil && (u.CacheEntries < 0 || u.CacheEntries > MaxUserAgentCacheEntries) {
+		return c.err("enrichment.user_agent.cache_entries", "expected an integer from 0 to "+strconv.Itoa(MaxUserAgentCacheEntries))
 	}
 	return nil
 }
@@ -156,8 +159,8 @@ func (c *Config) validateSet(name string) error {
 	switch {
 	case !c.present(p + ".type"):
 		return c.err(p+".type", "required")
-	case s.Type != SetTypeCIDR && s.Type != SetTypeASN && s.Type != SetTypeString:
-		return c.err(p+".type", "expected cidr, asn or string")
+	case s.Type != SetTypeCIDR && s.Type != SetTypeASN && s.Type != SetTypeString && s.Type != SetTypeArea:
+		return c.err(p+".type", "expected cidr, asn, string or area")
 	}
 	values, file := c.present(p+".values"), c.present(p+".file")
 	switch {
@@ -169,6 +172,8 @@ func (c *Config) validateSet(name string) error {
 			later = ".values"
 		}
 		return c.err(p+later, "values and file are both set: a set has one source")
+	case values && s.Type == SetTypeArea:
+		return c.err(p+".values", "not allowed with type area: an area set reads a GeoJSON file")
 	}
 	if s.MaxEntries < 1 {
 		return c.err(p+".max_entries", "must be positive")

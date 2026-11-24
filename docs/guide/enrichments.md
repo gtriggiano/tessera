@@ -1,12 +1,12 @@
 ---
-description: "What an enrichment is, and how to get the MaxMind databases that geo and asn read, keep them up to date with geoipupdate in Docker, in Kubernetes or in an image, configure the enrichments, check that tessera loads every release, and use them in rules."
+description: "What an enrichment is, and how to get the MaxMind databases that geo and asn read, keep them up to date with geoipupdate in Docker, in Kubernetes or in an image, configure the enrichments, check that tessera loads every release, use them in rules, and recognize the client software with ua."
 ---
 
 # Enrich requests
 
-An enrichment is a group of attributes that **tessera** derives from the client address, such as its country or its autonomous system. Every expression can read them, in a condition, an upstream header or a decision field, and tessera computes them only when an expression reads them, once per decision. This page describes the enrichments that tessera has today, `geo` and `asn`, and shows how to get the files that they read from MaxMind, keep them up to date with MaxMind's `geoipupdate` in Docker, in Kubernetes or in an image, configure tessera to read them, check that it loads every new release, and use them in rules.
+An enrichment is a group of attributes that **tessera** derives from the request, such as the country or the autonomous system of the client address, or the browser that the `user-agent` header names. Every expression can read them, in a condition, an upstream header or a decision field, and tessera computes them only when an expression reads them, once per decision. This page describes the enrichments that tessera has today, `geo`, `asn` and `ua`. It shows how to get the files that `geo` and `asn` read from MaxMind, keep them up to date with MaxMind's `geoipupdate` in Docker, in Kubernetes or in an image, configure tessera to read them, check that it loads every new release, and use them in rules; then how to recognize the client software with `ua`, which reads no file.
 
-Enrichments come after the client address in the [path of a request](./how-tessera-works.md#enrichments): they describe the address that [Set the client address](./client-address.md) chooses, and the [policy rules](./policy-rules.md) read them next to the request and the [sets](./sets.md).
+Enrichments come after the client address in the [path of a request](./how-tessera-works.md#enrichments): `geo` and `asn` describe the address that [Set the client address](./client-address.md) chooses, `ua` the software that sent the request, and the [policy rules](./policy-rules.md) read them next to the request and the [sets](./sets.md).
 
 ## The enrichments
 
@@ -15,7 +15,13 @@ Enrichments come after the client address in the [path of a request](./how-tesse
 | [`geo`](../reference/expressions.md#geo) | Its country, continent, subdivisions, city, postal code, time zone and location. | [`enrichment.geo`](../reference/configuration.md#enrichment-geo) |
 | [`asn`](../reference/expressions.md#asn) | Its autonomous system: its number and its organization. | [`enrichment.asn`](../reference/configuration.md#enrichment-asn) |
 
-tessera reads both from files in the MaxMind DB format, which it loads into memory before it opens its listeners, and loads again when they change. An enrichment exists only when its block of `enrichment` configures it: an expression that reads one that the configuration does not have is a configuration error. The [configuration reference](../reference/configuration.md#enrichment) describes every key.
+`ua` says what the `user-agent` header says of the client software:
+
+| Enrichment | What it says of the client software | Configured by |
+| --- | --- | --- |
+| [`ua`](../reference/expressions.md#ua) | Its browser and operating system, with their versions, the kind of device, and whether it is a bot, with the name and the description of the bot. | [`enrichment.user_agent`](../reference/configuration.md#enrichment-user-agent) |
+
+tessera reads `geo` and `asn` from files in the MaxMind DB format, which it loads into memory before it opens its listeners, and loads again when they change. `ua` reads no file: tessera analyzes the header of the request (see [Recognize the client software](#recognize-the-client-software)). An enrichment exists only when its block of `enrichment` configures it: an expression that reads one that the configuration does not have is a configuration error. The [configuration reference](../reference/configuration.md#enrichment) describes every key.
 
 ## Choose the databases
 
@@ -319,7 +325,7 @@ time() - tessera_enrichment_database_build_timestamp_seconds > 7 * 86400
 
 ### In rules
 
-A condition of the [policy rules](./policy-rules.md) reads the record of the client address through the attributes of [`geo`](../reference/expressions.md#geo) and [`asn`](../reference/expressions.md#asn), and [sets](./sets.md) of type `asn` hold AS numbers:
+A condition of the [policy rules](./policy-rules.md) reads the record of the client address through the attributes of [`geo`](../reference/expressions.md#geo) and [`asn`](../reference/expressions.md#asn), [sets](./sets.md) of type `asn` hold AS numbers, and sets of type `area` hold geographic areas, in which a rule looks up `geo.location` (see [Match a location in an area](./sets.md#match-a-location-in-an-area)):
 
 ```yaml [config.yaml]
 enrichment:
@@ -372,12 +378,51 @@ upstream:
 
 [Send headers to the upstream](./responses-and-logs.md#send-headers-to-the-upstream) shows what the upstream can trust in such a header, and [Log the decisions](./responses-and-logs.md#log-the-decisions) what a decision field can read.
 
+## Recognize the client software
+
+The `user-agent` header names the software that sent the request: a browser on a phone, a crawler, a script. [`ua`](../reference/expressions.md#ua) reads it, once [`enrichment.user_agent`](../reference/configuration.md#enrichment-user-agent) turns the analysis on. It has no file to get or to keep up to date: an empty block turns it on with its defaults.
+
+```yaml [config.yaml]
+enrichment:
+  user_agent: {}
+sets:
+  blocked_bots:
+    type: string
+    values: [OpenAI GPT, Claude Bot, Bytespider]
+policy:
+  default_action: allow
+  rules:
+    - name: blocked-bots
+      description: Bots that the site does not serve.
+      action: deny
+      when: sets.blocked_bots.contains(ua.bot.name)
+    - name: checkout-bots
+      description: Crawlers and scripts on the checkout pages.
+      action: deny
+      when: request.path.startsWith("/checkout") && ua.is_bot
+log:
+  decision_fields:
+    bot: ua.bot.name
+upstream:
+  headers:
+    x-client-device: ua.device
+```
+
+- tessera analyzes the header when an expression reads `ua`, and keeps the records of recent headers in a cache that every decision shares, whose number of entries [`enrichment.user_agent.cache_entries`](../reference/configuration.md#enrichment-user-agent-cache-entries) sets. Raise it when the share of lookups that find their header in the cache stays low (see [`tessera_enrichment_user_agent_cache_lookups_total`](../reference/metrics.md#tessera-enrichment-user-agent-cache-lookups-total)).
+- A request without the header, or with one that tessera does not recognize, is not an error: the names and the versions are empty, `ua.device` is `unknown` and `ua.is_bot` is `false`. A rule that denies bots does not deny it: to decide on requests without the header, test it, as `!("user-agent" in request.headers)` does.
+- The names that `ua.browser.name`, `ua.os.name` and `ua.bot.name` take are in the [expressions reference](../reference/expressions.md#ua), with how tessera recognizes a bot and where `ua.bot.description` comes from.
+- To decide on a group of bots, put their names in a `string` [set](./sets.md), such as `blocked_bots` above, and look `ua.bot.name` up in it: take the names from the [bot names reference](../reference/bot-names.md), which lists every name that tessera gives, with its description.
+
+::: warning Do not trust the header
+A client writes its own `user-agent` header, and can write anything, such as the header of a browser or of a well-known crawler. Use `ua` to treat the clients that say what they are, such as crawlers and scripts, and not to let a client through because of its header: to allow a crawler, check its address too, such as with a [set](./sets.md) of the networks that its operator publishes.
+:::
+
 ## Try a change
 
-[`tessera eval`](../reference/cli.md#enrichments) reads the databases of the configuration, and shows the attributes of `geo` and `asn` that the rules read for an address, and the upstream headers of an allowed request:
+[`tessera eval`](../reference/cli.md#enrichments) reads the databases of the configuration, and shows the attributes of `geo`, `asn` and `ua` that the rules read for an address and a `user-agent` header, and the upstream headers of an allowed request:
 
 ```sh
-tessera eval --config config.yaml --ip 192.0.2.10
+tessera eval --config config.yaml --ip 192.0.2.10 --header 'user-agent: curl/8.7.1'
 ```
 
 In the Docker project above, run it in the image: `docker compose run --rm tessera eval --ip 192.0.2.10`.

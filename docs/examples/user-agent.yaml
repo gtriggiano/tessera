@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../public/config.schema.json
+# The analysis of the user-agent header has no file.
+enrichment:
+  user_agent: {}
+
+log:
+  decisions: all
+  decision_fields:
+    bot: ua.bot.name
+
+policy:
+  default_action: allow
+  rules:
+    - name: checkout-bots
+      description: Crawlers and scripts on the checkout pages.
+      action: deny
+      when: request.path.startsWith("/checkout") && ua.is_bot
+
+    - name: old-safari
+      description: Versions of Safari that the checkout pages do not support.
+      action: deny
+      when: |
+        request.path.startsWith("/checkout")
+          && ua.browser.name == "Safari" && ua.browser.major < 15
+      response:
+        status: 400
+        body: Update your browser to pay.
+
+upstream:
+  headers:
+    x-client-device: ua.device

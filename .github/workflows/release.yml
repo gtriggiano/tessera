@@ -276,6 +276,11 @@ jobs:
         with:
           node-version-file: docs/.node-version
           package-manager-cache: false
+      # make docs-build writes the bot names reference with Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - run: make docs-install
       # The site of this version lives under vX.Y/ of the site root, or next/
       # for a release candidate (see "Versioned documentation" in RELEASING.md).

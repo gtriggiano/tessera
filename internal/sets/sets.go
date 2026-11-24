@@ -4,8 +4,9 @@
 //
 // A copy is never changed once built: a new copy replaces it, atomically, in
 // the Store. An entry of a set is a value read from its source, a duplicate
-// included: max_entries bounds the values read, so it bounds both the memory
-// of a copy and the work of building it, and Entries reports the same count.
+// included, or, for an area set, a polygon: max_entries bounds the entries
+// read, so it bounds both the memory of a copy and the work of building it,
+// and Entries reports the same count.
 package sets
 
 import (
@@ -21,6 +22,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/gaissmai/bart"
+
+	"github.com/gtriggiano/tessera/internal/area"
 )
 
 // Type is the type of a set: what its values are.
@@ -34,6 +37,8 @@ const (
 	ASN Type = "asn"
 	// String holds strings, compared exactly.
 	String Type = "string"
+	// Area holds polygons, read from a GeoJSON document.
+	Area Type = "area"
 )
 
 // The fixed ceilings of the content of a set.
@@ -55,21 +60,37 @@ const MaxASN = 1<<32 - 1
 const byteOrderMark = "\uFEFF"
 
 // Error is invalid content: an invalid value, or a ceiling exceeded. Line,
-// for text content, is the line of the problem, from 1; Value, for a list of
-// values, is the position of the value, from 1; both are 0 for a problem of
-// the whole content. Problem never repeats the content.
+// for content read from a file, is the line of the problem, from 1; Column,
+// for a GeoJSON document, its column, from 1, in characters, and Path its
+// place in the structure of the document, such as "feature 3, polygon 1, ring
+// 2", or empty; Value, for a list of values, is the position of the value,
+// from 1; all are 0 for a problem of the whole content. Problem never repeats
+// the content.
 type Error struct {
 	Line    int
+	Column  int
+	Path    string
 	Value   int
 	Problem string
 }
 
 func (e *Error) Error() string {
 	switch {
+	case e.Line > 0 && e.Column > 0:
+		return fmt.Sprintf("line %d, column %d: %s", e.Line, e.Column, e.Where())
 	case e.Line > 0:
 		return fmt.Sprintf("line %d: %s", e.Line, e.Problem)
 	case e.Value > 0:
 		return fmt.Sprintf("value %d: %s", e.Value, e.Problem)
+	}
+	return e.Problem
+}
+
+// Where returns the problem, after its place in the structure of a GeoJSON
+// document, if any.
+func (e *Error) Where() string {
+	if e.Path != "" {
+		return e.Path + ": " + e.Problem
 	}
 	return e.Problem
 }
@@ -88,6 +109,7 @@ var (
 	errLineLong     = errors.New("the line is longer than 4 KiB")
 	errFileLarge    = errors.New("the content is larger than 256 MiB")
 	errTooMany      = errors.New("more entries than max_entries")
+	errAreaValue    = errors.New("an area set has no values: it reads a GeoJSON document")
 )
 
 // errUnknownType is the error of a type that tessera does not know.
@@ -101,13 +123,14 @@ type Set struct {
 	prefixes *bart.Lite
 	numbers  map[uint32]struct{}
 	strings  map[string]struct{}
+	polygons *area.Polygons
 }
 
 // Type returns the type of the set.
 func (s *Set) Type() Type { return s.typ }
 
 // Entries returns the number of values that the set was built from,
-// duplicates included.
+// duplicates included, or, for an area set, its number of polygons.
 func (s *Set) Entries() int { return s.entries }
 
 // ContainsAddr reports whether a is in a network of a cidr set. An
@@ -137,6 +160,12 @@ func (s *Set) ContainsString(v string) bool {
 	return ok
 }
 
+// ContainsPoint reports whether the point at latitude lat and longitude lon
+// is in a polygon of an area set, as area.Polygons.Contains says.
+func (s *Set) ContainsPoint(lat, lon float64) bool {
+	return s.polygons.Contains(lat, lon)
+}
+
 // builder builds a new Set, and counts the values added to it.
 type builder struct {
 	set *Set
@@ -152,6 +181,8 @@ func newBuilder(t Type, maxEntries int) (*builder, error) {
 		s.numbers = map[uint32]struct{}{}
 	case String:
 		s.strings = map[string]struct{}{}
+	case Area:
+		// An empty area: its polygons come from a document only.
 	default:
 		return nil, errUnknownType
 	}
@@ -188,6 +219,8 @@ func (b *builder) add(v string) error {
 			return err
 		}
 		b.set.strings[v] = struct{}{}
+	case Area:
+		return errAreaValue
 	}
 	return nil
 }
@@ -198,7 +231,8 @@ func trim(s string) string { return strings.Trim(s, " \t\r") }
 
 // ParseValue checks value, one value of a set of type t as values and --set
 // write it: at most MaxValueBytes, without the spaces around it. The error,
-// if any, is the problem, and never repeats the value.
+// if any, is the problem, and never repeats the value. An area set has no
+// values.
 func ParseValue(t Type, value string) error {
 	b, err := newBuilder(t, 1)
 	if err != nil {
@@ -216,7 +250,7 @@ func (b *builder) parseValue(value string) error {
 
 // FromValues builds a set of type t from values, each read as ParseValue
 // reads it. An invalid value, or more than maxEntries values, is an *Error
-// with the position of the value.
+// with the position of the value. An area set of no values is empty.
 func FromValues(t Type, values []string, maxEntries int) (*Set, error) {
 	b, err := newBuilder(t, maxEntries)
 	if err != nil {
@@ -249,11 +283,18 @@ func (e *ReadError) Unwrap() error { return e.err }
 // maxEntries values. Invalid content, or a ceiling exceeded, is an *Error
 // with the line number; a failure of r is a *ReadError. The content is
 // never applied in part: on an error, there is no set.
+//
+// The content of an area set is a GeoJSON document instead, which
+// area.Read reads, with at most maxEntries polygons: an invalid document is
+// an *Error with its line, its column and its place in the structure.
 func Read(t Type, r io.Reader, maxEntries int) (*Set, error) {
 	return read(t, r, maxEntries, MaxFileBytes)
 }
 
 func read(t Type, r io.Reader, maxEntries int, maxBytes int64) (*Set, error) {
+	if t == Area {
+		return readArea(r, maxEntries, maxBytes)
+	}
 	b, err := newBuilder(t, maxEntries)
 	if err != nil {
 		return nil, err
@@ -306,6 +347,23 @@ func read(t Type, r io.Reader, maxEntries int, maxBytes int64) (*Set, error) {
 		return nil, &Error{Problem: errFileLarge.Error()}
 	}
 	return b.set, nil
+}
+
+// readArea builds an area set from a GeoJSON document, read from r, of at
+// most maxBytes.
+func readArea(r io.Reader, maxEntries int, maxBytes int64) (*Set, error) {
+	limited := &io.LimitedReader{R: r, N: maxBytes + 1}
+	polygons, err := area.Read(limited, maxEntries)
+	var invalid *area.Error
+	switch {
+	case err != nil && !errors.As(err, &invalid):
+		return nil, &ReadError{err: err}
+	case limited.N <= 0:
+		return nil, &Error{Problem: errFileLarge.Error()}
+	case err != nil:
+		return nil, &Error{Line: invalid.Line, Column: invalid.Column, Path: invalid.Path, Problem: invalid.Problem}
+	}
+	return &Set{typ: Area, entries: polygons.Len(), polygons: polygons}, nil
 }
 
 // parseCIDR parses a network or an address, which is a network of one

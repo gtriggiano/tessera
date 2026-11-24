@@ -37,10 +37,10 @@ func evalCommand(lookup config.LookupEnv) *cobra.Command {
 			"file, and show the attributes that the rules read, the outcome of each rule up\n" +
 			"to the one that decides, the decision, and the upstream headers of a request\n" +
 			"that Envoy sends on. The request goes through the same normalization as a\n" +
-			"request from Envoy; --ip sets client.ip, which is missing without it. The sets\n" +
-			"are loaded as serve loads them, their files included, except those that --set\n" +
-			"replaces, and so are the databases of geo and asn. Nothing is logged and no\n" +
-			"socket is opened.\n\n" +
+			"request from Envoy; --ip sets client.ip, which is missing without it, and\n" +
+			"ua reads the user-agent header of --header. The sets are loaded as serve\n" +
+			"loads them, their files included, except those that --set replaces, and so\n" +
+			"are the databases of geo and asn. Nothing is logged and no socket is opened.\n\n" +
 			"Exit status: 0 whatever the decision; 2 for usage and configuration errors.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -98,7 +98,7 @@ func evalCommand(lookup config.LookupEnv) *cobra.Command {
 	flags.StringVar(&f.query, "query", "", "the query of the request, without ?")
 	flags.StringVar(&f.scheme, "scheme", "https", "the scheme of the request")
 	flags.StringArrayVar(&f.headers, "header", nil, "a header, as 'name: value'; repeat it for more")
-	flags.StringArrayVar(&f.sets, "set", nil, "replace the content of a set, as 'name=value,value', read as its values; 'name=' for an empty set; its file is not read; once per set, repeat it for more sets")
+	flags.StringArrayVar(&f.sets, "set", nil, "replace the content of a set, as 'name=value,value', read as its values; 'name=' for an empty set, the only form for an area set; its file is not read; once per set, repeat it for more sets")
 	flags.StringVar(&f.output, "output", "text", "output format: text or json")
 	return cmd
 }
@@ -162,8 +162,9 @@ func (f *evalFlags) setValues() ([]setFlag, error) {
 }
 
 // replacements builds the copy of each set that --set replaces, from the
-// values read as the values of its type. An unknown set and an invalid value
-// are usage errors that repeat no value; a declared name can be named.
+// values read as the values of its type; an area set takes no values, and
+// becomes empty. An unknown set and an invalid value are usage errors that
+// repeat no value; a declared name can be named.
 func replacements(cfg *config.Config, given []setFlag) (map[string]*sets.Set, error) {
 	out := map[string]*sets.Set{}
 	for _, g := range given {
@@ -173,6 +174,9 @@ func replacements(cfg *config.Config, given []setFlag) (map[string]*sets.Set, er
 		}
 		if _, twice := out[g.name]; twice {
 			return nil, fmt.Errorf("invalid --set: the set %s is given twice", g.name)
+		}
+		if s.Type == config.SetTypeArea && len(g.values) > 0 {
+			return nil, fmt.Errorf("invalid --set for the set %s: an area set takes no values; --set %s= makes it empty", g.name, g.name)
 		}
 		set, err := sets.FromValues(sets.Type(s.Type), g.values, s.MaxEntries)
 		if err != nil {
@@ -320,10 +324,13 @@ func explain(p config.Policy, r *request.Request, x engine.Explanation, secretHe
 
 // attributes returns the value of the attribute name, as an expression
 // names it, for r: every header when name is request.headers, those of
-// secretHeaders redacted. in reads geo and asn as the decision did.
+// secretHeaders redacted. in reads geo, asn and ua as the decision did.
 func attributes(name string, r *request.Request, in *expr.Input, secretHeaders []string) []evalAttribute {
 	str := func(name, s string) evalAttribute { return evalAttribute{Name: name, Value: &s} }
 	if a, ok := databaseAttribute(name, in); ok {
+		return []evalAttribute{a}
+	}
+	if a, ok := userAgentAttribute(name, in); ok {
 		return []evalAttribute{a}
 	}
 	header := func(key string) evalAttribute {
@@ -452,6 +459,60 @@ func databaseAttribute(name string, in *expr.Input) (evalAttribute, bool) {
 		return missing, true
 	}
 	return evalAttribute{}, false
+}
+
+// userAgentAttribute returns the value of name when it is an attribute of ua,
+// as the decision analyzed the user-agent header: missing when the analysis
+// failed. An object read as a whole is written as a CEL literal, as an
+// object of geo is: {name: "Chrome", version: "131.0.6778", major: 131,
+// minor: 0}.
+func userAgentAttribute(name string, in *expr.Input) (evalAttribute, bool) {
+	field, ok := strings.CutPrefix(name, "ua.")
+	if !ok {
+		return evalAttribute{}, false
+	}
+	value := func(s string, bare bool) (evalAttribute, bool) {
+		return evalAttribute{Name: name, Value: &s, bare: bare}, true
+	}
+	integer := func(i int64) string { return strconv.FormatInt(i, 10) }
+	u, err := in.UserAgent()
+	if err != nil {
+		return evalAttribute{Name: name, Missing: true}, true
+	}
+	b, o := u.Browser, u.OS
+	switch field {
+	case "browser":
+		return value(literal("name", strconv.Quote(b.Name), "version", strconv.Quote(b.Version), "major", integer(b.Major), "minor", integer(b.Minor)), true)
+	case "browser.name":
+		return value(b.Name, false)
+	case "browser.version":
+		return value(b.Version, false)
+	case "browser.major":
+		return value(integer(b.Major), true)
+	case "browser.minor":
+		return value(integer(b.Minor), true)
+	case "os":
+		return value(literal("name", strconv.Quote(o.Name), "version", strconv.Quote(o.Version), "major", integer(o.Major), "minor", integer(o.Minor)), true)
+	case "os.name":
+		return value(o.Name, false)
+	case "os.version":
+		return value(o.Version, false)
+	case "os.major":
+		return value(integer(o.Major), true)
+	case "os.minor":
+		return value(integer(o.Minor), true)
+	case "device":
+		return value(u.Device, false)
+	case "is_bot":
+		return value(strconv.FormatBool(u.IsBot), true)
+	case "bot":
+		return value(literal("name", strconv.Quote(u.Bot.Name), "description", strconv.Quote(u.Bot.Description)), true)
+	case "bot.name":
+		return value(u.Bot.Name, false)
+	case "bot.description":
+		return value(u.Bot.Description, false)
+	}
+	return evalAttribute{Name: name, Missing: true}, true
 }
 
 // literal writes an object as a CEL literal, from the names and the values

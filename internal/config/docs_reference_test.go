@@ -102,6 +102,8 @@ const referenceName = "reference_name"
 var referenceBlocks = map[string]string{
 	"enrichment.geo": "{database: reference.mmdb}",
 	"enrichment.asn": "{database: reference.mmdb}",
+	// No key is required: the block is empty.
+	"enrichment.user_agent": "{}",
 }
 
 type schemaKey struct {

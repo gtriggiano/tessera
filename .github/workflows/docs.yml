@@ -55,6 +55,12 @@ jobs:
           node-version-file: docs/.node-version
           cache: npm
           cache-dependency-path: docs/package-lock.json
+      # make docs-build writes the bot names reference with Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
       - run: make docs-install
       # Skipped only when a caller passes audit: false (inputs.audit is null
       # for pull requests and pushes, and null == false in expressions).
@@ -192,6 +198,12 @@ jobs:
           path: root
           fetch-depth: 0
           persist-credentials: false
+      # make docs-build writes the bot names reference with Go, in the version
+      # of the release.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: root/go.mod
+          cache: false
       - run: make -C root docs-install
       # Skipped on manual deploys and when the caller passes audit: false, as
       # the Release workflow does: an advisory published after a release cannot

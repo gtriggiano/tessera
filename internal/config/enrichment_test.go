@@ -179,3 +179,104 @@ func TestLoadDatabasePaths(t *testing.T) {
 		t.Errorf("ErrorAt: %v", err)
 	}
 }
+
+// enrichment.user_agent is absent by default; an empty block turns it on with
+// its defaults.
+func TestUserAgentEnrichment(t *testing.T) {
+	if c := mustParse(t, "policy: {default_action: deny}\n", nil); c.Enrichment.UserAgent != nil {
+		t.Errorf("by default: %+v", c.Enrichment.UserAgent)
+	}
+	for _, tc := range []struct {
+		yaml string
+		want int
+	}{
+		{"user_agent: {}", DefaultUserAgentCacheEntries},
+		{"user_agent:\n    cache_entries: 0", 0},
+		{"user_agent: {cache_entries: 1}", 1},
+		{"user_agent: {cache_entries: 1000000}", MaxUserAgentCacheEntries},
+	} {
+		c := mustParse(t, "enrichment:\n  "+tc.yaml+"\npolicy:\n  default_action: deny\n  rules:\n    - name: bots\n      action: deny\n      when: ua.is_bot\n", nil)
+		if c.Enrichment.UserAgent == nil || c.Enrichment.UserAgent.CacheEntries != tc.want {
+			t.Errorf("%s: %+v", tc.yaml, c.Enrichment.UserAgent)
+		}
+		if len(c.Warnings()) != 0 || len(c.DatabaseKinds()) != 0 {
+			t.Errorf("%s: warnings %v, databases %v", tc.yaml, c.Warnings(), c.DatabaseKinds())
+		}
+	}
+
+	// Configured and read by nothing: a warning at the key of the block, in
+	// the order of the file with the others.
+	c := mustParse(t, `sets:
+  unused: {type: asn, values: [64496]}
+enrichment:
+  asn: {database: asn.mmdb}
+  user_agent: {}
+policy:
+  default_action: deny
+  rules:
+    - name: hosting
+      action: deny
+      when: asn.number == 64500
+`, nil)
+	var got []string
+	for _, w := range c.Warnings() {
+		got = append(got, w.String())
+	}
+	if want := []string{
+		"sets.unused (line 2, column 3): the set is not used by any rule, upstream header or decision field",
+		"enrichment.user_agent (line 5, column 3): the enrichment is not used by any rule, upstream header or decision field",
+	}; !slices.Equal(got, want) {
+		t.Errorf("warnings %q", got)
+	}
+	// A rule in audit mode, an upstream header or a decision field that
+	// reads ua uses it.
+	for _, use := range []string{
+		"policy:\n  default_action: deny\n  rules:\n    - name: bots\n      action: deny\n      mode: audit\n      when: ua.is_bot\n",
+		"policy: {default_action: deny}\nupstream:\n  headers:\n    x-client-device: ua.device\n",
+		"policy: {default_action: deny}\nlog:\n  decision_fields:\n    bot: ua.bot.name\n",
+	} {
+		if c := mustParse(t, "enrichment:\n  user_agent: {}\n"+use, nil); len(c.Warnings()) != 0 {
+			t.Errorf("%s: warnings %v", use, c.Warnings())
+		}
+	}
+}
+
+func TestInvalidUserAgentEnrichment(t *testing.T) {
+	const tail = "policy: {default_action: deny}\n"
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"null block", "enrichment:\n  user_agent:\n", "enrichment.user_agent (line 2, column 14): null is not allowed; omit the key to use its default"},
+		{"not a mapping", "enrichment:\n  user_agent: true\n", "enrichment.user_agent (line 2, column 15): expected a mapping"},
+		{"unknown key", "enrichment:\n  user_agent: {refresh: 1m}\n", "enrichment.user_agent.refresh (line 2, column 16): unknown key"},
+		{"negative", "enrichment:\n  user_agent: {cache_entries: -1}\n", "enrichment.user_agent.cache_entries (line 2, column 31): expected an integer from 0 to 1000000"},
+		{"too many", "enrichment:\n  user_agent: {cache_entries: 1000001}\n", "enrichment.user_agent.cache_entries (line 2, column 31): expected an integer from 0 to 1000000"},
+		{"string", "enrichment:\n  user_agent: {cache_entries: \"10\"}\n", "enrichment.user_agent.cache_entries (line 2, column 31): expected a decimal integer"},
+		{"ua without enrichment.user_agent", "policy:\n  default_action: deny\n  rules:\n    - name: bots\n      action: deny\n      when: request.host == \"x\" && ua.is_bot\n", "policy.rules[0].when (line 6, column 36): ua is not available: the configuration has no enrichment.user_agent"},
+		{"ua in an upstream header without enrichment.user_agent", "upstream:\n  headers:\n    x-client-device: ua.device\n", "upstream.headers (line 3, column 22): ua is not available: the configuration has no enrichment.user_agent"},
+		{"a field ua does not have", "enrichment: {user_agent: {}}\npolicy:\n  default_action: deny\n  rules:\n    - name: r\n      action: deny\n      when: ua.raw == \"curl\"\n", "policy.rules[0].when (line 7, column 15): undefined field 'raw'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := tc.yaml
+			if !strings.Contains(yaml, "policy:") {
+				yaml += tail
+			}
+			_, err := parse(t, yaml, nil)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("error %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRedactedUserAgentEnrichment(t *testing.T) {
+	c := mustParse(t, "enrichment:\n  user_agent: {}\npolicy:\n  default_action: deny\n  rules:\n    - name: bots\n      action: deny\n      when: ua.is_bot\n", nil)
+	got, err := c.Redacted()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "enrichment:\n  user_agent:\n    cache_entries: 10000\nsets: {}\n") {
+		t.Fatalf("got:\n%s", got)
+	}
+	if again := mustParse(t, string(got), nil); !reflect.DeepEqual(again.Enrichment, c.Enrichment) {
+		t.Fatalf("reads back as %+v", again.Enrichment.UserAgent)
+	}
+}

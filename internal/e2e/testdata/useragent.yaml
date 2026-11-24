@@ -1,0 +1,26 @@
+# The policy of TestEnvoyUserAgent: a rule on the bots, recognized in the
+# user-agent header of the client, and upstream headers and decision fields
+# read from the same analysis. The analysis has no file.
+server:
+  drain_delay: 1s
+log:
+  format: json
+  decisions: all
+  decision_fields:
+    agent: '"user-agent" in request.headers ? request.headers["user-agent"] : ""'
+    browser: ua.browser.name
+    device: ua.device
+    bot: ua.bot.name
+    bot_description: ua.bot.description
+enrichment:
+  user_agent: {}
+policy:
+  default_action: allow
+  rules:
+    - name: checkout-bots
+      action: deny
+      when: request.path.startsWith("/reflect/checkout/") && ua.is_bot
+upstream:
+  headers:
+    x-client-device: ua.device
+    x-client-bot: ua.bot.name

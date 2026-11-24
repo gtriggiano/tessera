@@ -1,0 +1,31 @@
+# The policy of TestEnvoyAreas: a deny rule on an area set read from a
+# GeoJSON file, on the location of the client in the geo database. The
+# database and the file are in a directory mounted as a volume at
+# /etc/tessera/data, so that a file renamed over one on the host is seen in
+# the container. Envoy, the only proxy in front of tessera, appends the
+# address of its peer to X-Forwarded-For; the test writes the client address
+# before it.
+server:
+  drain_delay: 1s
+log:
+  format: json
+  decisions: all
+client_ip:
+  from: x_forwarded_for
+  trusted_hops: 1
+enrichment:
+  geo:
+    database: data/geo.mmdb
+sets:
+  closed:
+    type: area
+    file: data/closed.geojson
+    refresh: 1s
+policy:
+  default_action: allow
+  rules:
+    - name: closed-areas
+      action: deny
+      when: sets.closed.contains(geo.location)
+      response:
+        status: 451

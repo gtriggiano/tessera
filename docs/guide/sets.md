@@ -1,10 +1,10 @@
 ---
-description: "How to declare the sets of tessera, use them in rules, update their files safely, read them from a Kubernetes ConfigMap, choose what an unavailable set answers, and try a change with tessera eval."
+description: "How to declare the sets of tessera, use them in rules, match the location of a client in geographic areas, update their files safely, read them from a Kubernetes ConfigMap, choose what an unavailable set answers, and try a change with tessera eval."
 ---
 
 # Use sets
 
-A set is a named list of networks, autonomous system numbers or strings that the rules of **tessera** read, kept apart from the rules. This page shows how to declare a set, use it in a rule, update its file while tessera runs, read it from a Kubernetes ConfigMap, choose what a set that tessera cannot keep up to date answers, and try a change before you make it. The [configuration reference](../reference/configuration.md#sets) describes every key.
+A set is a named list of networks, autonomous system numbers, strings or geographic areas that the rules of **tessera** read, kept apart from the rules. This page shows how to declare a set, use it in a rule, match the location of a client in areas, update the file of a set while tessera runs, read it from a Kubernetes ConfigMap, choose what a set that tessera cannot keep up to date answers, and try a change before you make it. The [configuration reference](../reference/configuration.md#sets) describes every key.
 
 Sets come after the [enrichments](./enrichments.md) in the [path of a request](./how-tessera-works.md#sets): the [policy rules](./policy-rules.md) look values up in them, such as the client address or its autonomous system.
 
@@ -13,7 +13,7 @@ Sets come after the [enrichments](./enrichments.md) in the [path of a request](.
 Each key of [`sets`](../reference/configuration.md#sets) is the name of a set, with its [type](../reference/configuration.md#sets-name-type) and one source:
 
 - [`values`](../reference/configuration.md#sets-name-values) writes the values in the configuration file. Use it for short lists that change with the configuration, such as the networks of an office.
-- [`file`](../reference/configuration.md#sets-name-file) reads them from a file, one value per line. Use it for lists that change on their own, such as networks blocked during an incident, or that another system writes.
+- [`file`](../reference/configuration.md#sets-name-file) reads them from a file, one value per line, or, for an area set, its polygons from a GeoJSON document. Use it for lists that change on their own, such as networks blocked during an incident, or that another system writes.
 
 ```yaml [config.yaml]
 sets:
@@ -38,7 +38,7 @@ A relative path is relative to the directory of the configuration file. tessera 
 
 ## Use a set in a rule
 
-A condition reads the set `blocked` as `sets.blocked`, and looks a value up with [`contains`](../reference/expressions.md#sets). The argument has the type of the set: an address, such as `client.ip`, for a `cidr` set, an `int`, such as [`asn.number`](../reference/expressions.md#asn), for an `asn` set, and a `string`, such as `request.host`, for a `string` set.
+A condition reads the set `blocked` as `sets.blocked`, and looks a value up with [`contains`](../reference/expressions.md#sets). The argument has the type of the set: an address, such as `client.ip`, for a `cidr` set, an `int`, such as [`asn.number`](../reference/expressions.md#asn), for an `asn` set, a `string`, such as `request.host`, for a `string` set, and the location of the client, `geo.location`, for an `area` set (see [Match a location in an area](#match-a-location-in-an-area)).
 
 ```yaml [config.yaml]
 sets:
@@ -64,6 +64,30 @@ policy:
 
 A decision reads every set as it was when the decision started: a file that changes during a decision does not change it.
 
+## Match a location in an area
+
+An area set holds polygons, read from a GeoJSON document, and a rule looks the location of the client address up in them with `sets.<name>.contains(geo.location)`. Use it for a region that no country or subdivision describes, such as the cities of your offices. The location comes from the database of [`enrichment.geo`](../reference/configuration.md#enrichment-geo): configure it with a database that has locations, such as GeoLite2 City (see [Choose the databases](./enrichments.md#choose-the-databases)).
+
+Declare the set with `type: area` and a `file`; an area set has no `values`:
+
+<<< @/examples/area.yaml{yaml}
+
+The file is a GeoJSON document: a `FeatureCollection` of features whose geometries are a `Polygon` or a `MultiPolygon`, or a single `Feature`, `Polygon` or `MultiPolygon`, as map tools such as QGIS export them. A position is a longitude, then a latitude, and each ring ends with its first position. These areas are Rome and Milan, inside their ring roads, drawn with a few vertices each:
+
+<<< @/examples/cities.geojson{json}
+
+A location is in an area when it is inside the exterior ring of a polygon and outside each of its holes. A location exactly on an edge can be inside or outside. [`sets.<name>.file`](../reference/configuration.md#sets-name-file) lists the rules that tessera checks in the document; an invalid document stops the startup, as an invalid line does, with the line and the column of the problem in the file.
+
+::: tip Draw large areas, with few vertices
+A geolocation database places an address approximately: often at the center of its city, or of its region, and sometimes many kilometers away from the client. Draw areas no smaller than a city, and simplify their polygons, with the simplification tool of your map editor, to the vertices that the rule needs: a boundary drawn to the meter adds vertices that an approximate location cannot use.
+:::
+
+An area that crosses the antimeridian, longitude 180, is two polygons, one on each side, such as the two polygons of a `MultiPolygon`: tessera rejects a ring whose consecutive positions are more than 180 degrees of longitude apart.
+
+::: danger An address without a location is in no area
+The record of an address has no location when the database places it only in a country, or when the database does not have the address. Then `geo.location` is absent, and `contains` answers `false`, without an error: a `deny` rule on an area does not deny such an address, and an `allow` rule does not allow it. To decide on these addresses, write a rule on `!has(geo.location)` before the rule on the area, as `no-location` does above in `audit` mode. Without a client address, the condition is indeterminate, as every condition that reads `geo` is.
+:::
+
 ## Update the file of a set
 
 `tessera serve` checks the file of each set every [`sets.<name>.refresh`](../reference/configuration.md#sets-name-refresh), and uses its new content from the first check that sees it, without a restart. A check reads the state of the file, and reads its content when the file has changed or was modified too recently to trust its state (see [`sets.<name>.refresh`](../reference/configuration.md#sets-name-refresh)). New content that is invalid changes nothing: tessera keeps the copy in use, counts the check in [`tessera_set_refreshes_total`](../reference/metrics.md#tessera-set-refreshes-total) with `result="rejected"`, and reports it with [`set_load_failed`](../reference/logs.md#set-load-failed).
@@ -79,11 +103,13 @@ mv blocked.txt.new blocked.txt
 A rename replaces the file at once: a check sees either the old file or the new one, whole. Editors that save to a new file and rename it work the same way.
 
 ::: warning A file written in place can be read empty or half written
-A program that writes the file in place, such as `cp` over `blocked.txt`, a shell redirection `> blocked.txt` or an editor that saves into the same file, first empties the file, then writes it. A check at that moment reads part of the new content, or none:
+A program that writes the file in place, such as `cp` over `blocked.txt`, a shell redirection `> blocked.txt` or an editor that saves into the same file, first empties the file, then writes it. A check at that moment reads part of the new content, or none. For a file of values, one per line:
 
 - a file of 0 bytes is a valid, empty set: tessera applies it until the next check, `refresh` later, and for that time a block list blocks nothing;
 - a file cut at the end of a line is valid too: tessera uses the values read until the next check, and the values not yet written are missing from the set;
 - a file cut in the middle of a line usually has an invalid last line: the check rejects it, and a later check reads the whole file.
+
+The GeoJSON document of an area set, empty or cut, is invalid: the check rejects it, and a later check reads the whole document.
 
 Write a temporary file and rename it over the file of the set, as above.
 :::
@@ -159,4 +185,4 @@ tessera_set_available == 0
 tessera eval --config config.yaml --set blocked=198.51.100.0/24,203.0.113.99 --ip 203.0.113.99
 ```
 
-`--set blocked=` makes the set empty. [Sets](../reference/cli.md#sets) in the CLI reference shows the output.
+`--set blocked=` makes the set empty, and `--set cities=` makes an empty area, which contains no location: an area set takes no other values. [Sets](../reference/cli.md#sets) in the CLI reference shows the output.

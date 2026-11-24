@@ -33,7 +33,7 @@ help:
 	@echo "make fmt             Format Go sources"
 	@echo "make test-e2e        Run tessera in Docker with Envoy and a test upstream (needs Docker)"
 	@echo "make fuzz            Run each fuzz target for $(FUZZ_TIME)"
-	@echo "make bench           Run the benchmarks of a decision, of the sets and of the databases for $(BENCH_TIME) each"
+	@echo "make bench           Run the benchmarks of a decision, of the sets, of the areas, of the databases and of the user-agent analysis for $(BENCH_TIME) each"
 	@echo "make vuln            Scan Go code using pinned govulncheck"
 	@echo "make workflows-check Validate GitHub Actions workflows"
 	@echo "make workflows-audit Audit workflows and Dependabot configuration using pinned zizmor (needs uv)"
@@ -78,18 +78,25 @@ fuzz:
 	$(GO) test ./internal/sets -run='^$$' -fuzz=FuzzRead -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
 	$(GO) test ./internal/sets -run='^$$' -fuzz=FuzzParseValue -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
 	$(GO) test ./internal/enrichment -run='^$$' -fuzz=FuzzParse -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
+	$(GO) test ./internal/useragent -run='^$$' -fuzz=FuzzAnalyze -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
+	$(GO) test ./internal/area -run='^$$' -fuzz=FuzzReadGeoJSON -fuzztime=$(FUZZ_TIME) -fuzzminimizetime=1x -parallel=2
 
 # The benchmarks of one decision over ten typical rules, alone, after a rule
 # on a set of 100,000 and of 1,000,000 networks, after two rules on the
-# databases as large as GeoLite2 City and ASN, and with upstream headers and
-# decision fields: time, memory and allocations per decision, and the
-# percentiles of the time of each. Then the lookups in those sets and
-# databases, the memory per entry of each type of set, and the reading of a
-# set of one million entries and of those databases, with the memory of one
-# copy and the peak during repeated reads. One package at a time (-p 1), so
-# that their times do not mix.
+# databases as large as GeoLite2 City and ASN, after a rule on the user-agent
+# header with the cache of its analysis warm and cold, after a rule on
+# 10,000 geofences, and with upstream headers and decision fields: time,
+# memory and allocations per decision, and the percentiles of the time of
+# each, from one goroutine and from many at once. Then the lookups in those
+# sets, areas and databases, the memory per entry of each type of set and per
+# vertex of the areas, and the reading of a set of one million entries, of
+# large GeoJSON documents and of those databases, with the memory of one copy
+# and the peak during repeated reads; and the analysis of a user-agent
+# header with the cache cold and warm, from one goroutine and from many, of
+# the slowest headers, and the memory of the cache. One package at a time
+# (-p 1), so that their times do not mix.
 bench:
-	$(GO) test -p 1 ./internal/engine ./internal/sets ./internal/enrichment ./internal/source -run='^$$' -bench=. -benchmem -benchtime=$(BENCH_TIME) -count=1
+	$(GO) test -p 1 ./internal/engine ./internal/sets ./internal/area ./internal/enrichment ./internal/useragent ./internal/source -run='^$$' -bench=. -benchmem -benchtime=$(BENCH_TIME) -count=1
 
 mod-check:
 	$(GO) mod tidy -diff
@@ -132,10 +139,16 @@ docs-install:
 docs-audit:
 	$(NPM) --prefix docs audit --audit-level=moderate
 
+# The bot names reference is written from the code before VitePress reads the
+# pages, with Go (internal/botnames); Git ignores it.
+BOT_NAMES_PAGE := docs/reference/bot-names.md
+
 docs-dev:
+	$(GO) run ./internal/botnames $(BOT_NAMES_PAGE)
 	$(NPM) --prefix docs run docs:dev
 
 docs-build:
+	$(GO) run ./internal/botnames $(BOT_NAMES_PAGE)
 	$(NPM) --prefix docs run docs:build
 
 docs-check:

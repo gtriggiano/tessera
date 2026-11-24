@@ -240,7 +240,7 @@ The fields follow `duration_ms`, in the order of their names (see [`decision`](.
 - A name starts with a lowercase letter, followed by lowercase letters, digits and underscores, at most 63 characters, and is not a field that every `decision` event has: `ts`, `level`, `msg`, `request_id`, `host`, `method`, `path`, `client_ip`, `action`, `enforced`, `rule`, `reason`, `audit_rules`, `indeterminate_rules`, `error` and `duration_ms`.
 - tessera compiles each expression when it reads the configuration, as it compiles a condition (see [`policy.rules[].when`](#policy-rules-when)): its result is a string, such as `string(asn.number)` for a number. An error in it names `log.decision_fields`, at its position in the expression.
 - An expression cannot read the query of the request, a [secret header](#secret-headers), nor the map of the headers otherwise than by a literal name, which tessera never logs: see [Decision fields](./expressions.md#decision-fields).
-- tessera computes the fields only for the events that it writes, those that [`log.decisions`](#log-decisions) and [`log.level`](#log-level) select, after the decision and with what it read: the same sets and databases, and the record of the client address that a rule looked up.
+- tessera computes the fields only for the events that it writes, those that [`log.decisions`](#log-decisions) and [`log.level`](#log-level) select, after the decision and with what it read: the same sets and databases, and the records of the enrichments that a rule computed.
 - A field whose expression fails, such as one that reads a missing header, is empty, and nothing counts or reports the failure. A value longer than 1024 bytes is cut at a character boundary.
 
 ## `client_ip`
@@ -323,6 +323,8 @@ tessera reads a secret header as any other: conditions and [upstream headers](#u
 - a [decision field](#log-decision-fields) cannot read it, so a [`decision`](./logs.md#decision) event never holds it, and no other event does either (see [What is never logged](./logs.md#what-is-never-logged));
 - [`tessera eval`](./cli.md#the-output) shows its value as `[REDACTED]`, and the value of an upstream header whose expression reads it too.
 
+Only the value of the header is secret: what tessera derives from it is not. With `user-agent` in `secret_headers`, the attributes of [`ua`](./expressions.md#ua), which tessera derives from that header, stay readable everywhere: a decision field can read them, so a `decision` event can hold them, and `tessera eval` shows them as they are.
+
 A name is an HTTP field name, in any case: letters, digits and the characters ``!#$%&'*+-.^_`|~``. Each problem is an error at the position of the item, which never repeats the name: `expected a header name`; `this header is always secret` for `authorization`, `proxy-authorization` and `cookie`; `the same header twice`, and `the same header twice, in different cases` for two names that differ only in case; `more than 64 headers`.
 
 ## `enrichment`
@@ -330,7 +332,7 @@ A name is an HTTP field name, in any case: letters, digits and the characters ``
 **Type:** mapping\
 **Default:** `{}`
 
-The databases that the attributes [`geo`](./expressions.md#geo) and [`asn`](./expressions.md#asn) read, which describe the client address: files in the MaxMind DB format (MMDB). [`enrichment.geo`](#enrichment-geo) is a database with the schema of GeoIP2 or GeoLite2 City or Country, and [`enrichment.asn`](#enrichment-asn) a database with the schema of GeoLite2 ASN, from MaxMind or from another provider that writes the same schema. [Enrich requests](../guide/enrichments.md) shows how to get the files, keep them up to date and use them.
+The enrichments: the databases that the attributes [`geo`](./expressions.md#geo) and [`asn`](./expressions.md#asn) read, which describe the client address, and the analysis of the user-agent header that the attribute [`ua`](./expressions.md#ua) reads, which describes the client software. The databases are files in the MaxMind DB format (MMDB): [`enrichment.geo`](#enrichment-geo) is a database with the schema of GeoIP2 or GeoLite2 City or Country, and [`enrichment.asn`](#enrichment-asn) a database with the schema of GeoLite2 ASN, from MaxMind or from another provider that writes the same schema. [`enrichment.user_agent`](#enrichment-user-agent) has no file. [Enrich requests](../guide/enrichments.md) shows how to get the files, keep them up to date and use the enrichments.
 
 ```yaml [config.yaml]
 enrichment:
@@ -338,12 +340,16 @@ enrichment:
     database: geo.mmdb
   asn:
     database: asn.mmdb
+  user_agent: {}
 policy:
   default_action: deny
   rules:
     - name: hosting-networks
       action: deny
       when: asn.number in [64500, 64501]
+    - name: bots
+      action: deny
+      when: ua.is_bot
     - name: european-union
       action: allow
       when: geo.country.in_eu
@@ -352,7 +358,7 @@ policy:
 Each block is absent by default. Without it, its attribute does not exist, and a condition that reads it is a configuration error, at the position of the attribute. Without `enrichment.geo`, the file above stops with:
 
 ```text
-tessera: policy.rules[1].when (line 12, column 13): geo is not available: the configuration has no enrichment.geo
+tessera: policy.rules[2].when (line 16, column 13): geo is not available: the configuration has no enrichment.geo
 ```
 
 tessera reads each database whole into memory when `tessera serve` starts, before it opens a socket, and so do `tessera config validate` and `tessera eval`. A file that does not exist or cannot be read, a file larger than 512 MiB and a file that is not a valid database are configuration errors, which name the key and its position, never the path of the file:
@@ -363,7 +369,7 @@ tessera: enrichment.geo.database (line 3, column 15): the file is not a valid MM
 
 These checks are light: tessera checks the metadata of the database and decodes the records of its first networks, not every record. At least one of these records must have a key of the schema of the database, such as `country` or `location` for `geo` and `autonomous_system_number` for `asn`: a database of the other kind, such as an ASN file configured as `enrichment.geo`, is rejected, instead of answering that it has no address. A record that tessera cannot decode when a condition reads it makes the condition indeterminate, with the cause `database_error` (see [Indeterminate conditions](./expressions.md#indeterminate-conditions)).
 
-A database that no rule, [upstream header](#upstream-headers) or [decision field](#log-decision-fields) reads is read and checked all the same, and `tessera config validate` warns about it (see [`tessera config validate`](./cli.md#tessera-config-validate)). While it runs, `tessera serve` checks the file of each database every [`enrichment.geo.refresh`](#enrichment-geo-refresh) or [`enrichment.asn.refresh`](#enrichment-asn-refresh), and replaces the copy in use when the file has new valid content.
+A database that no rule, [upstream header](#upstream-headers) or [decision field](#log-decision-fields) reads is read and checked all the same, and `tessera config validate` warns about it (see [`tessera config validate`](./cli.md#tessera-config-validate)); it warns about `enrichment.user_agent` too when nothing reads `ua`. While it runs, `tessera serve` checks the file of each database every [`enrichment.geo.refresh`](#enrichment-geo-refresh) or [`enrichment.asn.refresh`](#enrichment-asn-refresh), and replaces the copy in use when the file has new valid content.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
@@ -373,6 +379,8 @@ A database that no rule, [upstream header](#upstream-headers) or [decision field
 | [`enrichment.asn`](#enrichment-asn) | mapping | none |  |
 | [`enrichment.asn.database`](#enrichment-asn-database) | string | required | nonempty; a path |
 | [`enrichment.asn.refresh`](#enrichment-asn-refresh) | duration | `1m` | positive; at least `1s` |
+| [`enrichment.user_agent`](#enrichment-user-agent) | mapping | none |  |
+| [`enrichment.user_agent.cache_entries`](#enrichment-user-agent-cache-entries) | integer | `10000` | `0` to `1000000`; `0` disables the cache |
 
 ### `enrichment.geo`
 
@@ -437,12 +445,42 @@ The path of the file of the database, with the rules of [`enrichment.geo.databas
 
 How often tessera checks the file of the database, as [`enrichment.geo.refresh`](#enrichment-geo-refresh) describes.
 
+### `enrichment.user_agent`
+
+**Type:** mapping\
+**Default:** none
+
+The analysis of the user-agent header that [`ua`](./expressions.md#ua) reads: the browser, the operating system and the kind of device that the header names, and whether the client is a bot, with the name and the description of the bot. It has no file and no key that it requires: write `user_agent: {}` to turn it on with its defaults.
+
+```yaml [config.yaml]
+enrichment:
+  user_agent: {}
+policy:
+  default_action: allow
+  rules:
+    - name: bots
+      action: deny
+      when: ua.is_bot && request.path.startsWith("/checkout")
+```
+
+tessera analyzes the first 512 bytes of the value of the `user-agent` header only, as Envoy gives it, and the record of a header depends on them only. The analysis reads memory only and never fails: a header that tessera does not recognize gives empty names and the device `unknown`. [`ua`](./expressions.md#ua) lists the attributes, the names that they take, and when tessera computes them.
+
+### `enrichment.user_agent.cache_entries`
+
+**Type:** integer\
+**Default:** `10000`\
+**Allowed:** `0` to `1000000`; `0` disables the cache
+
+The largest number of analyzed headers that tessera keeps in memory, in a cache that every decision of the process shares: a header already in the cache is not analyzed again. The key of an entry is the first 512 bytes of the header, so an entry holds at most 512 bytes of the header and its record. When the cache has no room for a new header, its record takes the place of one that no decision has found recently: the records that decisions keep finding stay. The cache can make room this way before it holds this number of entries. The number of entries never exceeds this limit, however many different headers clients send. A decision never waits to store its record: when other decisions are using that part of the cache at that moment, tessera does not keep the record, and a later decision analyzes the header again. A lookup in the cache can wait, briefly, for another decision that is storing a record. `0` disables the cache: tessera analyzes the header of every decision that reads `ua`.
+
+[`tessera_enrichment_user_agent_cache_lookups_total`](./metrics.md#tessera-enrichment-user-agent-cache-lookups-total) counts the lookups in the cache, and [`tessera_enrichment_user_agent_cache_entries`](./metrics.md#tessera-enrichment-user-agent-cache-entries) reports its entries.
+
 ## `sets`
 
 **Type:** mapping of mappings\
 **Default:** `{}`
 
-The named sets that the conditions of the rules read with [`sets.<name>.contains(value)`](./expressions.md#sets): lists of networks, autonomous system numbers or strings, kept apart from the rules. Each key of `sets` is the name of a set, and its value declares the set: a type, and one source, the `values` written in this file or a `file`.
+The named sets that the conditions of the rules read with [`sets.<name>.contains(value)`](./expressions.md#sets): lists of networks, autonomous system numbers or strings, and geographic areas, kept apart from the rules. Each key of `sets` is the name of a set, and its value declares the set: a type, and one source, the `values` written in this file or a `file`; an area set has a `file` only.
 
 ```yaml [config.yaml]
 sets:
@@ -470,12 +508,18 @@ tessera reads every set when `tessera serve` starts, before it opens a socket, a
 tessera: sets.partners.file (line 9, column 11): line 12 of the file: the value has a control character
 ```
 
+For the GeoJSON document of an area set, the error names the line and the column of the file, in characters, and, when the problem is inside a feature or a geometry, its place in the document: the feature, in a `FeatureCollection`, the polygon, in a `MultiPolygon`, the ring, `1` for the exterior one, and the position, each counted from `1`:
+
+```text
+tessera: sets.stores.file (line 9, column 11): line 3, column 88 of the file: feature 3, polygon 1, ring 2: the ring is not closed: its last position differs from its first
+```
+
 A set that no rule, [upstream header](#upstream-headers) or [decision field](#log-decision-fields) reads is read and checked all the same, and `tessera config validate` warns about it (see [`tessera config validate`](./cli.md#tessera-config-validate)). While it runs, `tessera serve` checks the file of each set every [`sets.<name>.refresh`](#sets-name-refresh), and replaces the copy of the set when the file has new valid content. [Use sets](../guide/sets.md) shows how to declare, use and update sets.
 
 | Key | Type | Default | Allowed |
 | --- | --- | --- | --- |
-| [`sets.<name>.type`](#sets-name-type) | string | required | `cidr`, `asn`, `string` |
-| [`sets.<name>.values`](#sets-name-values) | list of values | required unless `sets.<name>.file` is set | values of the type, each at most 4 KiB; not with `file` |
+| [`sets.<name>.type`](#sets-name-type) | string | required | `cidr`, `asn`, `string`, `area` |
+| [`sets.<name>.values`](#sets-name-values) | list of values | required unless `sets.<name>.file` is set | values of the type, each at most 4 KiB; not with `file`, nor with type `area` |
 | [`sets.<name>.file`](#sets-name-file) | string | required unless `sets.<name>.values` is set | nonempty; a path, not with `values` |
 | [`sets.<name>.refresh`](#sets-name-refresh) | duration | `10s` | positive; at least `1s`, only with `file` |
 | [`sets.<name>.max_staleness`](#sets-name-max-staleness) | duration | `0s` | zero or longer than `sets.<name>.refresh`; only with `file` |
@@ -486,7 +530,7 @@ A set that no rule, [upstream header](#upstream-headers) or [decision field](#lo
 
 **Type:** string\
 **Default:** required\
-**Allowed:** `cidr`, `asn`, `string`
+**Allowed:** `cidr`, `asn`, `string`, `area`
 
 The type of the values of the set, which is also the type of the argument of `contains`:
 
@@ -495,20 +539,22 @@ The type of the values of the set, which is also the type of the argument of `co
 | `cidr` | An IPv4 or IPv6 network, such as `203.0.113.0/24` or `2001:db8::/32`, or an address, such as `203.0.113.7`, which is the network of that one address (`/32` or `/128`). | An address, such as `client.ip`. |
 | `asn` | An autonomous system number from `1` to `4294967295`, with or without the prefix `AS` in any case: `64496`, `AS64496`, `as64496`. | An `int`. |
 | `string` | Any text, compared exactly, case included. | A `string`. |
+| `area` | A polygon, with its holes, read from a GeoJSON document: see [`sets.<name>.file`](#sets-name-file). | A location, `geo.location`. |
 
 - **`cidr`.** A network with bits set after its prefix length, such as `192.0.2.1/24`, is an error: write its first address, `192.0.2.0/24`. An IPv4-mapped IPv6 address or network, such as `::ffff:192.0.2.0/120`, is the IPv4 network it maps, `192.0.2.0/24`. An IPv6 zone, such as `fe80::1%eth0`, is an error. IPv4 and IPv6 values mix in one set, and networks can overlap. An IPv4 address is never in an IPv6 network, `::/0` included.
 - **`asn`.** The number has no sign and no leading zeros: `+64496`, `064496` and `AS 64496` are errors. `0`, or `AS0`, is an error.
 - **`string`.** An empty value, invalid UTF-8 and a control character, a tab included, are errors.
+- **`area`.** The set reads a [`file`](#sets-name-file), whose GeoJSON document holds its polygons; it has no `values`.
 
-Spaces and tabs around a value are ignored, for every type.
+Spaces and tabs around a value are ignored, for every type that has values.
 
 ### `sets.<name>.values`
 
 **Type:** list of values\
 **Default:** required unless `sets.<name>.file` is set\
-**Allowed:** values of the type, each at most 4 KiB; not with `file`
+**Allowed:** values of the type, each at most 4 KiB; not with `file`, nor with type `area`
 
-The values of the set, written in the configuration file, one item each, in the forms of [`sets.<name>.type`](#sets-name-type). An item is a YAML string, which can be quoted; in an `asn` set, it can be a YAML integer too, such as `64496`. `#` is part of a value here, not a comment. `values: []` declares an empty set.
+The values of the set, written in the configuration file, one item each, in the forms of [`sets.<name>.type`](#sets-name-type). An area set has no values: it reads a [`file`](#sets-name-file). An item is a YAML string, which can be quoted; in an `asn` set, it can be a YAML integer too, such as `64496`. `#` is part of a value here, not a comment. `values: []` declares an empty set.
 
 A set of values is always available: [`sets.<name>.refresh`](#sets-name-refresh), [`sets.<name>.max_staleness`](#sets-name-max-staleness) and [`sets.<name>.on_unavailable`](#sets-name-on-unavailable) are errors with `values`.
 
@@ -518,11 +564,11 @@ A set of values is always available: [`sets.<name>.refresh`](#sets-name-refresh)
 **Default:** required unless `sets.<name>.values` is set\
 **Allowed:** nonempty; a path, not with `values`
 
-The path of a file that holds the values of the set, relative to the directory of the configuration file when it is not absolute. The file is a regular file, or a symbolic link to one, of at most 256 MiB, with one value per line, in the forms of [`sets.<name>.type`](#sets-name-type):
+The path of a file that holds the values of the set, or the polygons of an area set, relative to the directory of the configuration file when it is not absolute. The file is a regular file, or a symbolic link to one, of at most 256 MiB. The file of a `cidr`, `asn` or `string` set has one value per line, in the forms of [`sets.<name>.type`](#sets-name-type):
 
 - a UTF-8 byte order mark at the start of the file is ignored;
 - a blank line is ignored;
-- `#` starts a comment that runs to the end of the line, in a set of any type: a `string` value cannot hold `#`;
+- `#` starts a comment that runs to the end of the line, in a set of each of these types: a `string` value cannot hold `#`;
 - spaces and tabs around a value are ignored, and so is the carriage return of a line that ends with CR LF;
 - any other line is a value.
 
@@ -533,6 +579,40 @@ api.partner-two.example.com   # since November
 ```
 
 A line has at most 4 KiB, its comment included. An invalid value, a line longer than 4 KiB, a file larger than 256 MiB and more values than [`sets.<name>.max_entries`](#sets-name-max-entries) make the whole file invalid: tessera never uses part of a file.
+
+The file of an area set is a GeoJSON document, as [RFC 7946](https://www.rfc-editor.org/rfc/rfc7946) describes it, of at most 256 MiB, which tessera reads more strictly than the RFC:
+
+- the document is a `FeatureCollection`, a `Feature`, a `Polygon` or a `MultiPolygon`. The geometry of a `Feature` is a `Polygon` or a `MultiPolygon`: a `null` geometry, a `Point`, a `MultiPoint`, a `LineString`, a `MultiLineString` and a `GeometryCollection` are errors. A `FeatureCollection` whose `features` is `[]` is an empty set;
+- a `Polygon` has at least one ring, the exterior one, followed by its holes, and a `MultiPolygon` at least one polygon;
+- a ring is closed, its last position equal to its first, and has at least 4 positions;
+- a position has 2 numbers, the longitude, from `-180` to `180`, then the latitude, from `-90` to `90`; a third number, the altitude, is read and ignored, and a fourth is an error. A number beyond the range of a `double`, such as `1e999`, is an error, and so is a number of a position longer than 64 characters;
+- two consecutive positions of a ring are at most 180 degrees of longitude apart: an area that crosses the antimeridian, longitude 180, is two polygons, one on each side;
+- the content is JSON in UTF-8, nested at most 64 levels; a UTF-8 byte order mark at the start is ignored. Member names are case-sensitive: `Type` is not `type`;
+- an object has the GeoJSON members of its type only, among `features`, `geometry` and `coordinates`: a `coordinates` member in a `Feature` is an error. Any other member, such as `properties`, `bbox`, `crs`, `id` or a foreign member, is read as JSON and ignored, and so is the order of the members;
+- a `FeatureCollection`, a `Feature` or a geometry has each of the members that tessera reads, `type`, `features`, `geometry` and `coordinates`, at most once. tessera does not look for repeated names among the members that it ignores, nor inside them, such as in `properties`;
+- the document has at most 10000000 positions, the last one of each ring included.
+
+tessera does not check the orientation of the rings, whether a ring crosses itself, whether a hole is inside its exterior ring, or repeated positions. A point is in the set when it is inside the exterior ring of a polygon and outside each of its holes, with the even-odd rule. A point exactly on an edge can be inside or outside, always the same for the same point; a point of an edge that two polygons share, between its ends, is in one of them only.
+
+```json [stores.geojson]
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "Rome" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[12.485, 41.795], [12.612, 41.868], [12.585, 41.965], [12.418, 41.968], [12.365, 41.885], [12.485, 41.795]]
+        ]
+      }
+    }
+  ]
+}
+```
+
+An invalid document, a ceiling exceeded and more polygons than [`sets.<name>.max_entries`](#sets-name-max-entries) make the whole file invalid, as for the other types.
 
 ### `sets.<name>.refresh`
 
@@ -567,7 +647,7 @@ The set becomes unavailable as soon as its age passes the limit, between two che
 **Default:** `fail`\
 **Allowed:** `fail`, `match`, `no_match`; only with `file`
 
-What `contains` answers when the set is unavailable, because its last successful check is older than [`sets.<name>.max_staleness`](#sets-name-max-staleness), whatever its argument:
+What `contains` answers when the set is unavailable, because its last successful check is older than [`sets.<name>.max_staleness`](#sets-name-max-staleness), whatever its argument; on an area set, an absent `geo.location` is still in no area, and `contains` answers `false` for it:
 
 | Value | `contains` |
 | --- | --- |
@@ -581,7 +661,7 @@ What `contains` answers when the set is unavailable, because its last successful
 **Default:** `1000000`\
 **Allowed:** positive
 
-The largest number of entries of the set. An entry is a value of the source: an item of `values`, or a line of `file` that holds a value. A value written twice counts twice, so the limit bounds both the memory of the set and the work of reading it. More entries make the whole source invalid, at the first value beyond the limit.
+The largest number of entries of the set. An entry is a value of the source: an item of `values`, or a line of `file` that holds a value. A value written twice counts twice, so the limit bounds both the memory of the set and the work of reading it. In an area set, an entry is a polygon: a `Polygon` counts one, and a `MultiPolygon` one for each of its polygons. More entries make the whole source invalid, at the first value or polygon beyond the limit.
 
 ## `policy`
 
@@ -816,7 +896,7 @@ upstream:
     x-client-asn: 'asn.found ? string(asn.number) : ""'
 ```
 
-- tessera computes the headers for every request that Envoy sends on: an allowed request, and a denied request that [`policy.mode: audit`](#policy-mode) lets through. A denial has none. It computes them after the decision, with what the rules read: the same sets and databases, and the record of the client address that a rule looked up.
+- tessera computes the headers for every request that Envoy sends on: an allowed request, and a denied request that [`policy.mode: audit`](#policy-mode) lets through. A denial has none. It computes them after the decision, with what the rules read: the same sets and databases, and the records of the enrichments that a rule computed.
 - A header declared here belongs to tessera: its value replaces the one that the client sent, and when tessera has no value for it, tessera asks Envoy to remove the header that the client sent. Either way, the value of the client does not reach the upstream.
 - tessera removes the header when its expression gives an empty string, fails, or gives a value that cannot be sent: longer than 4096 bytes, with an ASCII control character other than the horizontal tab, or not valid UTF-8. The decision does not change. [`tessera_upstream_header_errors_total`](./metrics.md#tessera-upstream-header-errors-total) counts the failures and the invalid values, but not an empty string, which removes the header on purpose: `asn.found ? string(asn.number) : ""` sends no header for an address that the database does not have.
 - A name is an HTTP field name, in any case: letters, digits and the characters ``!#$%&'*+-.^_`|~``. tessera sends it in lowercase. Two names that differ only in case are an error.

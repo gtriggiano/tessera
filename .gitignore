@@ -17,6 +17,8 @@ coverage.html
 
 # Documentation
 docs/node_modules/
+# Written by make docs-build and make docs-dev from the code
+docs/reference/bot-names.md
 docs/.vitepress/cache/
 docs/.vitepress/dist/
 docs/.vitepress/.temp/

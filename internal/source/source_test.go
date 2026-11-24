@@ -128,3 +128,33 @@ func TestReadFileErrors(t *testing.T) {
 		t.Errorf("more than max_entries: %v", err)
 	}
 }
+
+// The file of an area set is a GeoJSON document; Problem gives the line, the
+// column and the place in the structure of an invalid one, never its content.
+func TestReadAreaFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stores.geojson")
+	writeFile(t, path, `{"type":"Polygon","coordinates":[[[12.35,41.80],[12.62,41.80],[12.62,42.00],[12.35,42.00],[12.35,41.80]]]}`)
+	set, id, err := ReadFile(path, sets.Area, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Type() != sets.Area || set.Entries() != 1 || !set.ContainsPoint(41.8919, 12.5113) || id.Sum == [32]byte{} {
+		t.Errorf("entries %d, identity %+v", set.Entries(), id)
+	}
+	for _, tc := range []struct{ content, want string }{
+		{"{\"type\":\"FeatureCollection\",\"features\":[\n{\"type\":\"Feature\",\"properties\":{\"name\":\"s3cr3t\"},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,1]]]}}]}", "line 2, column 94 of the file: feature 1, ring 1: the ring is not closed: its last position differs from its first"},
+		{`{"type":"Polygon","coordinates":"s3cr3t"}`, "line 1, column 33 of the file: the coordinates do not have the shape of a Polygon"},
+		{"s3cr3t", "line 1, column 1 of the file: invalid JSON: expected a value"},
+	} {
+		writeFile(t, path, tc.content)
+		_, _, err := ReadFile(path, sets.Area, 10)
+		if got := Problem(err); got != tc.want {
+			t.Errorf("Problem = %q, want %q", got, tc.want)
+		}
+	}
+	// The problems of text content keep their form.
+	writeFile(t, path, "192.0.2.0/24\ns3cr3t\n")
+	if _, _, err := ReadFile(path, sets.CIDR, 10); Problem(err) != "line 2 of the file: expected an IP address or a network, such as 192.0.2.0/24 or 2001:db8::/32" {
+		t.Errorf("Problem of a text file: %q", Problem(err))
+	}
+}

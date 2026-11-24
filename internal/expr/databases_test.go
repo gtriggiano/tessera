@@ -53,7 +53,7 @@ func exampleDatabases(t testing.TB) (*enrichment.Store, *Env) {
 
 func evalDB(t *testing.T, env *Env, store *enrichment.Store, text, clientIP string) (bool, error) {
 	t.Helper()
-	return mustCompile(t, env, text).Eval(NewInput(sampleRequest(clientIP), nil, store.Snapshot()))
+	return mustCompile(t, env, text).Eval(NewInput(sampleRequest(clientIP), nil, store.Snapshot(), nil))
 }
 
 func TestGeoAndASN(t *testing.T) {
@@ -165,7 +165,7 @@ func TestGeoEquality(t *testing.T) {
 	// The values of two decisions: the objects equal by their fields,
 	// geo does not.
 	read := func(client string) *geoVal {
-		v, _ := NewInput(sampleRequest(client), nil, store.Snapshot()).ResolveName("geo")
+		v, _ := NewInput(sampleRequest(client), nil, store.Snapshot(), nil).ResolveName("geo")
 		g, ok := v.(*geoVal)
 		if !ok {
 			t.Fatalf("geo for %s: %v", client, v)
@@ -273,7 +273,7 @@ func TestDatabaseError(t *testing.T) {
 		t.Errorf("a valid record of the same database: %v, %v", got, err)
 	}
 	// Without a copy in the snapshot, the read fails the same way.
-	_, err := mustCompile(t, env, `geo.found`).Eval(NewInput(sampleRequest("192.0.2.7"), nil, nil))
+	_, err := mustCompile(t, env, `geo.found`).Eval(NewInput(sampleRequest("192.0.2.7"), nil, nil, nil))
 	if cause(err) != CauseDatabaseError {
 		t.Errorf("no database: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestDatabaseError(t *testing.T) {
 // the copy of the snapshot that the Input was given.
 func TestLookupOncePerDecision(t *testing.T) {
 	store, env := testDatabases(t, loadDatabase(t, enrichment.Geo, mmdbtest.BrokenDatabase("geo")), loadDatabase(t, enrichment.ASN, mmdbtest.ASNDatabase()))
-	in := NewInput(sampleRequest("198.51.100.7"), nil, store.Snapshot())
+	in := NewInput(sampleRequest("198.51.100.7"), nil, store.Snapshot(), nil)
 	for _, text := range []string{
 		`request.host == "api.example.com"`,
 		`request.host == "api.example.com" || geo.found`,
@@ -305,7 +305,7 @@ func TestLookupOncePerDecision(t *testing.T) {
 
 	// The copy of the decision stays the one it started with.
 	store, env = exampleDatabases(t)
-	in = NewInput(sampleRequest("192.0.2.7"), nil, store.Snapshot())
+	in = NewInput(sampleRequest("192.0.2.7"), nil, store.Snapshot(), nil)
 	if got, err := mustCompile(t, env, `geo.city == "Rome"`).Eval(in); !got || err != nil {
 		t.Fatalf("before the replacement: %v, %v", got, err)
 	}
@@ -326,7 +326,7 @@ func TestLookupOncePerDecision(t *testing.T) {
 	if r, err := in.ASN(); err != nil || r.Number != 64496 {
 		t.Errorf("ASN: %+v, %v", r, err)
 	}
-	if _, err := NewInput(sampleRequest(""), nil, store.Snapshot()).Geo(); !errors.Is(err, ErrClientIPMissing) {
+	if _, err := NewInput(sampleRequest(""), nil, store.Snapshot(), nil).Geo(); !errors.Is(err, ErrClientIPMissing) {
 		t.Errorf("Geo without an address: %v", err)
 	}
 }
@@ -445,7 +445,7 @@ func TestDatabasesConcurrentReplacement(t *testing.T) {
 	for range 8 {
 		workers.Go(func() {
 			for range 2000 {
-				in := NewInput(&request.Request{ClientIP: sampleRequest("192.0.2.7").ClientIP}, nil, store.Snapshot())
+				in := NewInput(&request.Request{ClientIP: sampleRequest("192.0.2.7").ClientIP}, nil, store.Snapshot(), nil)
 				a, errA := first.Eval(in)
 				b, errB := second.Eval(in)
 				if a != b || errA != nil || errB != nil {

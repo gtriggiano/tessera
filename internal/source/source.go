@@ -75,8 +75,8 @@ func Read[T any](path string, parse Parse[T]) (T, Identity, error) {
 }
 
 // ReadFile reads the set of type t, of at most maxEntries entries, from the
-// file at path, as Read does. Invalid content, or a ceiling exceeded, is a
-// *sets.Error.
+// file at path, as Read does: a text file, or a GeoJSON document for an area
+// set. Invalid content, or a ceiling exceeded, is a *sets.Error.
 func ReadFile(path string, t sets.Type, maxEntries int) (*sets.Set, Identity, error) {
 	return unwrapInvalid(Read(path, SetParse(t, maxEntries)))
 }
@@ -183,11 +183,15 @@ func (c *contentReader) Read(p []byte) (int, error) {
 }
 
 // Problem describes err, an error of a read, without the content of the
-// file or its path: the line of the file and the problem for invalid
-// content of a set, the problem alone otherwise.
+// file or its path: for invalid content of a set, the line of the file and
+// the problem, with the column and the place in the structure of a GeoJSON
+// document; the problem alone otherwise.
 func Problem(err error) string {
 	var invalid *sets.Error
-	if errors.As(err, &invalid) && invalid.Line > 0 {
+	switch {
+	case errors.As(err, &invalid) && invalid.Line > 0 && invalid.Column > 0:
+		return fmt.Sprintf("line %d, column %d of the file: %s", invalid.Line, invalid.Column, invalid.Where())
+	case errors.As(err, &invalid) && invalid.Line > 0:
 		return fmt.Sprintf("line %d of the file: %s", invalid.Line, invalid.Problem)
 	}
 	return err.Error()

@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../public/config.schema.json
+# The database and the areas are files next to this one.
+enrichment:
+  geo:
+    database: geo.mmdb
+
+sets:
+  cities:
+    type: area
+    file: cities.geojson
+
+policy:
+  default_action: deny
+  rules:
+    - name: no-location
+      description: Addresses that the database does not place on a map.
+      action: deny
+      mode: audit
+      when: '!has(geo.location)'
+
+    - name: office-cities
+      description: Rome and Milan, inside their ring roads.
+      action: allow
+      when: sets.cities.contains(geo.location)

@@ -444,7 +444,7 @@ func TestStore(t *testing.T) {
 	}
 	for _, decls := range [][]Declaration{
 		{{Name: "a", Type: CIDR, OnUnavailable: Fail}, {Name: "a", Type: ASN, OnUnavailable: Fail}},
-		{{Name: "a", Type: "area", OnUnavailable: Fail}},
+		{{Name: "a", Type: "polygon", OnUnavailable: Fail}},
 		{{Name: "a", Type: ASN, OnUnavailable: "maybe"}},
 	} {
 		if _, err := NewStore(decls); err == nil {
