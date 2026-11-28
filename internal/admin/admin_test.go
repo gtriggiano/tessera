@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -27,6 +28,33 @@ func (l *observingListener) Accept() (net.Conn, error) {
 		}
 	}
 	return c, err
+}
+
+// gatedListener hands over its first connection at once, and holds each later
+// one until open; held receives once it holds one.
+type gatedListener struct {
+	net.Listener
+	gate, held chan struct{}
+	once       sync.Once
+	accepted   int
+}
+
+// open lets the held connections through. It can be called more than once.
+func (l *gatedListener) open() { l.once.Do(func() { close(l.gate) }) }
+
+func (l *gatedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if l.accepted++; l.accepted > 1 {
+		select {
+		case l.held <- struct{}{}:
+		default:
+		}
+		<-l.gate
+	}
+	return c, nil
 }
 
 type fixture struct {
@@ -296,6 +324,54 @@ func TestShutdown(t *testing.T) {
 		}
 		if elapsed := time.Since(begin); elapsed > time.Second {
 			t.Fatalf("Shutdown waited %v for a connection without a request", elapsed)
+		}
+	})
+	t.Run("connection accepted as the shutdown begins", func(t *testing.T) {
+		s := NewServer(metricsText)
+		inner, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		l := &gatedListener{Listener: inner, gate: make(chan struct{}), held: make(chan struct{}, 1)}
+		served := make(chan error, 1)
+		go func() { served <- s.Serve(l) }()
+		t.Cleanup(func() {
+			l.open() // Close waits for Serve, which a held connection would block
+			_ = s.Close()
+			select {
+			case err := <-served:
+				if err != nil {
+					t.Errorf("Serve: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("Serve did not stop")
+			}
+		})
+		first := dial(t, inner.Addr().String()) // sends nothing
+		dial(t, inner.Addr().String())          // sends nothing either
+		// Serve accepts the second connection only once it has seen the first.
+		select {
+		case <-l.held:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the second connection was not accepted")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		begin := time.Now()
+		shutdown := make(chan error, 1)
+		go func() { shutdown <- s.Shutdown(ctx) }()
+		// The server closes the first connection once the shutdown has begun;
+		// only then does Serve get the second.
+		var b [1]byte
+		if _, err := first.Read(b[:]); !errors.Is(err, io.EOF) {
+			t.Fatalf("the first connection was not closed: %v", err)
+		}
+		l.open()
+		if err := <-shutdown; err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if elapsed := time.Since(begin); elapsed > 2*time.Second {
+			t.Fatalf("Shutdown waited %v for a connection accepted as it began", elapsed)
 		}
 	})
 	t.Run("deadline", func(t *testing.T) {

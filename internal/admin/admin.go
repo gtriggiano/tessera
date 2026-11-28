@@ -45,8 +45,10 @@ type Server struct {
 	mu     sync.Mutex
 	reason string // empty when ready
 	// fresh holds the connections that have not sent a request yet, which
-	// net/http's Shutdown would wait for.
-	fresh map[net.Conn]struct{}
+	// net/http's Shutdown would wait for, so the server closes them itself;
+	// once closing, it closes every new one at once.
+	fresh   map[net.Conn]struct{}
+	closing bool
 }
 
 // NewServer returns an admin server that serves metrics at /metrics, without
@@ -72,7 +74,6 @@ func newServer(metrics http.Handler, l limits) *Server {
 		// can carry client addresses and values that clients sent.
 		ErrorLog: log.New(io.Discard, "", 0),
 	}
-	s.http.RegisterOnShutdown(s.closeFresh)
 	return s
 }
 
@@ -105,10 +106,11 @@ func (s *Server) Serve(l net.Listener) error {
 	return nil
 }
 
-// closeFresh closes the connections that have not sent a request yet. net/http
-// runs it once Shutdown has closed the listener.
+// closeFresh closes the connections that have not sent a request yet, and
+// every connection accepted from now on.
 func (s *Server) closeFresh() {
 	s.mu.Lock()
+	s.closing = true
 	fresh := make([]net.Conn, 0, len(s.fresh))
 	for c := range s.fresh {
 		fresh = append(fresh, c)
@@ -119,14 +121,20 @@ func (s *Server) closeFresh() {
 	}
 }
 
-// track records whether c has sent a request yet.
+// track records whether c has sent a request yet. Once closing, it closes a
+// new connection instead: net/http then fails its first read and forgets it.
 func (s *Server) track(c net.Conn, state http.ConnState) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if state == http.StateNew {
-		s.fresh[c] = struct{}{}
-	} else {
+	closing := s.closing && state == http.StateNew
+	switch {
+	case state != http.StateNew:
 		delete(s.fresh, c)
+	case !closing:
+		s.fresh[c] = struct{}{}
+	}
+	s.mu.Unlock()
+	if closing {
+		_ = c.Close()
 	}
 }
 
@@ -134,6 +142,7 @@ func (s *Server) track(c net.Conn, state http.ConnState) {
 // sent a request yet, and waits for the requests in progress until ctx ends;
 // it then closes the remaining connections and returns the context error.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.closeFresh()
 	err := s.http.Shutdown(ctx)
 	if err != nil {
 		_ = s.http.Close()
