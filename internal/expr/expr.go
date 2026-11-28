@@ -33,7 +33,7 @@ import (
 )
 
 // CostLimit is the largest cost of one evaluation of a condition, in the
-// units of CEL's cost model. A typical condition costs 2 to 30.
+// units of revision 1 of CEL's cost model. A typical condition costs 2 to 30.
 const CostLimit = 10_000
 
 // MaxLength is the largest number of characters of an expression.
@@ -130,6 +130,12 @@ func NewEnv(opts Options) (*Env, error) {
 		cel.Variable("asn", asnType),
 		cel.Variable("ua", userAgentType),
 		cel.ParserExpressionSizeLimit(MaxLength),
+		// CostLimit is a number of units of revision 1 of CEL's cost model.
+		// Revision 0 is the model of cel-go v0.32, which charged more for
+		// contains and matches on strings. Pinned, so that a later default
+		// revision of cel-go cannot move costs silently: adopting another
+		// revision is a change of the expression language.
+		cel.CostModelVersion(1),
 	}
 	env, err := cel.NewEnv(append(envOpts, lib.envOptions()...)...)
 	if err != nil {

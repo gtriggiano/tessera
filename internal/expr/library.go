@@ -14,6 +14,7 @@ import (
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/cost"
 	"cel.dev/cel-go/common/functions"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
@@ -188,10 +189,10 @@ func oneUnit([]ref.Val, ref.Val) *uint64 {
 }
 
 // costOptions give contains on a set its constant cost.
-func costOptions() []interpreter.CostTrackerOption {
-	var out []interpreter.CostTrackerOption
+func costOptions() []cost.TrackerOption {
+	var out []cost.TrackerOption
 	for _, id := range setContainsOverloads {
-		out = append(out, interpreter.OverloadCostTracker(id, oneUnit))
+		out = append(out, cost.OverloadTracker(id, oneUnit))
 	}
 	return out
 }
@@ -503,8 +504,9 @@ func (l *library) prepareInCidr(i interpreter.InterpretableV2) (interpreter.Inte
 }
 
 // inCidrCall evaluates ip.inCidr(network) with network parsed in advance. It
-// keeps the original call for Function, OverloadID and Args, which the cost
-// tracker reads.
+// keeps the original call for Function, OverloadID and Args. It charges
+// nothing to the cost tracker: ip.inCidr(network) costs what reading ip
+// costs.
 type inCidrCall struct {
 	interpreter.InterpretableCall
 	ip      interpreter.InterpretableV2
@@ -529,8 +531,12 @@ func (c *inCidrCall) contains(addr *ip) (out ref.Val) {
 	return types.Bool(c.network.Contains(addr.addr))
 }
 
+// Eval evaluates the call as Exec does. cel-go calls it on the condition of
+// cond ? a : b, with the frame of the evaluation, which it reuses, cost
+// tracker included. Another activation gets a frame of its own, released
+// afterwards, or an error value when no frame can be made of it.
 func (c *inCidrCall) Eval(act interpreter.Activation) ref.Val {
-	return c.Exec(interpreter.AsFrame(act))
+	return interpreter.EvalActivation(act, c.Exec)
 }
 
 // prepareAreaContains is an interpreter decorator: it replaces each call of
@@ -549,8 +555,9 @@ func (l *library) prepareAreaContains(i interpreter.InterpretableV2) (interprete
 }
 
 // areaContainsCall evaluates sets.<name>.contains(point) on an area set. It
-// keeps the original call for Function, OverloadID and Args, which the cost
-// tracker reads.
+// keeps the original call for Function, OverloadID and Args, and charges
+// itself to the cost tracker when it answers, as cel-go charges the calls it
+// evaluates: one unit, as contains on the other sets.
 type areaContainsCall struct {
 	interpreter.InterpretableCall
 	set, point interpreter.InterpretableV2
@@ -566,7 +573,7 @@ func (c *areaContainsCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	if types.IsUnknownOrError(point) {
 		// geo.location of a record without one is in no area.
 		if err, ok := point.(*types.Err); ok && errors.Is(err, errNoLocation) {
-			return types.False
+			return c.charge(frame, set, point, types.False)
 		}
 		return point
 	}
@@ -574,7 +581,17 @@ func (c *areaContainsCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	if _, isPoint := point.(*pointVal); !ok || !isPoint {
 		return types.MaybeNoSuchOverloadErr(point)
 	}
-	return c.contains(s, point)
+	return c.charge(frame, set, point, c.contains(s, point))
+}
+
+// charge records the cost of the call, whose arguments are set and point and
+// whose result is out, and returns out. Past the cost limit, the tracker
+// panics to stop the evaluation, as it does in cel-go's own calls.
+func (c *areaContainsCall) charge(frame *interpreter.ExecutionFrame, set, point, out ref.Val) ref.Val {
+	if costs := frame.CostTracker(); costs != nil {
+		costs.EvalBinary(frame, c.ID(), c, set, point, out)
+	}
+	return out
 }
 
 func (c *areaContainsCall) contains(set *setVal, point ref.Val) (out ref.Val) {
@@ -582,8 +599,9 @@ func (c *areaContainsCall) contains(set *setVal, point ref.Val) (out ref.Val) {
 	return types.LabelErrNode(c.ID(), areaSetContains(set, point))
 }
 
+// Eval evaluates the call as Exec does, as inCidrCall.Eval does.
 func (c *areaContainsCall) Eval(act interpreter.Activation) ref.Val {
-	return c.Exec(interpreter.AsFrame(act))
+	return interpreter.EvalActivation(act, c.Exec)
 }
 
 // unary and binary guard a function binding: a panic becomes an error value
@@ -669,11 +687,12 @@ func (l *library) recoverPanic(out *ref.Val, in *Input) {
 }
 
 // recovered reports a recovered panic, with the rule that in evaluates, and
-// returns it as an error. The panic that cel-go uses to stop an evaluation
-// at the cost limit goes on.
+// returns it as an error. The panics that cel-go uses to stop an evaluation
+// at the cost limit go on.
 func (l *library) recovered(r any, in *Input) *Panic {
-	if c, ok := r.(interpreter.EvalCancelledError); ok {
-		panic(c)
+	switch r.(type) {
+	case interpreter.EvalCancelledError, cost.LimitExceededError:
+		panic(r)
 	}
 	p := &Panic{Value: r, Stack: debug.Stack()}
 	if in != nil {

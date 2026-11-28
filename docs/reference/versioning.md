@@ -7,7 +7,7 @@ From version 1.0.0, **tessera** follows [Semantic Versioning 2.0.0](https://semv
 These are the public interface. An incompatible change to any of them is a breaking change:
 
 - **The configuration file**: keys, types, defaults and allowed values. A stricter validation that rejects a file accepted before is a breaking change. A breaking change never gives an existing key a new meaning: it renames or removes the key, so that tessera rejects a file written for the old format instead of reading it differently.
-- **The expression language** of the rule conditions: attributes, types and functions.
+- **The expression language** of the rule conditions: attributes, types, functions and [limits](./expressions.md#limits). A stricter limit that rejects an expression accepted before is a breaking change. The cost limit counts in units of one revision of the cost model of CEL: a change of the revision, or of the cost of a step, is a breaking change when it changes which conditions exceed the limit, in either direction, because a condition beyond the limit is [indeterminate](./expressions.md#indeterminate-conditions) and counts against allowing. A condition that fits the limit after such a change can make a `deny` rule stop denying or an `allow` rule start allowing, and one that exceeds it can do the opposite.
 - **The CLI**: commands, flags, the `TESSERA_CONFIG` environment variable and exit statuses.
 - **The responses to Envoy**: the decision, the status and content of denials, and the headers added to or removed from the request.
 - **The admin endpoints** and their responses.
