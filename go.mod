@@ -3,7 +3,7 @@ module github.com/gtriggiano/tessera
 go 1.27.4
 
 require (
-	cel.dev/cel-go v0.32.0
+	cel.dev/cel-go v0.33.4
 	github.com/LumenResearch/uasurfer v0.3.1
 	github.com/envoyproxy/go-control-plane/envoy v1.40.0
 	github.com/gaissmai/bart v0.30.0
