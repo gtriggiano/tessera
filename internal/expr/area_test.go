@@ -147,6 +147,45 @@ func TestAreaUnavailable(t *testing.T) {
 	}
 }
 
+// inCidr and contains on an area set answer as the condition of ? : as they
+// do elsewhere, and fail in the same way: cel-go evaluates that condition by
+// another path.
+func TestConditionalOnPreparedCalls(t *testing.T) {
+	store, dbs, env := testAreas(t, sets.Fail, loadDatabase(t, enrichment.Geo, mmdbtest.CityDatabase(6)))
+	for _, tc := range []struct {
+		text, client string
+		want         bool
+		cause        Cause
+	}{
+		{`sets.stores.contains(geo.location) ? request.method == "GET" : false`, "192.0.2.7", true, ""},
+		{`sets.stores.contains(geo.location) ? true : request.method == "POST"`, "2001:db8::7", false, ""},
+		{`sets.stores.contains(geo.location) ? false : true`, "203.0.113.7", true, ""}, // without a location
+		{`sets.stores.contains(geo.location) ? true : false`, "", false, CauseClientIPMissing},
+		{`client.ip.inCidr("192.0.2.0/24") ? request.method == "GET" : false`, "192.0.2.7", true, ""},
+		{`client.ip.inCidr("192.0.2.0/24") ? true : request.method == "POST"`, "198.51.100.7", false, ""},
+		{`client.ip.inCidr("192.0.2.0/24") ? false : true`, "", false, CauseClientIPMissing},
+	} {
+		got, err := evalArea(t, env, store, dbs, tc.text, tc.client)
+		if got != tc.want || cause(err) != tc.cause {
+			t.Errorf("%s, client %q: %v, %v; want %v, cause %q", tc.text, tc.client, got, err, tc.want, tc.cause)
+		}
+	}
+	// The value of an upstream header.
+	header := mustCompileString(t, env, `client.ip.inCidr("198.51.100.0/24") ? "office" : (sets.stores.contains(geo.location) ? "rome" : "other")`)
+	for client, want := range map[string]string{"198.51.100.7": "office", "192.0.2.7": "rome", "2001:db8::7": "other"} {
+		if got, err := header.Eval(NewInput(sampleRequest(client), store.Snapshot(), dbs.Snapshot(), nil)); got != want || err != nil {
+			t.Errorf("client %s: %q, %v; want %q", client, got, err, want)
+		}
+	}
+	// An unavailable set fails the condition, whose on_unavailable is fail.
+	if err := store.SetAvailable("stores", false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := evalArea(t, env, store, dbs, `sets.stores.contains(geo.location) ? true : false`, "192.0.2.7"); got || cause(err) != CauseSetUnavailable {
+		t.Errorf("unavailable set: %v, %v; want the cause set_unavailable", got, err)
+	}
+}
+
 // contains is strict for every argument but the absent location: the other
 // overloads, and the standard contains on strings, still fail with the
 // error of their argument.

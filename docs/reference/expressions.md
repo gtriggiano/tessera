@@ -329,8 +329,8 @@ An error message never quotes a literal of the expression, such as a string that
 | Limit | Value |
 | --- | --- |
 | Length of an expression | 8192 characters |
-| Cost of one evaluation | 10000 units of the cost model of CEL |
+| Cost of one evaluation | 10000 units of revision 1 of the cost model of CEL |
 | Nesting of macros | A macro over a list or a map (`all`, `exists`, `exists_one`, `map`, `filter`) cannot contain another, nor iterate over the result of another: `l.map(x, f(x)).filter(y, g(y))` is an error. |
 
-- **Cost.** CEL counts a cost for each step of an evaluation, larger for steps that read more data, such as a regular expression over a long header or a macro over many headers. `contains` on a set costs one unit, whatever the size of the set and of its argument. A condition made of comparisons and a few function calls stays far below the limit. An evaluation that reaches it stops, and the condition is [indeterminate](#indeterminate-conditions).
+- **Cost.** tessera counts the cost of an evaluation with revision 1 of the cost model of CEL, which gives each step of the evaluation a cost, larger for steps that read more data, such as a regular expression over a long header or a macro over many headers. `contains` on a set costs one unit, whatever the size of the set and of its argument. A condition made of comparisons and a few function calls stays far below the limit. An evaluation that exceeds the limit stops, and the condition is [indeterminate](#indeterminate-conditions).
 - **Regular expressions** are RE2, whose time grows linearly with the text. tessera compiles a pattern written as a literal when it reads the configuration, and an invalid one is an error.
